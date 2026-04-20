@@ -1,0 +1,6 @@
+[submodule "brand"]
+	path = brand
+	url = git@github.com:Flockctl/brand.git
+[submodule "src/bundled-skills"]
+	path = src/bundled-skills
+	url = git@github.com:Flockctl/flockctl-skills.git

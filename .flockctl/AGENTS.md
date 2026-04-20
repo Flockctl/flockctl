@@ -1,0 +1,81 @@
+# Flockctl — Development Rules
+
+## Verification Rules
+
+1. **Never say "it works" without testing yourself.** After any code change, climb the tier ladder appropriate to the change (see [docs/TESTING.md](docs/TESTING.md)):
+   - **Always:** `npm run test:coverage` — Vitest unit/integration + v8 coverage thresholds (pretest runs `typecheck`)
+   - **For a specific test file:** `npx vitest run src/__tests__/routes/tasks.test.ts`
+   - **If the change affects API behavior:** write or update a test that exercises the endpoint before claiming done
+   - **If you changed migrations or DB boot code:** `npm run test:smoke` — real `server-entry.ts` against a clean `FLOCKCTL_HOME` (catches missing `_journal.json` entries and unsplit multi-statement SQL)
+   - **If you touched the UI:** `cd ui && npx tsc -b --noEmit` AND `npm run test:e2e` (Playwright)
+   - **If you touched AI integration** (`ai-client.ts`, `agent-session.ts`, `claude-cli.ts`, `src/services/agents/`): run `FLOCKCTL_LIVE_TESTS=1 npm run test:live` locally before opening the PR
+
+2. **No Docker.** Flockctl is a local CLI daemon — no containers, no rebuilds.
+
+3. **Test from the local environment.** Start the daemon with `npm start`, verify via `curl http://localhost:52077/...`.
+   - `npm start` expects built artifacts in `dist/` — fails if project was not built first.
+   - For local verification during development, use `npm run dev` (tsx watch) instead of `npm start`.
+   - API health check endpoint: `GET /health` on port `52077`.
+
+## Anthropic OAuth / API Key Auth Rules
+
+- `sk-ant-api*` keys → `x-api-key` header (classic API keys)
+- `sk-ant-oat*` keys → `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20` (OAuth API tokens)
+- Raw OAuth access tokens (no `sk-ant-` prefix) → `Authorization: Bearer` + `anthropic-beta: oauth-2025-04-20`
+- The check is `apiKey.startsWith("sk-ant-api")` for classic keys, everything else uses Bearer
+
+## Flockctl Access Modes
+
+Flockctl runs in one of two modes, switched by the presence of `remoteAccessToken` in `~/.flockctlrc`:
+
+- **Local mode (default):** loopback-only, wildcard CORS, no authentication. Endpoints are open.
+- **Remote mode (opt-in):** Bearer-token auth for non-localhost callers, `corsOrigins` whitelist, WebSocket auth via `?token=...` query param, 5-fail-per-60s per-IP rate limit.
+
+When writing code, treat `remoteAuth` as a cross-cutting middleware that already handles the split — do not add ad-hoc auth checks inside route handlers. See [docs/SECURITY.md](docs/SECURITY.md) for the threat model.
+
+## Project Structure
+
+- **src/**: TypeScript backend (Hono, Drizzle ORM, better-sqlite3)
+  - `src/routes/` — Hono route handlers
+  - `src/services/` — Business logic (AI client, task executor, scheduler, permission-resolver, project-config, …)
+  - `src/middleware/` — Cross-cutting middleware (`remote-auth.ts` for token + rate limit + WS verify)
+  - `src/db/` — Drizzle schema + migrations (11 tables)
+  - `src/daemon.ts` — PID file management, start/stop/status
+  - `src/server-entry.ts` — Process entry point (migrations, rc-permission warning, scheduler, server)
+  - `src/cli.ts` — Commander CLI (`flockctl start|stop|status|token`)
+  - `src/__tests__/` — Vitest test files
+- **ui/**: React + Vite + shadcn/ui frontend (multi-server aware — `server-switcher`, `server-store`, `server-context`)
+- Database: SQLite (WAL mode), stored at `~/flockctl/flockctl.db`
+- Config: `~/.flockctlrc` (JSON, chmod 600) — `home`, `defaultModel`, `planningModel`, `defaultAgent`, `remoteAccessToken`, `corsOrigins`, `remoteServers`
+- Tests: six-tier ladder — see [docs/TESTING.md](docs/TESTING.md). Unit/integration under `src/__tests__/`, smoke under `tests/smoke/`, live under `tests/live/`, UI E2E under `ui/e2e/`.
+
+## AI Chat Architecture Rules
+
+- **Single streaming endpoint.** All AI chat interactions (regular chats, plan-entity chats, workspace chats) MUST use one endpoint: `POST /chats/:id/messages/stream`. No separate streaming endpoints per context.
+- The endpoint accepts optional parameters (e.g. `entity_context`, `system`) to specialize behavior. Context-specific system prompts are built on the backend.
+- Frontend MUST create a chat first via `POST /chats` (with `entityType`/`entityId` if needed), then stream via the unified endpoint.
+- One frontend hook (`useChatStream`) handles all streaming. No duplicate hooks per chat type.
+
+## Documentation Rules
+
+1. **Documentation must ALWAYS be up to date.** Files in `docs/`, `README.md`, `AGENTS.md`, `API.md` are the source of truth for the project.
+2. **Final step of every task** — verify whether documentation needs updating after the changes. If changes affect the API, DB schema, project structure, commands, or configuration — update the corresponding docs.
+3. **Do not finish a task** until you have confirmed that documentation reflects the current state of the code.
+
+## Dependency Hygiene Rules
+
+1. **Keep `npm audit` clean.** Before finishing a task, run `npm audit` in the root and `cd ui && npm audit`. Both must report `found 0 vulnerabilities`. The publish workflow does not gate on this, so the agent is responsible for staying clean.
+2. **Auto-remediate without asking:**
+   - Non-breaking fixes: run `npm audit fix` in root and `ui/`.
+   - Breaking fixes: bump the direct dependency in the relevant `package.json` to the latest major that resolves the advisory, rebuild, and retest. Do NOT use `npm audit fix --force` blindly — it happily downgrades first-party direct deps (e.g. `drizzle-kit` → 0.18.1) and will break the build.
+   - Transitive vulns that can't be fixed by bumping a direct dep: add an `"overrides": { "<pkg>": "^<safe-version>" }` entry in the root `package.json`, reinstall, and verify the advisory is gone. Document why in the commit message.
+3. **After any dependency change:** re-run `npm install` in both root and `ui/` to sync lockfiles, then run `npm run test:coverage` + `cd ui && npm run build` to confirm nothing regressed. Commit both `package.json` and `package-lock.json` together — never just one.
+4. **Prereleases / RC versions** go out under the `next` dist-tag. The publish workflow picks the tag automatically based on whether `package.json#version` contains a `-` (prerelease per SemVer). Never hand-publish from a local machine.
+
+## Changelog Rules
+
+1. **Every user-visible change goes into [CHANGELOG.md](CHANGELOG.md)** under the `## [Unreleased]` section. Use the standard Keep-a-Changelog categories: `Added`, `Changed`, `Fixed`, `Removed`, `Deprecated`, `Security`.
+2. **What counts as user-visible:** new or changed API endpoints, CLI commands, config keys, UI features, bug fixes users would notice, breaking changes, security fixes. Internal refactors, test changes, and doc-only edits do NOT need entries.
+3. **Write entries from the user's perspective** — "Added `flockctl token rotate` command", not "Refactored token handler in cli.ts". One line per change. No task/PR/issue references in the text.
+4. **Do not rename `[Unreleased]` yourself** — that happens at release time together with the version bump. Just keep appending to it.
+5. **Release gate:** the publish workflow fails if `## [X.Y.Z]` is missing for the version being published, so unreleased entries must be cut over before `npm version` + tag.

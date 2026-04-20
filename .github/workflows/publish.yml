@@ -1,0 +1,84 @@
+name: Publish to npm
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Run npm publish in --dry-run mode"
+        type: boolean
+        default: false
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # required for npm provenance
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+          cache: "npm"
+          cache-dependency-path: |
+            package-lock.json
+            ui/package-lock.json
+
+      - name: Install root deps
+        run: npm ci
+
+      - name: Install UI deps
+        run: cd ui && npm ci
+
+      - name: Verify release tag matches package.json version
+        if: github.event_name == 'release'
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "$PKG_VERSION" != "$TAG" ]; then
+            echo "::error::package.json version ($PKG_VERSION) does not match release tag ($TAG)"
+            exit 1
+          fi
+
+      - name: Verify CHANGELOG has entry for this version
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if ! grep -qE "^## \[${PKG_VERSION}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no entry '## [${PKG_VERSION}]' — update it before publishing"
+            exit 1
+          fi
+
+      - name: Typecheck
+        run: npm run typecheck && npm run typecheck:ui
+
+      - name: Test
+        run: npm test
+
+      - name: Determine npm dist-tag
+        id: tag
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          if [[ "$PKG_VERSION" == *-* ]]; then
+            echo "dist=next" >> "$GITHUB_OUTPUT"
+          else
+            echo "dist=latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ "${{ inputs.dry-run }}" = "true" ]; then
+            npm publish --provenance --access public --tag ${{ steps.tag.outputs.dist }} --dry-run
+          else
+            npm publish --provenance --access public --tag ${{ steps.tag.outputs.dist }}
+          fi

@@ -1,0 +1,181 @@
+{
+  "version": "5",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1713100000000,
+      "tag": "0000_init",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1744732800000,
+      "tag": "0001_add_disabled_and_mcp",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1750000000000,
+      "tag": "0002_add_config_dir",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "5",
+      "when": 1750100000000,
+      "tag": "0003_add_workspace_allowed_keys",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "5",
+      "when": 1750200000000,
+      "tag": "0004_add_claude_session_id",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "5",
+      "when": 1750300000000,
+      "tag": "0005_add_cascade_deletes",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "5",
+      "when": 1750400000000,
+      "tag": "0006_add_target_slice_slug",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "5",
+      "when": 1750500000000,
+      "tag": "0007_add_prompt_file",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "5",
+      "when": 1750600000000,
+      "tag": "0008_drop_template_command",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "5",
+      "when": 1750700000000,
+      "tag": "0009_add_chat_entity",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "5",
+      "when": 1750800000000,
+      "tag": "0010_add_git_diff_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "5",
+      "when": 1750900000000,
+      "tag": "0011_add_approval_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "5",
+      "when": 1751000000000,
+      "tag": "0012_add_budget_limits",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "5",
+      "when": 1751100000000,
+      "tag": "0013_add_project_config_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "5",
+      "when": 1751200000000,
+      "tag": "0014_add_template_assigned_key",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "5",
+      "when": 1751300000000,
+      "tag": "0015_add_permission_mode",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "5",
+      "when": 1751400000000,
+      "tag": "0016_add_task_claude_session_id",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "5",
+      "when": 1751500000000,
+      "tag": "0017_drop_project_default_timeout",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "5",
+      "when": 1751600000000,
+      "tag": "0018_drop_project_config_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "5",
+      "when": 1751700000000,
+      "tag": "0019_drop_workspace_config_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "5",
+      "when": 1751800000000,
+      "tag": "0020_drop_merge_queue",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "5",
+      "when": 1751900000000,
+      "tag": "0021_add_usage_key_id",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "5",
+      "when": 1752000000000,
+      "tag": "0022_add_workspace_repo_url",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "5",
+      "when": 1752100000000,
+      "tag": "0023_drop_task_disabled_skills_and_mcp",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "5",
+      "when": 1752200000000,
+      "tag": "0024_add_secrets",
+      "breakpoints": true
+    }
+  ]
+}

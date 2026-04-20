@@ -1,0 +1,60 @@
+{
+  "skills": [
+    {
+      "name": "agents-md-editing",
+      "level": "global"
+    },
+    {
+      "name": "api-design",
+      "level": "project"
+    },
+    {
+      "name": "bugfix",
+      "level": "project"
+    },
+    {
+      "name": "code-audit",
+      "level": "project"
+    },
+    {
+      "name": "database",
+      "level": "project"
+    },
+    {
+      "name": "debugging",
+      "level": "global"
+    },
+    {
+      "name": "implementation",
+      "level": "global"
+    },
+    {
+      "name": "mcp-add",
+      "level": "global"
+    },
+    {
+      "name": "performance",
+      "level": "project"
+    },
+    {
+      "name": "planning",
+      "level": "global"
+    },
+    {
+      "name": "search-first",
+      "level": "project"
+    },
+    {
+      "name": "security",
+      "level": "project"
+    },
+    {
+      "name": "test-design",
+      "level": "project"
+    },
+    {
+      "name": "testing",
+      "level": "project"
+    }
+  ]
+}

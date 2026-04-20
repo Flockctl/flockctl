@@ -1,0 +1,51 @@
+
+# ── GSD baseline (auto-generated) ──
+.gsd
+.gsd-id
+.bg-shell/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
+.env
+.env.*
+!.env.example
+node_modules/
+.next/
+dist/
+build/
+__pycache__/
+*.pyc
+.venv/
+venv/
+target/
+vendor/
+*.log
+coverage/
+.cache/
+tmp/
+*.egg-info/
+.eggs/
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Playwright / E2E runtime state
+.e2e-data/
+test-results/
+playwright-report/
+ui/test-results/
+ui/playwright-report/
+
+# ─── Flockctl (auto-managed — do not edit) ───
+.claude/skills/
+.mcp.json
+.flockctl/.skills-reconcile
+.flockctl/.mcp-reconcile
+.flockctl/.agents-reconcile
+.flockctl/import-backup/
+# ─── /Flockctl ───
