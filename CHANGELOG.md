@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.1] - 2026-04-25
+
+First stable release. Promotes `0.0.1-rc.3` to `latest` on npm and brings the dependency stack up to date.
+
+### Changed
+- Bumped `@anthropic-ai/sdk` from 0.88.0 to 0.91.1.
+- Bumped `@github/copilot-sdk` from 0.2.2 to 0.3.0.
+- Bumped `@anthropic-ai/claude-agent-sdk` from 0.2.107 to 0.2.119.
+- Bumped `vitest` / `@vitest/coverage-v8` from 4.1.4 to 4.1.5.
+- Bumped `hono` from 4.12.14 to 4.12.15, `nanoid` from 5.1.7 to 5.1.9, `typescript` from 6.0.2 to 6.0.3, plus assorted minor / patch updates across both root and `ui/`.
+- UI lint stack moved to `eslint` 10.x (`@eslint/js` 10, `eslint` 10.2.1) and `@types/node` 25.x. UI Tanstack Query, Tailwind, Vite and lucide-react picked up patch / minor bumps.
+
+### Notes
+- `@hono/node-server` is intentionally held at the `1.x` line. v2.0.0 is available, but `@hono/node-ws@1.3.0` still peer-requires `^1.19.2`, and pinning the server to v2 makes `npm ci` reject the lockfile. The upgrade will land once `@hono/node-ws` ships a release that accepts `@hono/node-server@^2`.
+
 ## [0.0.1-rc.3] - 2026-04-25
 
 ### Fixed
