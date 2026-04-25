@@ -4,6 +4,12 @@ export function statusBadge(status: string) {
   switch (status) {
     case "pending":
       return <Badge variant="secondary">pending</Badge>;
+    case "proposed":
+      return (
+        <Badge variant="outline" className="border-violet-500 text-violet-600 dark:text-violet-400">
+          proposed
+        </Badge>
+      );
     case "planning":
       return <Badge variant="secondary">planning</Badge>;
     case "active":

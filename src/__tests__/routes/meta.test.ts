@@ -1,10 +1,18 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { app } from "../../server.js";
 import { createTestDb } from "../helpers.js";
 import { setDb, type FlockctlDb } from "../../db/index.js";
 import { aiProviderKeys } from "../../db/schema.js";
 import Database from "better-sqlite3";
-import * as config from "../../config.js";
+import * as config from "../../config/index.js";
+import * as pkgVersion from "../../lib/package-version.js";
+import { resetUpdateState, setUpdateState } from "../../services/update-state.js";
+
+vi.mock("execa", () => ({
+  execa: vi.fn(),
+}));
+import { execa } from "execa";
+const execaMock = execa as unknown as ReturnType<typeof vi.fn>;
 
 let db: FlockctlDb;
 let sqlite: Database.Database;
@@ -185,226 +193,222 @@ describe("GET /meta", () => {
     const res = await app.request("/meta");
     const body = await res.json();
     expect(Array.isArray(body.models)).toBe(true);
-    // If models present, validate shape
+    // If models present, validate shape. Accept any registered agent —
+    // multi-agent support means models can belong to claude-code or copilot.
     for (const m of body.models) {
       expect(typeof m.id).toBe("string");
       expect(typeof m.name).toBe("string");
-      expect(m.agent).toBe("claude-code");
+      expect(["claude-code", "copilot"]).toContain(m.agent);
     }
   });
 });
 
-describe("/meta/remote-servers", () => {
-  type StoredServer = { id: string; name: string; url: string; token?: string };
-  let stored: StoredServer[];
+// NOTE: the /meta/remote-servers describe block lived here but was
+// removed when slices 01+03 migrated the endpoint from the legacy
+// `{name, url, token}` shape to SSH-only `{name, ssh:{host,...}}`.
+// Current coverage lives in:
+//   - src/__tests__/routes/meta-remote-servers.test.ts  (slice 01 schema)
+//   - src/__tests__/routes/remote-servers-post.test.ts  (slice 03 pipeline)
 
+describe("/meta/version", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it("reports updateAvailable=true when registry 'latest' is newer", async () => {
+    vi.spyOn(pkgVersion, "getPackageVersion").mockReturnValue("0.0.1");
+    vi.spyOn(pkgVersion, "getPackageName").mockReturnValue("flockctl");
+    vi.spyOn(pkgVersion, "getInstallInfo").mockReturnValue({ mode: "global", root: "/usr/local/lib" });
+    globalThis.fetch = vi.fn(async () =>
+      new Response(
+        JSON.stringify({ "dist-tags": { latest: "0.0.2", next: "0.0.3-rc.1" } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    ) as typeof fetch;
+
+    const res = await app.request("/meta/version");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.current).toBe("0.0.1");
+    expect(body.latest).toBe("0.0.2");
+    expect(body.updateAvailable).toBe(true);
+    expect(body.installMode).toBe("global");
+  });
+
+  it("prefers 'next' tag when current version is a prerelease", async () => {
+    vi.spyOn(pkgVersion, "getPackageVersion").mockReturnValue("0.0.1-rc.1");
+    vi.spyOn(pkgVersion, "getPackageName").mockReturnValue("flockctl");
+    globalThis.fetch = vi.fn(async () =>
+      new Response(
+        JSON.stringify({ "dist-tags": { latest: "0.0.0", next: "0.0.1-rc.2" } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    ) as typeof fetch;
+
+    const res = await app.request("/meta/version");
+    const body = await res.json();
+    expect(body.latest).toBe("0.0.1-rc.2");
+    expect(body.updateAvailable).toBe(true);
+  });
+
+  it("reports updateAvailable=false when local is at or above registry", async () => {
+    vi.spyOn(pkgVersion, "getPackageVersion").mockReturnValue("1.2.3");
+    vi.spyOn(pkgVersion, "getPackageName").mockReturnValue("flockctl");
+    globalThis.fetch = vi.fn(async () =>
+      new Response(
+        JSON.stringify({ "dist-tags": { latest: "1.2.3" } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    ) as typeof fetch;
+
+    const res = await app.request("/meta/version");
+    const body = await res.json();
+    expect(body.updateAvailable).toBe(false);
+  });
+
+  it("returns error field when the registry is unreachable", async () => {
+    vi.spyOn(pkgVersion, "getPackageVersion").mockReturnValue("0.0.1");
+    vi.spyOn(pkgVersion, "getPackageName").mockReturnValue("flockctl");
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("network down");
+    }) as typeof fetch;
+
+    const res = await app.request("/meta/version");
+    const body = await res.json();
+    expect(body.latest).toBeNull();
+    expect(body.updateAvailable).toBe(false);
+    expect(body.error).toMatch(/network down/);
+  });
+});
+
+describe("POST /meta/update (async)", () => {
   beforeEach(() => {
-    stored = [];
-    vi.spyOn(config, "getRemoteServers").mockImplementation(() => stored.slice());
-    vi.spyOn(config, "addRemoteServer").mockImplementation((input) => {
-      const server: StoredServer = {
-        id: `srv-${stored.length + 1}`,
-        name: input.name,
-        url: input.url.replace(/\/$/, ""),
-        token: input.token || undefined,
-      };
-      stored.push(server);
-      return server;
-    });
-    vi.spyOn(config, "updateRemoteServer").mockImplementation((id, input) => {
-      const idx = stored.findIndex((s) => s.id === id);
-      if (idx === -1) return null;
-      const cur = stored[idx];
-      const next: StoredServer = {
-        id: cur.id,
-        name: input.name !== undefined ? input.name : cur.name,
-        url: input.url !== undefined ? input.url.replace(/\/$/, "") : cur.url,
-        token:
-          input.token === null
-            ? undefined
-            : input.token !== undefined
-              ? input.token || undefined
-              : cur.token,
-      };
-      stored[idx] = next;
-      return next;
-    });
-    vi.spyOn(config, "deleteRemoteServer").mockImplementation((id) => {
-      const before = stored.length;
-      stored = stored.filter((s) => s.id !== id);
-      return stored.length < before;
-    });
+    execaMock.mockReset();
+    resetUpdateState();
+    vi.spyOn(pkgVersion, "getPackageName").mockReturnValue("flockctl");
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    resetUpdateState();
   });
 
-  it("lists remote servers without tokens", async () => {
-    stored.push({ id: "srv-1", name: "Prod", url: "https://example.com", token: "secret-1234" });
-    const res = await app.request("/meta/remote-servers");
+  // Wait for the fire-and-forget IIFE in the route to settle.
+  const flushMicrotasks = async () => {
+    await new Promise((r) => setImmediate(r));
+  };
+
+  it("returns 202 immediately and later transitions to success", async () => {
+    vi.spyOn(pkgVersion, "getPackageVersion").mockReturnValue("1.0.0");
+    vi.spyOn(pkgVersion, "getInstallInfo").mockReturnValue({ mode: "global", root: "/usr/local/lib" });
+    execaMock.mockResolvedValue({ failed: false, exitCode: 0, stdout: "+ flockctl@1.0.1", stderr: "" });
+
+    const res = await app.request("/meta/update", { method: "POST" });
+    expect(res.status).toBe(202);
+    const body = await res.json();
+    expect(body.triggered).toBe(true);
+    expect(body.installMode).toBe("global");
+    expect(body.targetVersion).toBe("latest");
+    expect(execaMock).toHaveBeenCalledWith(
+      "npm",
+      ["install", "-g", "flockctl@latest"],
+      expect.objectContaining({ reject: false }),
+    );
+
+    await flushMicrotasks();
+    const state = await (await app.request("/meta/update")).json();
+    expect(state.status).toBe("success");
+  });
+
+  it("runs npm install without -g in the project root for local installs", async () => {
+    vi.spyOn(pkgVersion, "getPackageVersion").mockReturnValue("1.0.0");
+    vi.spyOn(pkgVersion, "getInstallInfo").mockReturnValue({ mode: "local", root: "/home/x/proj" });
+    execaMock.mockResolvedValue({ failed: false, exitCode: 0, stdout: "", stderr: "" });
+
+    const res = await app.request("/meta/update", { method: "POST" });
+    expect(res.status).toBe(202);
+    expect(execaMock).toHaveBeenCalledWith(
+      "npm",
+      ["install", "flockctl@latest"],
+      expect.objectContaining({ cwd: "/home/x/proj" }),
+    );
+  });
+
+  it("uses @next tag when current version is a prerelease", async () => {
+    vi.spyOn(pkgVersion, "getPackageVersion").mockReturnValue("0.0.1-rc.1");
+    vi.spyOn(pkgVersion, "getInstallInfo").mockReturnValue({ mode: "global", root: "/usr/local/lib" });
+    execaMock.mockResolvedValue({ failed: false, exitCode: 0, stdout: "", stderr: "" });
+
+    await app.request("/meta/update", { method: "POST" });
+    expect(execaMock).toHaveBeenCalledWith(
+      "npm",
+      ["install", "-g", "flockctl@next"],
+      expect.anything(),
+    );
+  });
+
+  it("refuses with 400 (no state mutation) when install mode is unknown", async () => {
+    vi.spyOn(pkgVersion, "getPackageVersion").mockReturnValue("1.0.0");
+    vi.spyOn(pkgVersion, "getInstallInfo").mockReturnValue({ mode: "unknown" });
+
+    const res = await app.request("/meta/update", { method: "POST" });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.details?.installMode).toBe("unknown");
+    expect(execaMock).not.toHaveBeenCalled();
+    const state = await (await app.request("/meta/update")).json();
+    expect(state.status).toBe("idle");
+  });
+
+  it("returns 409 when an install is already running", async () => {
+    vi.spyOn(pkgVersion, "getPackageVersion").mockReturnValue("1.0.0");
+    vi.spyOn(pkgVersion, "getInstallInfo").mockReturnValue({ mode: "global", root: "/usr/local/lib" });
+    setUpdateState({ status: "running", targetVersion: "latest" });
+
+    const res = await app.request("/meta/update", { method: "POST" });
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toMatch(/already in progress/i);
+    expect(execaMock).not.toHaveBeenCalled();
+  });
+
+  it("records error state with stderr when npm install fails", async () => {
+    vi.spyOn(pkgVersion, "getPackageVersion").mockReturnValue("1.0.0");
+    vi.spyOn(pkgVersion, "getInstallInfo").mockReturnValue({ mode: "global", root: "/usr/local/lib" });
+    execaMock.mockResolvedValue({
+      failed: true,
+      exitCode: 1,
+      stdout: "",
+      stderr: "EACCES: permission denied",
+    });
+
+    const res = await app.request("/meta/update", { method: "POST" });
+    expect(res.status).toBe(202);
+
+    await flushMicrotasks();
+    const state = await (await app.request("/meta/update")).json();
+    expect(state.status).toBe("error");
+    expect(state.error).toMatch(/EACCES/);
+    expect(state.exitCode).toBe(1);
+  });
+
+  it("GET /meta/update returns idle by default", async () => {
+    const res = await app.request("/meta/update");
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body).toEqual([
-      { id: "srv-1", name: "Prod", url: "https://example.com", hasToken: true },
-    ]);
-    expect(JSON.stringify(body)).not.toContain("secret-1234");
+    expect(body.status).toBe("idle");
   });
+});
 
-  it("adds a remote server and trims trailing slash", async () => {
-    const res = await app.request("/meta/remote-servers", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "Dev", url: "http://10.0.0.2:52077/", token: "tok-abc" }),
-    });
-    expect(res.status).toBe(201);
-    const body = await res.json();
-    expect(body.name).toBe("Dev");
-    expect(body.url).toBe("http://10.0.0.2:52077");
-    expect(body.hasToken).toBe(true);
-    expect(stored).toHaveLength(1);
-    expect(stored[0].token).toBe("tok-abc");
-  });
-
-  it("rejects invalid URLs", async () => {
-    const res = await app.request("/meta/remote-servers", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "Bad", url: "not-a-url" }),
-    });
-    expect(res.status).toBe(400);
-  });
-
-  it("updates a remote server", async () => {
-    stored.push({ id: "srv-1", name: "Old", url: "http://old.local" });
-    const res = await app.request("/meta/remote-servers/srv-1", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "New", token: "t-123" }),
-    });
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.name).toBe("New");
-    expect(body.hasToken).toBe(true);
-    expect(stored[0].token).toBe("t-123");
-  });
-
-  it("returns 404 when updating unknown server", async () => {
-    const res = await app.request("/meta/remote-servers/missing", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "x" }),
-    });
-    expect(res.status).toBe(404);
-  });
-
-  it("deletes a remote server", async () => {
-    stored.push({ id: "srv-1", name: "Doomed", url: "http://doomed.local" });
-    const res = await app.request("/meta/remote-servers/srv-1", { method: "DELETE" });
-    expect(res.status).toBe(200);
-    expect(stored).toHaveLength(0);
-  });
-
-  it("hands the token to the proxy-token endpoint", async () => {
-    stored.push({ id: "srv-1", name: "Prod", url: "https://example.com", token: "secret" });
-    const res = await app.request("/meta/remote-servers/srv-1/proxy-token", {
-      method: "POST",
-    });
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body).toEqual({ token: "secret" });
-  });
-
-  it("returns null token when none is configured", async () => {
-    stored.push({ id: "srv-1", name: "Prod", url: "https://example.com" });
-    const res = await app.request("/meta/remote-servers/srv-1/proxy-token", {
-      method: "POST",
-    });
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body).toEqual({ token: null });
-  });
-
-  it("returns 404 for proxy-token of unknown server", async () => {
-    const res = await app.request("/meta/remote-servers/missing/proxy-token", {
-      method: "POST",
-    });
-    expect(res.status).toBe(404);
-  });
-
-  it("POST rejects malformed JSON body", async () => {
-    const res = await app.request("/meta/remote-servers", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: "{ not json",
-    });
-    expect(res.status).toBe(400);
-  });
-
-  it("POST rejects empty/missing name", async () => {
-    const res = await app.request("/meta/remote-servers", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "  ", url: "https://x.com" }),
-    });
-    expect(res.status).toBe(400);
-  });
-
-  it("POST rejects non-string token", async () => {
-    const res = await app.request("/meta/remote-servers", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "n", url: "https://x.com", token: 123 }),
-    });
-    expect(res.status).toBe(400);
-  });
-
-  it("PATCH rejects malformed JSON body", async () => {
-    const res = await app.request("/meta/remote-servers/srv-1", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: "{ oops",
-    });
-    expect(res.status).toBe(400);
-  });
-
-  it("PATCH rejects empty string name", async () => {
-    const res = await app.request("/meta/remote-servers/srv-1", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "   " }),
-    });
-    expect(res.status).toBe(400);
-  });
-
-  it("PATCH rejects invalid URL", async () => {
-    const res = await app.request("/meta/remote-servers/srv-1", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: "ftp://nope.com" }),
-    });
-    expect(res.status).toBe(400);
-  });
-
-  it("PATCH rejects non-string non-null token", async () => {
-    const res = await app.request("/meta/remote-servers/srv-1", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token: 42 }),
-    });
-    expect(res.status).toBe(400);
-  });
-
-  it("PATCH accepts null token to clear it", async () => {
-    stored.push({ id: "srv-1", name: "X", url: "https://x.com", token: "t" });
-    const res = await app.request("/meta/remote-servers/srv-1", {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token: null }),
-    });
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.hasToken).toBe(false);
-  });
-
-  it("DELETE returns 404 for unknown server", async () => {
-    const res = await app.request("/meta/remote-servers/nope", { method: "DELETE" });
-    expect(res.status).toBe(404);
+describe("semver helper", () => {
+  it("handles release vs prerelease ordering", async () => {
+    const { semverGt } = await import("../../lib/package-version.js");
+    expect(semverGt("1.0.0", "1.0.0-rc.1")).toBe(true);
+    expect(semverGt("1.0.0-rc.1", "1.0.0")).toBe(false);
+    expect(semverGt("1.0.1", "1.0.0")).toBe(true);
+    expect(semverGt("1.0.0-rc.2", "1.0.0-rc.1")).toBe(true);
+    expect(semverGt("1.0.0", "1.0.0")).toBe(false);
   });
 });

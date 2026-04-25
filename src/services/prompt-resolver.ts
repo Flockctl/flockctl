@@ -4,7 +4,7 @@
  * Otherwise falls back to the inline `prompt` column.
  */
 import { readFileSync, existsSync } from "fs";
-import { parseMd } from "./plan-store.js";
+import { parseMd } from "./plan-store/index.js";
 
 interface TaskRow {
   prompt: string | null;

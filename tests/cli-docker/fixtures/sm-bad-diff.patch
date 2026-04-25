@@ -1,0 +1,14 @@
+diff --git a/src/order.ts b/src/order.ts
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/src/order.ts
+@@ -0,0 +1,1 @@
++// @sm:order shipped -> cancelled
+diff --git a/docs/order.md b/docs/order.md
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/docs/order.md
+@@ -0,0 +1,1 @@
++// @sm:order shipped -> cancelled

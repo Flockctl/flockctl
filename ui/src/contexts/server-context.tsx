@@ -13,19 +13,34 @@ import { getApiBaseUrl, getAuthHeaders } from "@/lib/api";
 import {
   LOCAL_SERVER,
   LOCAL_SERVER_ID,
-  cacheToken,
-  clearCachedToken,
   getActiveServerId,
   setActiveServerId as persistActiveServerId,
   setServerMap,
 } from "@/lib/server-store";
-import type { ConnectionStatus, ServerConnection } from "@/lib/types";
+import type {
+  ConnectionStatus,
+  ServerConnection,
+  ServerErrorCode,
+} from "@/lib/types";
 
+/**
+ * Shape of a single entry from `GET /meta/remote-servers`. Mirrors the
+ * `toEnriched` serializer in `src/routes/meta.ts` — keep the two in sync.
+ */
 interface RemoteServerDTO {
   id: string;
   name: string;
-  url: string;
-  has_token: boolean;
+  ssh: {
+    host: string;
+    user?: string;
+    port?: number;
+    identityFile?: string;
+    remotePort?: number;
+  };
+  tunnelStatus: "starting" | "ready" | "error" | "stopped";
+  tunnelPort: number | null;
+  tunnelLastError: string | null;
+  errorCode: ServerErrorCode | null;
 }
 
 interface ServerContextValue {
@@ -41,10 +56,14 @@ const ServerContext = createContext<ServerContextValue | null>(null);
 
 const HEALTH_CHECK_INTERVAL_MS = 30_000;
 
-async function checkServerHealth(url: string, signal?: AbortSignal): Promise<boolean> {
+async function checkServerHealth(signal?: AbortSignal): Promise<boolean> {
   try {
-    const headers = { ...getAuthHeaders() };
-    const res = await fetch(`${url}/health`, { method: "GET", headers, signal });
+    const base = getApiBaseUrl();
+    const res = await fetch(`${base}/health`, {
+      method: "GET",
+      headers: { ...getAuthHeaders() },
+      signal,
+    });
     return res.ok;
   } catch {
     return false;
@@ -63,32 +82,37 @@ export function ServerProvider({ children }: { children: ReactNode }) {
     [servers, activeServerId],
   );
 
-  // Keep the api-layer server URL map in sync with the context state.
+  // Keep the api-layer tunnel-port map in sync with the context state.
   useEffect(() => {
     setServerMap(
       servers
         .filter((s) => !s.is_local)
-        .map((s) => ({ id: s.id, url: s.url })),
+        .map((s) => ({ id: s.id, tunnelPort: s.tunnelPort })),
     );
   }, [servers]);
 
   const refreshServers = useCallback(async () => {
     try {
-      // Fetch remote server list from the LOCAL backend — the one that owns
-      // ~/.flockctlrc. When the active server is remote we still want the list
-      // to come from local, so temporarily hit the local URL directly.
-      const localBase = import.meta.env.VITE_API_URL ?? "";
+      // The remote-server list is owned by the LOCAL daemon — it's the one
+      // that holds ~/.flockctlrc. Even when the active server is remote we
+      // want the enumeration to come from local.
+      const localBase =
+        (import.meta.env.VITE_API_URL as string | undefined) ??
+        "http://127.0.0.1:52077";
       const res = await fetch(`${localBase}/meta/remote-servers`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const remote = (await res.json()) as RemoteServerDTO[];
       setServers([
         LOCAL_SERVER,
-        ...remote.map((s) => ({
+        ...remote.map<ServerConnection>((s) => ({
           id: s.id,
           name: s.name,
-          url: s.url,
           is_local: false,
-          has_token: s.has_token,
+          ssh: s.ssh,
+          tunnelStatus: s.tunnelStatus,
+          tunnelPort: s.tunnelPort ?? undefined,
+          tunnelLastError: s.tunnelLastError ?? undefined,
+          errorCode: s.errorCode ?? undefined,
         })),
       ]);
     } catch {
@@ -101,48 +125,31 @@ export function ServerProvider({ children }: { children: ReactNode }) {
   }, [refreshServers]);
 
   const performHealthCheck = useCallback(async () => {
-    if (activeServer.is_local) {
-      // Hit current-origin /health; an empty base URL resolves against origin.
-      const ok = await checkServerHealth(getApiBaseUrl() || "");
-      setConnectionStatus(ok ? "connected" : "error");
+    // A remote server with no live tunnel has no loopback endpoint to probe,
+    // so getApiBaseUrl() would throw. Treat that as "error" without attempting
+    // the fetch.
+    if (!activeServer.is_local && activeServer.tunnelStatus !== "ready") {
+      setConnectionStatus("error");
       return;
     }
-    const ok = await checkServerHealth(activeServer.url);
+    const ok = await checkServerHealth();
     setConnectionStatus(ok ? "connected" : "error");
-  }, [activeServer]);
+  }, [activeServer.is_local, activeServer.tunnelStatus]);
 
-  // On active-server change: fetch token (if any), then probe /health.
+  // Re-probe /health whenever the active server (or its tunnel state) changes.
   useEffect(() => {
     let cancelled = false;
     setConnectionStatus("checking");
 
-    async function prepare() {
-      if (!activeServer.is_local && activeServer.has_token) {
-        try {
-          const localBase = import.meta.env.VITE_API_URL ?? "";
-          const res = await fetch(
-            `${localBase}/meta/remote-servers/${activeServer.id}/proxy-token`,
-            { method: "POST" },
-          );
-          if (res.ok) {
-            const body = (await res.json()) as { token: string | null };
-            if (body.token) cacheToken(activeServer.id, body.token);
-          }
-        } catch {
-          // non-fatal — will show as connection error below
-        }
-      } else if (!activeServer.is_local) {
-        clearCachedToken(activeServer.id);
-      }
+    (async () => {
       if (cancelled) return;
       await performHealthCheck();
-    }
+    })();
 
-    void prepare();
     return () => {
       cancelled = true;
     };
-  }, [activeServer.id, activeServer.is_local, activeServer.has_token, performHealthCheck]);
+  }, [activeServer.id, performHealthCheck]);
 
   // Periodic health check for the active server
   useEffect(() => {

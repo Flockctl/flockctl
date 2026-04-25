@@ -2,7 +2,8 @@ import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from "vites
 import { app } from "../../server.js";
 import { createTestDb } from "../helpers.js";
 import { setDb } from "../../db/index.js";
-import { projects } from "../../db/schema.js";
+import { projects, chats as chatsTable, agentQuestions, aiProviderKeys } from "../../db/schema.js";
+import { eq } from "drizzle-orm";
 
 // Capture AgentSession constructor calls across all tests in this file.
 const agentSessionCalls: Array<{ opts: any }> = [];
@@ -15,7 +16,7 @@ let mockUsage = {
   totalCostUsd: 0,
 };
 
-vi.mock("../../services/agent-session", async () => {
+vi.mock("../../services/agent-session/index", async () => {
   const { EventEmitter } = await import("events");
   class MockAgentSession extends EventEmitter {
     opts: any;
@@ -42,19 +43,23 @@ vi.mock("../../services/agents/registry", () => ({
   }),
 }));
 
-// Mock key selection — return a fake key so AI calls work without real keys in DB
-vi.mock("../../services/key-selection", () => ({
+// Mock key selection — return a fake key so AI calls work without real keys in DB.
+// `resolveAllowedKeyIds` is used by chats.ts to enforce the project whitelist,
+// so mock it too — default to "no restriction" (empty array) so existing tests
+// that don't set `allowedKeyIds` pass unchanged.
+vi.mock("../../services/ai/key-selection", () => ({
   selectKeyForTask: vi.fn().mockResolvedValue({
     id: 1,
     provider: "anthropic",
     keyValue: "sk-test",
     providerType: "api-key",
   }),
+  resolveAllowedKeyIds: vi.fn().mockReturnValue([]),
 }));
 
 // Mock AI client — not used by chat routes after refactor, but kept for any
 // adjacent code path that may still import it.
-vi.mock("../../services/ai-client", () => ({
+vi.mock("../../services/ai/client", () => ({
   createAIClient: vi.fn().mockReturnValue({
     chat: vi.fn().mockResolvedValue({
       text: "Mocked AI response",
@@ -75,6 +80,16 @@ describe("Chats API", () => {
       name: "Chat Test Project",
     }).returning().get();
     projectId = p!.id;
+
+    // Seed a few aiProviderKeys so persistChatSelection doesn't hit an FK
+    // failure when tests supply `keyId` values that the whitelist tests need
+    // to exist. Key id 7 is the "allowed" fixture, 42 is the "rejected"
+    // fixture, 99 is the "no whitelist configured" fixture.
+    testDb.db.insert(aiProviderKeys).values([
+      { id: 7, provider: "github_copilot", providerType: "oauth", label: "Copilot Test", isActive: true },
+      { id: 42, provider: "github_copilot", providerType: "oauth", label: "Copilot Rejected", isActive: true },
+      { id: 99, provider: "anthropic", providerType: "api-key", label: "Anthropic Test", isActive: true },
+    ]).run();
   });
 
   afterAll(() => testDb.sqlite.close());
@@ -146,6 +161,58 @@ describe("Chats API", () => {
       expect(body.items.length).toBe(1);
       expect(body.perPage).toBe(1);
     });
+
+    // Full-text search covers chat title AND message content AND
+    // project/workspace name. Seeds a chat with a distinctive title plus a
+    // chat whose only mention of the term is in a message body — both must
+    // surface, and a non-matching chat must not.
+    it("full-text search matches title and message content", async () => {
+      const { chats: chatsTbl, chatMessages } = await import("../../db/schema.js");
+      const db = testDb.db;
+
+      const byTitle = db.insert(chatsTbl).values({
+        projectId,
+        title: "Обсуждение zzzSearchTitle plan",
+      }).returning().get()!;
+      const byBody = db.insert(chatsTbl).values({
+        projectId,
+        title: "Unrelated title",
+      }).returning().get()!;
+      db.insert(chatsTbl).values({
+        projectId,
+        title: "Another chat, no match",
+      }).run();
+      db.insert(chatMessages).values({
+        chatId: byBody.id,
+        role: "user",
+        content: "Let's talk about zzzSearchTitle later",
+      }).run();
+
+      const res = await app.request("/chats?q=zzzSearchTitle");
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      const ids = body.items.map((c: any) => c.id);
+      expect(ids).toContain(byTitle.id);
+      expect(ids).toContain(byBody.id);
+      // Non-matching chats from prior tests must not leak in.
+      expect(body.items.every((c: any) =>
+        (c.title ?? "").includes("zzzSearchTitle") ||
+        // Body-match chats don't have the term in title; allow them through.
+        c.id === byBody.id
+      )).toBe(true);
+    });
+
+    it("full-text search escapes LIKE wildcards", async () => {
+      // Neither the `%` nor the `_` should act as a wildcard — the query
+      // must be treated as a literal substring, so a search for `%` must
+      // NOT return every chat in the table.
+      const res = await app.request("/chats?q=%25"); // decoded: "%"
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      // No seeded chat/message contains a literal "%", so the result set
+      // must be empty. If the escape is dropped, this will match everything.
+      expect(body.items.length).toBe(0);
+    });
   });
 
   // ─── Get single ─────────────────────
@@ -177,6 +244,24 @@ describe("Chats API", () => {
         expect(body.isRunning).toBe(true);
       } finally {
         chatExecutor.unregister(2);
+      }
+    });
+
+    // Regression for the "Response was not received" flash on chat switch.
+    // Between the `chat_messages` insert and `chatExecutor.register`, the
+    // message route calls `chatExecutor.claim(id)` so that a racing GET
+    // during setup still reports `isRunning=true` instead of the torn state
+    // (user row committed, session not yet registered) that used to trigger
+    // the UI fallback. See chat-executor.ts + routes/chats/messages.ts.
+    it("reports isRunning=true while a chat is claimed but not yet registered", async () => {
+      const { chatExecutor } = await import("../../services/chat-executor.js");
+      chatExecutor.claim(2);
+      try {
+        const res = await app.request("/chats/2");
+        const body = await res.json();
+        expect(body.isRunning).toBe(true);
+      } finally {
+        chatExecutor.release(2);
       }
     });
   });
@@ -350,6 +435,69 @@ describe("Chats API", () => {
     });
   });
 
+  // ─── allowedKeyIds whitelist enforcement ───────────────────
+  //
+  // Chats whose project sets `allowedKeyIds` must reject requests (and the
+  // stored / default fallbacks) that resolve to a key outside the whitelist.
+  // Silently swapping to a different provider was the original bug: the UI
+  // showed Copilot but Claude Code actually ran.
+  describe("POST /chats/:id/messages — allowedKeyIds whitelist", () => {
+    it("rejects an explicit keyId that is not in the project's allowedKeyIds", async () => {
+      const { resolveAllowedKeyIds } = await import("../../services/ai/key-selection.js");
+      (resolveAllowedKeyIds as ReturnType<typeof vi.fn>).mockReturnValueOnce([1]);
+
+      const res = await app.request("/chats/2/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "try copilot", keyId: 42 }),
+      });
+      expect(res.status).toBe(422);
+      const body = await res.json();
+      expect(body.error).toMatch(/not allowed for this chat's project/);
+      expect(body.error).toMatch(/#42/);
+      // Hint should mention allowedKeyIds or the whitelist
+      expect(body.error).toMatch(/allowed/i);
+    });
+
+    it("allows an explicit keyId that is in the whitelist", async () => {
+      const { resolveAllowedKeyIds } = await import("../../services/ai/key-selection.js");
+      (resolveAllowedKeyIds as ReturnType<typeof vi.fn>).mockReturnValueOnce([1, 7]);
+
+      const res = await app.request("/chats/2/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "allowed key", keyId: 7 }),
+      });
+      expect(res.status).toBe(201);
+    });
+
+    it("lets requests through when no whitelist is configured", async () => {
+      const { resolveAllowedKeyIds } = await import("../../services/ai/key-selection.js");
+      (resolveAllowedKeyIds as ReturnType<typeof vi.fn>).mockReturnValueOnce([]);
+
+      const res = await app.request("/chats/2/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "no whitelist", keyId: 99 }),
+      });
+      expect(res.status).toBe(201);
+    });
+
+    it("rejects disallowed keys on the streaming endpoint too", async () => {
+      const { resolveAllowedKeyIds } = await import("../../services/ai/key-selection.js");
+      (resolveAllowedKeyIds as ReturnType<typeof vi.fn>).mockReturnValueOnce([1]);
+
+      const res = await app.request("/chats/2/messages/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "stream copilot", keyId: 42 }),
+      });
+      expect(res.status).toBe(422);
+      const body = await res.json();
+      expect(body.error).toMatch(/not allowed for this chat's project/);
+    });
+  });
+
   // ─── Metrics ─────────────────────
 
   describe("GET /chats/:id/metrics", () => {
@@ -427,6 +575,364 @@ describe("Chats API", () => {
     });
   });
 
+  // ─── Todos ─────────────────────
+
+  describe("GET /chats/:id/todos", () => {
+    it("returns 204 when chat has no snapshots", async () => {
+      const createRes = await app.request("/chats", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "Todos empty" }),
+      });
+      const chat = await createRes.json();
+
+      const res = await app.request(`/chats/${chat.id}/todos`);
+      expect(res.status).toBe(204);
+      // 204 must have an empty body — RFC 7230.
+      const text = await res.text();
+      expect(text).toBe("");
+    });
+
+    it("returns the latest snapshot + counts when present", async () => {
+      const createRes = await app.request("/chats", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "Todos populated" }),
+      });
+      const chat = await createRes.json();
+
+      const { chatTodos: chatTodosTable } = await import("../../db/schema.js");
+      // Insert two snapshots — the endpoint must pick the newer one.
+      testDb.db.insert(chatTodosTable).values({
+        chatId: chat.id,
+        todosJson: JSON.stringify([
+          { content: "old", status: "pending" },
+        ]),
+        createdAt: "2024-01-01T00:00:00Z",
+      }).run();
+      const newer = testDb.db.insert(chatTodosTable).values({
+        chatId: chat.id,
+        todosJson: JSON.stringify([
+          { content: "write code", status: "in_progress", activeForm: "writing" },
+          { content: "write tests", status: "pending" },
+          { content: "ship", status: "completed" },
+        ]),
+        createdAt: "2024-06-01T00:00:00Z",
+      }).returning().get();
+
+      const res = await app.request(`/chats/${chat.id}/todos`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+
+      expect(body.snapshot).toBeDefined();
+      expect(body.snapshot.id).toBe(newer!.id);
+      expect(body.snapshot.createdAt).toBe("2024-06-01T00:00:00Z");
+      expect(body.snapshot.todos).toHaveLength(3);
+      expect(body.snapshot.todos[0].content).toBe("write code");
+      expect(body.snapshot.todos[0].activeForm).toBe("writing");
+
+      expect(body.counts).toEqual({
+        total: 3,
+        completed: 1,
+        in_progress: 1,
+        pending: 1,
+      });
+    });
+
+    it("returns 404 for non-existent chat", async () => {
+      const res = await app.request("/chats/999999/todos");
+      expect(res.status).toBe(404);
+    });
+  });
+
+  describe("GET /chats/:id/todos/history", () => {
+    it("returns paginated list of snapshots (newest first)", async () => {
+      const createRes = await app.request("/chats", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "Todos history" }),
+      });
+      const chat = await createRes.json();
+
+      const { chatTodos: chatTodosTable } = await import("../../db/schema.js");
+      // Insert 3 snapshots at distinct timestamps.
+      const inputs = [
+        { ts: "2024-01-01T00:00:00Z", todos: [{ content: "a", status: "pending" }] },
+        { ts: "2024-02-01T00:00:00Z", todos: [{ content: "a", status: "in_progress" }] },
+        {
+          ts: "2024-03-01T00:00:00Z",
+          todos: [
+            { content: "a", status: "completed" },
+            { content: "b", status: "pending" },
+          ],
+        },
+      ];
+      for (const s of inputs) {
+        testDb.db.insert(chatTodosTable).values({
+          chatId: chat.id,
+          todosJson: JSON.stringify(s.todos),
+          createdAt: s.ts,
+        }).run();
+      }
+
+      // Default page — all three, newest first.
+      const res = await app.request(`/chats/${chat.id}/todos/history`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.items).toHaveLength(3);
+      expect(body.total).toBe(3);
+      expect(body.page).toBe(1);
+      expect(body.perPage).toBe(20);
+      expect(body.items[0].createdAt).toBe("2024-03-01T00:00:00Z");
+      expect(body.items[2].createdAt).toBe("2024-01-01T00:00:00Z");
+
+      // Counts computed per snapshot.
+      expect(body.items[0].counts).toEqual({ total: 2, completed: 1, in_progress: 0, pending: 1 });
+      expect(body.items[1].counts).toEqual({ total: 1, completed: 0, in_progress: 1, pending: 0 });
+      expect(body.items[2].counts).toEqual({ total: 1, completed: 0, in_progress: 0, pending: 1 });
+
+      // Page 1 of 2 per page — newest row only.
+      const page1 = await app.request(`/chats/${chat.id}/todos/history?page=1&per_page=2`);
+      const page1Body = await page1.json();
+      expect(page1Body.items).toHaveLength(2);
+      expect(page1Body.items[0].createdAt).toBe("2024-03-01T00:00:00Z");
+      expect(page1Body.items[1].createdAt).toBe("2024-02-01T00:00:00Z");
+      expect(page1Body.total).toBe(3);
+      expect(page1Body.perPage).toBe(2);
+
+      // Page 2 — oldest row.
+      const page2 = await app.request(`/chats/${chat.id}/todos/history?page=2&per_page=2`);
+      const page2Body = await page2.json();
+      expect(page2Body.items).toHaveLength(1);
+      expect(page2Body.items[0].createdAt).toBe("2024-01-01T00:00:00Z");
+      expect(page2Body.page).toBe(2);
+    });
+
+    it("returns empty items when chat has no snapshots", async () => {
+      const createRes = await app.request("/chats", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "Todos history empty" }),
+      });
+      const chat = await createRes.json();
+
+      const res = await app.request(`/chats/${chat.id}/todos/history`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.items).toEqual([]);
+      expect(body.total).toBe(0);
+    });
+
+    it("returns 404 for non-existent chat", async () => {
+      const res = await app.request("/chats/999999/todos/history");
+      expect(res.status).toBe(404);
+    });
+
+    it("filters by ?agent=main to scope history to the main agent only", async () => {
+      const createRes = await app.request("/chats", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "Todos history main filter" }),
+      });
+      const chat = await createRes.json();
+
+      const { chatTodos: chatTodosTable } = await import("../../db/schema.js");
+      // Two snapshots from main (parent_tool_use_id NULL), one from a sub-agent.
+      testDb.db.insert(chatTodosTable).values({
+        chatId: chat.id,
+        todosJson: JSON.stringify([{ content: "main1", status: "pending" }]),
+        createdAt: "2024-01-01T00:00:00Z",
+      }).run();
+      testDb.db.insert(chatTodosTable).values({
+        chatId: chat.id,
+        todosJson: JSON.stringify([{ content: "main2", status: "pending" }]),
+        createdAt: "2024-01-02T00:00:00Z",
+      }).run();
+      testDb.db.insert(chatTodosTable).values({
+        chatId: chat.id,
+        parentToolUseId: "toolu_sub_a",
+        todosJson: JSON.stringify([{ content: "sub", status: "pending" }]),
+        createdAt: "2024-01-03T00:00:00Z",
+      }).run();
+
+      const res = await app.request(`/chats/${chat.id}/todos/history?agent=main`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.total).toBe(2);
+      expect(body.items.map((it: any) => it.todos[0].content)).toEqual(["main2", "main1"]);
+      // Snapshots from main MUST carry a NULL parent_tool_use_id on the wire.
+      expect(body.items.every((it: any) => it.parentToolUseId === null)).toBe(true);
+    });
+
+    it("filters by ?agent=<toolu_id> to scope history to one sub-agent", async () => {
+      const createRes = await app.request("/chats", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "Todos history sub filter" }),
+      });
+      const chat = await createRes.json();
+      const { chatTodos: chatTodosTable } = await import("../../db/schema.js");
+      testDb.db.insert(chatTodosTable).values({
+        chatId: chat.id,
+        todosJson: JSON.stringify([{ content: "main", status: "pending" }]),
+        createdAt: "2024-01-01T00:00:00Z",
+      }).run();
+      testDb.db.insert(chatTodosTable).values({
+        chatId: chat.id,
+        parentToolUseId: "toolu_sub_a",
+        todosJson: JSON.stringify([{ content: "sub-a", status: "pending" }]),
+        createdAt: "2024-01-02T00:00:00Z",
+      }).run();
+      testDb.db.insert(chatTodosTable).values({
+        chatId: chat.id,
+        parentToolUseId: "toolu_sub_b",
+        todosJson: JSON.stringify([{ content: "sub-b", status: "pending" }]),
+        createdAt: "2024-01-03T00:00:00Z",
+      }).run();
+
+      const res = await app.request(`/chats/${chat.id}/todos/history?agent=toolu_sub_a`);
+      const body = await res.json();
+      expect(body.total).toBe(1);
+      expect(body.items[0].todos[0].content).toBe("sub-a");
+      expect(body.items[0].parentToolUseId).toBe("toolu_sub_a");
+    });
+
+    it("rejects an empty ?agent= as 422 (defense-in-depth, not a NULL match)", async () => {
+      const createRes = await app.request("/chats", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "Todos history empty agent" }),
+      });
+      const chat = await createRes.json();
+      const res = await app.request(`/chats/${chat.id}/todos/history?agent=`);
+      expect(res.status).toBe(422);
+    });
+  });
+
+  // ─── Per-agent grouping ──────────
+
+  describe("GET /chats/:id/todos/agents", () => {
+    it("returns empty items when chat has no snapshots", async () => {
+      const createRes = await app.request("/chats", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "Agents empty" }),
+      });
+      const chat = await createRes.json();
+      const res = await app.request(`/chats/${chat.id}/todos/agents`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.items).toEqual([]);
+    });
+
+    it("groups by parent_tool_use_id, annotates completedAt, resolves Task labels", async () => {
+      const createRes = await app.request("/chats", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "Agents grouped" }),
+      });
+      const chat = await createRes.json();
+
+      const { chatTodos: chatTodosTable, chatMessages: chatMessagesTable } =
+        await import("../../db/schema.js");
+
+      // Main agent emits two snapshots — second marks the first todo done.
+      testDb.db.insert(chatTodosTable).values({
+        chatId: chat.id,
+        todosJson: JSON.stringify([
+          { content: "plan", status: "in_progress" },
+          { content: "ship", status: "pending" },
+        ]),
+        createdAt: "2024-01-01T00:00:00Z",
+      }).run();
+      testDb.db.insert(chatTodosTable).values({
+        chatId: chat.id,
+        todosJson: JSON.stringify([
+          { content: "plan", status: "completed" },
+          { content: "ship", status: "in_progress" },
+        ]),
+        createdAt: "2024-01-02T00:00:00Z",
+      }).run();
+
+      // Sub-agent A — one snapshot.
+      testDb.db.insert(chatTodosTable).values({
+        chatId: chat.id,
+        parentToolUseId: "toolu_sub_a",
+        todosJson: JSON.stringify([{ content: "child task", status: "pending" }]),
+        createdAt: "2024-01-03T00:00:00Z",
+      }).run();
+
+      // Spawning Task tool message for sub-agent A. The /agents route reads
+      // chat_messages where role='tool', parses the JSON content, and matches
+      // tool_use_id to recover the description for the tab label.
+      testDb.db.insert(chatMessagesTable).values({
+        chatId: chat.id,
+        role: "tool",
+        content: JSON.stringify({
+          kind: "call",
+          name: "Task",
+          input: { description: "tester-1", subagent_type: "general-purpose" },
+          summary: "Task: tester-1",
+          parent_tool_use_id: null,
+          tool_use_id: "toolu_sub_a",
+        }),
+        createdAt: "2024-01-03T00:00:00Z",
+      }).run();
+
+      const res = await app.request(`/chats/${chat.id}/todos/agents`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.items).toHaveLength(2);
+
+      // Main agent first (insertion order).
+      const main = body.items[0];
+      expect(main.key).toBe("main");
+      expect(main.parentToolUseId).toBeNull();
+      expect(main.label).toBe("Main agent");
+      expect(main.snapshotCount).toBe(2);
+      expect(main.latest.todos).toHaveLength(2);
+      // The completed `plan` todo should carry completedAt = the timestamp
+      // of the snapshot in which it first transitioned to completed.
+      const planTodo = main.latest.todos.find((t: any) => t.content === "plan");
+      expect(planTodo.completedAt).toBe("2024-01-02T00:00:00Z");
+      const shipTodo = main.latest.todos.find((t: any) => t.content === "ship");
+      expect(shipTodo.completedAt).toBeNull();
+
+      // Sub-agent — label resolved from the Task call.
+      const subA = body.items[1];
+      expect(subA.key).toBe("toolu_sub_a");
+      expect(subA.label).toBe("tester-1");
+      expect(subA.subagentType).toBe("general-purpose");
+      expect(subA.snapshotCount).toBe(1);
+    });
+
+    it("falls back to 'Sub-agent <suffix>' when no spawning Task message is found", async () => {
+      const createRes = await app.request("/chats", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "Agents fallback label" }),
+      });
+      const chat = await createRes.json();
+      const { chatTodos: chatTodosTable } = await import("../../db/schema.js");
+      testDb.db.insert(chatTodosTable).values({
+        chatId: chat.id,
+        parentToolUseId: "toolu_orphan_xyz123",
+        todosJson: JSON.stringify([{ content: "orphan", status: "pending" }]),
+        createdAt: "2024-01-01T00:00:00Z",
+      }).run();
+
+      const res = await app.request(`/chats/${chat.id}/todos/agents`);
+      const body = await res.json();
+      expect(body.items[0].label).toBe("Sub-agent xyz123");
+      expect(body.items[0].subagentType).toBeNull();
+    });
+
+    it("returns 404 for unknown chat", async () => {
+      const res = await app.request("/chats/999999/todos/agents");
+      expect(res.status).toBe(404);
+    });
+  });
+
   // ─── Delete ─────────────────────
 
   describe("DELETE /chats/:id", () => {
@@ -448,6 +954,141 @@ describe("Chats API", () => {
 
     it("returns 404 for non-existent chat", async () => {
       const res = await app.request("/chats/999", { method: "DELETE" });
+      expect(res.status).toBe(404);
+    });
+  });
+
+  // ─── Question /answer endpoints ─────────────────────────────────────────
+  describe("POST /chats/:id/question/:requestId/answer", () => {
+    function insertChat(title = "question-chat"): number {
+      const row = testDb.db.insert(chatsTable).values({ title }).returning().get();
+      return row!.id;
+    }
+
+    function insertQuestion(opts: {
+      chatId: number;
+      requestId: string;
+      status?: "pending" | "answered" | "cancelled";
+    }): void {
+      testDb.db.insert(agentQuestions).values({
+        requestId: opts.requestId,
+        chatId: opts.chatId,
+        toolUseId: `tu-${opts.requestId}`,
+        question: "please clarify",
+        status: opts.status ?? "pending",
+        answer: opts.status === "answered" ? "prior answer" : null,
+        answeredAt: opts.status === "answered" ? new Date().toISOString() : null,
+      }).run();
+    }
+
+    async function hit(chatId: number | string, requestId: string, body: unknown): Promise<Response> {
+      return app.request(`/chats/${chatId}/question/${requestId}/answer`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    }
+
+    it("answers a pending question", async () => {
+      const chatId = insertChat();
+      insertQuestion({ chatId, requestId: "cq-ok-1" });
+
+      const { chatExecutor } = await import("../../services/chat-executor.js");
+      const spy = vi.spyOn(chatExecutor, "answerQuestion").mockImplementation(() => {
+        testDb.db.update(agentQuestions)
+          .set({ status: "answered", answer: "hello", answeredAt: new Date().toISOString() })
+          .where(eq(agentQuestions.requestId, "cq-ok-1"))
+          .run();
+        return true;
+      });
+
+      try {
+        const res = await hit(chatId, "cq-ok-1", { answer: "hello" });
+        expect(res.status).toBe(200);
+        const body = await res.json();
+        expect(body.ok).toBe(true);
+        expect(spy).toHaveBeenCalledWith(chatId, "cq-ok-1", "hello");
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("returns 404 when the requestId is unknown", async () => {
+      const chatId = insertChat();
+      const res = await hit(chatId, "missing", { answer: "hi" });
+      expect(res.status).toBe(404);
+    });
+
+    it("returns 404 when the requestId belongs to another chat", async () => {
+      const ownerChat = insertChat();
+      const otherChat = insertChat();
+      insertQuestion({ chatId: ownerChat, requestId: "cq-other-1" });
+
+      const res = await hit(otherChat, "cq-other-1", { answer: "hi" });
+      expect(res.status).toBe(404);
+    });
+
+    it("returns 400 for an oversize answer (> 8000 chars)", async () => {
+      const chatId = insertChat();
+      insertQuestion({ chatId, requestId: "cq-size-1" });
+
+      const res = await hit(chatId, "cq-size-1", { answer: "x".repeat(8001) });
+      expect(res.status).toBe(400);
+    });
+
+    it("returns 400 for an empty answer", async () => {
+      const chatId = insertChat();
+      insertQuestion({ chatId, requestId: "cq-empty-1" });
+
+      const res = await hit(chatId, "cq-empty-1", { answer: "" });
+      expect(res.status).toBe(400);
+    });
+
+    it("returns 409 when the question is already answered", async () => {
+      const chatId = insertChat();
+      insertQuestion({ chatId, requestId: "cq-dup-1", status: "answered" });
+
+      const res = await hit(chatId, "cq-dup-1", { answer: "again" });
+      expect(res.status).toBe(409);
+    });
+
+    it("returns 404 when the chat does not exist", async () => {
+      const res = await hit(999999, "anything", { answer: "hi" });
+      expect(res.status).toBe(404);
+    });
+  });
+
+  describe("GET /chats/:id/questions", () => {
+    it("lists pending questions for the chat", async () => {
+      const chat = testDb.db.insert(chatsTable).values({ title: "list-questions-chat" }).returning().get();
+      const chatId = chat!.id;
+
+      testDb.db.insert(agentQuestions).values({
+        requestId: "cq-list-1",
+        chatId,
+        toolUseId: "tu-clist-1",
+        question: "confirm?",
+        status: "pending",
+      }).run();
+      testDb.db.insert(agentQuestions).values({
+        requestId: "cq-list-done",
+        chatId,
+        toolUseId: "tu-clist-done",
+        question: "old",
+        status: "answered",
+        answer: "ok",
+        answeredAt: new Date().toISOString(),
+      }).run();
+
+      const res = await app.request(`/chats/${chatId}/questions`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.items).toHaveLength(1);
+      expect(body.items[0].requestId).toBe("cq-list-1");
+    });
+
+    it("returns 404 for a missing chat", async () => {
+      const res = await app.request("/chats/999999/questions");
       expect(res.status).toBe(404);
     });
   });

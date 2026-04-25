@@ -2,13 +2,14 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { Hono } from "hono";
 import {
   remoteAuth,
+  requireLoopback,
   verifyWsToken,
   safeCompare,
   isLoopbackBindHost,
   getClientIp,
   _resetRateLimiter,
 } from "../../middleware/remote-auth.js";
-import * as config from "../../config.js";
+import * as config from "../../config/index.js";
 
 const VALID_TOKEN = "0123456789abcdef0123456789abcdef0123";
 const SECOND_TOKEN = "fedcba9876543210fedcba9876543210fedc";
@@ -138,6 +139,110 @@ describe("remoteAuth middleware", () => {
     app.options("/secret", (c) => c.body(null, 204));
     const res = await app.request("/secret", { method: "OPTIONS" }, remoteEnv());
     expect(res.status).toBeLessThan(400);
+  });
+});
+
+describe("requireLoopback middleware", () => {
+  function makeLoopbackApp() {
+    // Compose remoteAuth first (as in server.ts), then the per-route
+    // loopback gate. This mirrors how the /fs router is mounted: a remote
+    // caller with a valid token satisfies remoteAuth, then hits the extra
+    // loopback gate.
+    const app = new Hono();
+    app.use("/*", remoteAuth);
+    app.use("/jailed/*", requireLoopback);
+    app.get("/jailed/browse", (c) => c.json({ ok: true }));
+    app.get("/public", (c) => c.json({ ok: true }));
+    return app;
+  }
+
+  beforeEach(() => {
+    _resetRateLimiter();
+    vi.restoreAllMocks();
+  });
+
+  it("is a no-op when remote auth is not configured (local-only mode)", async () => {
+    mockTokens([]);
+    // No env at all — mirrors in-memory `app.request` from unit tests.
+    const res = await makeLoopbackApp().request("/jailed/browse");
+    expect(res.status).toBe(200);
+  });
+
+  it("allows a localhost caller through even with remote auth on", async () => {
+    mockTokens([{ label: "default", token: VALID_TOKEN }]);
+    const res = await makeLoopbackApp().request(
+      "/jailed/browse",
+      {},
+      localhostEnv(),
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it("403s a remote caller WITH a valid bearer token", async () => {
+    mockTokens([{ label: "phone", token: VALID_TOKEN }]);
+    const res = await makeLoopbackApp().request(
+      "/jailed/browse",
+      { headers: { authorization: `Bearer ${VALID_TOKEN}` } },
+      remoteEnv(),
+    );
+    expect(res.status).toBe(403);
+    const body = await res.json();
+    expect(body).toEqual({ error: "endpoint is loopback-only" });
+  });
+
+  it("remote caller WITHOUT a token still 401s first (remoteAuth wins)", async () => {
+    // Demonstrates that requireLoopback is additive: the token gate still
+    // runs first, so a tokenless remote caller sees 401 (or 429 once the
+    // rate limiter trips), never 403 from the loopback gate.
+    mockTokens([{ label: "default", token: VALID_TOKEN }]);
+    const res = await makeLoopbackApp().request(
+      "/jailed/browse",
+      {},
+      remoteEnv(),
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("does NOT affect other routes — only the wrapped path is gated", async () => {
+    // Bearer-token auth must continue to work on non-/jailed endpoints.
+    mockTokens([{ label: "default", token: VALID_TOKEN }]);
+    const res = await makeLoopbackApp().request(
+      "/public",
+      { headers: { authorization: `Bearer ${VALID_TOKEN}` } },
+      remoteEnv(),
+    );
+    expect(res.status).toBe(200);
+  });
+
+  it("treats IPv6 loopback (::1) the same as 127.0.0.1", async () => {
+    mockTokens([{ label: "default", token: VALID_TOKEN }]);
+    const env = {
+      incoming: { socket: { remoteAddress: "::1" } },
+    } as unknown as Record<string, unknown>;
+    const res = await makeLoopbackApp().request("/jailed/browse", {}, env);
+    expect(res.status).toBe(200);
+  });
+
+  it("treats ::ffff:127.0.0.1 (v4-mapped-in-v6) as loopback", async () => {
+    mockTokens([{ label: "default", token: VALID_TOKEN }]);
+    const env = {
+      incoming: { socket: { remoteAddress: "::ffff:127.0.0.1" } },
+    } as unknown as Record<string, unknown>;
+    const res = await makeLoopbackApp().request("/jailed/browse", {}, env);
+    expect(res.status).toBe(200);
+  });
+
+  it("403s a caller whose source IP is 'unknown' under remote auth", async () => {
+    // With remote auth on, a request that arrives with no socket info is
+    // not safe to classify as local — explicit deny.
+    mockTokens([{ label: "default", token: VALID_TOKEN }]);
+    const noSocketEnv = {} as unknown as Record<string, unknown>;
+    const res = await makeLoopbackApp().request(
+      "/jailed/browse",
+      { headers: { authorization: `Bearer ${VALID_TOKEN}` } },
+      noSocketEnv,
+    );
+    expect(res.status).toBe(403);
   });
 });
 

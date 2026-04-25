@@ -10,7 +10,14 @@ import {
   DropdownMenuCheck,
 } from "@/components/ui/dropdown-menu";
 import { useServerContext } from "@/contexts/server-context";
+import type { ServerConnection } from "@/lib/types";
 import { cn } from "@/lib/utils";
+
+/** Human-friendly subtitle for a server row. */
+function subtitleFor(server: ServerConnection): string {
+  if (server.is_local) return "This machine";
+  return server.ssh?.host ?? "SSH tunnel";
+}
 
 function StatusDot({ status }: { status: "connected" | "checking" | "error" }) {
   const color =
@@ -42,7 +49,7 @@ export function ServerSwitcher() {
           <div className="flex min-w-0 flex-1 flex-col">
             <span className="truncate text-xs font-medium">{activeServer.name}</span>
             <span className="truncate text-[10px] text-muted-foreground">
-              {activeServer.is_local ? "This machine" : activeServer.url}
+              {subtitleFor(activeServer)}
             </span>
           </div>
           <StatusDot status={connectionStatus} />
@@ -60,7 +67,7 @@ export function ServerSwitcher() {
             <div className="flex min-w-0 flex-1 flex-col">
               <span className="truncate font-medium">{server.name}</span>
               <span className="truncate text-[11px] text-muted-foreground">
-                {server.is_local ? "This machine" : server.url}
+                {subtitleFor(server)}
               </span>
             </div>
             {server.id === activeServer.id && <DropdownMenuCheck className="mt-1" />}

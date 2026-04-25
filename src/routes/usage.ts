@@ -6,6 +6,7 @@ import { paginationParams } from "../lib/pagination.js";
 import { getBudgetSummary } from "../services/budget.js";
 import { BudgetScope, BudgetPeriod, BudgetAction } from "../lib/types.js";
 import { ValidationError, NotFoundError } from "../lib/errors.js";
+import { parseIdParam } from "../lib/route-params.js";
 
 export const usageRoutes = new Hono();
 
@@ -254,7 +255,7 @@ usageRoutes.post("/budgets", async (c) => {
 
 // PATCH /usage/budgets/:id — update a budget limit
 usageRoutes.patch("/budgets/:id", async (c) => {
-  const id = parseInt(c.req.param("id"));
+  const id = parseIdParam(c);
   const body = await c.req.json();
   const db = getDb();
 
@@ -278,7 +279,7 @@ usageRoutes.patch("/budgets/:id", async (c) => {
 
 // DELETE /usage/budgets/:id — remove a budget limit
 usageRoutes.delete("/budgets/:id", (c) => {
-  const id = parseInt(c.req.param("id"));
+  const id = parseIdParam(c);
   const db = getDb();
   const existing = db.select().from(budgetLimits).where(eq(budgetLimits.id, id)).get();
   if (!existing) throw new NotFoundError("Budget limit");

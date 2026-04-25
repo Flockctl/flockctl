@@ -10,7 +10,7 @@ const createdSessions: any[] = [];
 // Hook called inside mock run() BEFORE any throw so test can mutate DB state
 let beforeThrowHook: null | (() => void) = null;
 
-vi.mock("../../services/agent-session", () => {
+vi.mock("../../services/agent-session/index", () => {
   const EventEmitter = require("events").EventEmitter;
   class MockAgentSession extends EventEmitter {
     private opts: any;
@@ -114,11 +114,11 @@ vi.mock("../../services/ws-manager", () => ({
   wsManager: { broadcast: vi.fn(), broadcastAll: vi.fn() },
 }));
 
-vi.mock("../../services/claude-skills-sync", () => ({
+vi.mock("../../services/claude/skills-sync", () => ({
   reconcileClaudeSkillsForProject: vi.fn(() => {}),
 }));
 
-vi.mock("../../services/claude-mcp-sync", () => ({
+vi.mock("../../services/claude/mcp-sync", () => ({
   reconcileMcpForProject: vi.fn(() => {}),
 }));
 
@@ -168,9 +168,9 @@ beforeAll(() => {
 
 afterAll(() => sqlite.close());
 
-import { taskExecutor } from "../../services/task-executor.js";
+import { taskExecutor } from "../../services/task-executor/index.js";
 import { wsManager } from "../../services/ws-manager.js";
-import { reconcileClaudeSkillsForProject } from "../../services/claude-skills-sync.js";
+import { reconcileClaudeSkillsForProject } from "../../services/claude/skills-sync.js";
 import { loadProjectConfig } from "../../services/project-config.js";
 
 beforeEach(() => {
@@ -273,6 +273,21 @@ describe("TaskExecutor — reconciler failure is non-fatal", () => {
 });
 
 describe("TaskExecutor — session error variants", () => {
+  it("marks task as failed when promptFile is missing instead of crashing", async () => {
+    const task = db.insert(tasks).values({
+      projectId,
+      prompt: null,
+      promptFile: "/nonexistent/path/task.md",
+      status: "queued",
+    }).returning().get()!;
+
+    await expect(taskExecutor.execute(task.id)).resolves.toBeUndefined();
+
+    const u = db.select().from(tasks).where(eq(tasks.id, task.id)).get()!;
+    expect(u.status).toBe("failed");
+    expect(u.errorMessage).toContain("Prompt file not found");
+  });
+
   it("sets status=cancelled for AbortError", async () => {
     const task = db.insert(tasks).values({
       projectId,
@@ -644,6 +659,22 @@ describe("TaskExecutor — resetStaleTasks", () => {
     const ids = taskExecutor.resetStaleTasks();
     expect(Array.isArray(ids)).toBe(true);
   });
+
+  it("adopts DB-queued tasks orphaned by a prior daemon restart", () => {
+    // After a restart the in-memory queue is empty, so any `queued` task in
+    // DB that isn't currently owned by a session must be re-enqueued.
+    const t = db.insert(tasks).values({
+      projectId,
+      prompt: "orphan-queued",
+      status: "queued",
+    }).returning().get()!;
+
+    const requeued = taskExecutor.resetStaleTasks();
+    expect(requeued).toContain(t.id);
+
+    const after = db.select().from(tasks).where(eq(tasks.id, t.id)).get()!;
+    expect(after.status).toBe("queued");
+  });
 });
 
 describe("TaskExecutor — cancel + isRunning + getMetrics", () => {
@@ -714,5 +745,93 @@ describe("TaskExecutor — cancel + isRunning + getMetrics", () => {
     // Shutdown abort must NOT mark task terminal — it will resume on restart
     const u = db.select().from(tasks).where(eq(tasks.id, task.id)).get()!;
     expect(u.status).toBe("running");
+  });
+});
+
+describe("TaskExecutor — per-key concurrency", () => {
+  it("runs tasks concurrently when they use different assigned keys", async () => {
+    const secondKey = db.insert(aiProviderKeys).values({
+      provider: "anthropic",
+      providerType: "anthropic-messages",
+      label: "k2",
+      keyValue: "sk-ant-api-k2",
+      isActive: 1,
+      priority: 1,
+    } as any).returning().get()!;
+
+    const baseKey = db.select().from(aiProviderKeys).where(eq(aiProviderKeys.label, "k")).get()!;
+    taskExecutor.setMaxConcurrent(1);
+
+    const t1 = db.insert(tasks).values({
+      projectId,
+      prompt: "HANG_UNTIL_ABORT",
+      status: "queued",
+      assignedKeyId: baseKey.id,
+    }).returning().get()!;
+    const t2 = db.insert(tasks).values({
+      projectId,
+      prompt: "HANG_UNTIL_ABORT",
+      status: "queued",
+      assignedKeyId: secondKey.id,
+    }).returning().get()!;
+
+    const p1 = taskExecutor.execute(t1.id);
+    const p2 = taskExecutor.execute(t2.id);
+    await new Promise((r) => setImmediate(r));
+
+    expect(taskExecutor.isRunning(t1.id)).toBe(true);
+    expect(taskExecutor.isRunning(t2.id)).toBe(true);
+
+    expect(taskExecutor.cancel(t1.id)).toBe(true);
+    expect(taskExecutor.cancel(t2.id)).toBe(true);
+    await Promise.all([p1, p2]);
+
+    taskExecutor.setMaxConcurrent(5);
+    db.delete(aiProviderKeys).where(eq(aiProviderKeys.id, secondKey.id)).run();
+  });
+
+  it("falls back to the next available key when the top-priority key is saturated", async () => {
+    const secondKey = db.insert(aiProviderKeys).values({
+      provider: "anthropic",
+      providerType: "anthropic-messages",
+      label: "k-fallback",
+      keyValue: "sk-ant-api-k-fallback",
+      isActive: 1,
+      priority: 1,
+    } as any).returning().get()!;
+
+    taskExecutor.setMaxConcurrent(1);
+
+    const first = db.insert(tasks).values({
+      projectId,
+      prompt: "HANG_UNTIL_ABORT",
+      status: "queued",
+    }).returning().get()!;
+    const second = db.insert(tasks).values({
+      projectId,
+      prompt: "HANG_UNTIL_ABORT",
+      status: "queued",
+    }).returning().get()!;
+
+    const p1 = taskExecutor.execute(first.id);
+    await new Promise((r) => setImmediate(r));
+    const p2 = taskExecutor.execute(second.id);
+    await new Promise((r) => setImmediate(r));
+
+    const firstRow = db.select().from(tasks).where(eq(tasks.id, first.id)).get()!;
+    const secondRow = db.select().from(tasks).where(eq(tasks.id, second.id)).get()!;
+    expect(firstRow.assignedKeyId).toBeTruthy();
+    expect(secondRow.assignedKeyId).toBeTruthy();
+    expect(secondRow.assignedKeyId).toBe(secondKey.id);
+
+    expect(taskExecutor.isRunning(first.id)).toBe(true);
+    expect(taskExecutor.isRunning(second.id)).toBe(true);
+
+    expect(taskExecutor.cancel(first.id)).toBe(true);
+    expect(taskExecutor.cancel(second.id)).toBe(true);
+    await Promise.all([p1, p2]);
+
+    taskExecutor.setMaxConcurrent(5);
+    db.delete(aiProviderKeys).where(eq(aiProviderKeys.id, secondKey.id)).run();
   });
 });

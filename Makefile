@@ -40,8 +40,25 @@ clean:
 	rm -rf dist
 
 # Rebuild (TS + UI) and reinstall globally. Stops a running flockctl first.
+#
+# IMPORTANT: never SIGKILL (`kill -9`) the daemon here. The graceful-shutdown
+# path in server-entry.ts drains in-flight chat streams and flushes each
+# chat's `claudeSessionId`; forcing the process to die mid-drain leaves a
+# stale session id in SQLite, so the next user message tries to
+# `claude --resume <dead-id>` and starts from scratch — which is exactly the
+# "context lost on make reinstall" bug.
+#
+# `flockctl stop` now blocks until the child process actually exits (up to
+# 15 s, matches the shutdown budget). If it times out we bail loudly instead
+# of papering over it — that should prompt the operator to investigate, not
+# auto-force-kill.
 reinstall:
-	-flockctl stop 2>/dev/null || true
+	@flockctl stop 2>/dev/null || true
+	@if lsof -ti :52077 >/dev/null 2>&1; then \
+		echo "❌ port 52077 still busy after flockctl stop — refusing to reinstall."; \
+		echo "   Investigate the stuck process manually before retrying."; \
+		exit 1; \
+	fi
 	npm run build
 	npm install -g .
 	flockctl start

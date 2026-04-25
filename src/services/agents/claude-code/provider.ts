@@ -8,7 +8,7 @@ import type {
   StreamChatEvent,
   CostInput,
 } from "../types.js";
-import { createAIClient } from "../../ai-client.js";
+import { createAIClient } from "../../ai/client.js";
 import {
   CLAUDE_CODE_MODELS,
   streamViaClaudeAgentSDK,
@@ -17,8 +17,8 @@ import {
   isClaudeCodeAuthed,
   isClaudeCodeReady,
   clearReadinessCache,
-} from "../../claude-cli.js";
-import { calculateCost } from "../../cost.js";
+} from "../../claude/cli.js";
+import { calculateCost } from "../../ai/cost.js";
 
 export class ClaudeCodeProvider implements AgentProvider {
   readonly id = "claude-code";
@@ -56,6 +56,9 @@ export class ClaudeCodeProvider implements AgentProvider {
       canUseTool: opts.canUseTool as any,
       sdkPermissionMode: opts.sdkPermissionMode,
       resumeSessionId: opts.resumeSessionId,
+      mcpServers: opts.mcpServers,
+      thinkingEnabled: opts.thinkingEnabled,
+      effort: opts.effort,
     });
   }
 
@@ -68,6 +71,7 @@ export class ClaudeCodeProvider implements AgentProvider {
       configDir: opts.configDir,
       resumeSessionId: opts.resumeSessionId,
       signal: opts.signal,
+      mcpServers: opts.mcpServers,
     });
     for await (const event of iter) {
       yield event as StreamChatEvent;

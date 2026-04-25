@@ -5,6 +5,7 @@
     "moduleResolution": "bundler",
     "esModuleInterop": true,
     "strict": true,
+    "noUncheckedIndexedAccess": true,
     "outDir": "./dist",
     "rootDir": "./src",
     "declaration": true,
@@ -14,5 +15,11 @@
     "paths": { "@/*": ["./src/*"] }
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "ui"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    "ui",
+    "src/__tests__/**/*",
+    "src/services/__tests__/**/*"
+  ]
 }

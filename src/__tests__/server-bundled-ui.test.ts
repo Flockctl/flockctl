@@ -107,8 +107,8 @@ describe("server.ts — bundled UI block", () => {
 describe("server.ts — CORS with remote auth", () => {
   it("uses whitelist-based CORS when remoteAccessToken is configured", async () => {
     vi.resetModules();
-    vi.doMock("../config.js", async () => {
-      const actual = await vi.importActual<typeof import("../config.js")>("../config.js");
+    vi.doMock("../config/index.js", async () => {
+      const actual = await vi.importActual<typeof import("../config/index.js")>("../config/index.js");
       return {
         ...actual,
         hasRemoteAuth: () => true,
@@ -123,15 +123,15 @@ describe("server.ts — CORS with remote auth", () => {
       expect(res.status).toBe(200);
       expect(res.headers.get("access-control-allow-origin")).toBe("https://app.example.com");
     } finally {
-      vi.doUnmock("../config.js");
+      vi.doUnmock("../config/index.js");
       vi.resetModules();
     }
   });
 
   it("falls back to wildcard CORS when whitelist is empty", async () => {
     vi.resetModules();
-    vi.doMock("../config.js", async () => {
-      const actual = await vi.importActual<typeof import("../config.js")>("../config.js");
+    vi.doMock("../config/index.js", async () => {
+      const actual = await vi.importActual<typeof import("../config/index.js")>("../config/index.js");
       return {
         ...actual,
         hasRemoteAuth: () => true,
@@ -145,7 +145,7 @@ describe("server.ts — CORS with remote auth", () => {
       });
       expect(res.status).toBe(200);
     } finally {
-      vi.doUnmock("../config.js");
+      vi.doUnmock("../config/index.js");
       vi.resetModules();
     }
   });

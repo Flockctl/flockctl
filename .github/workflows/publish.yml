@@ -39,6 +39,12 @@ jobs:
       - name: Install UI deps
         run: cd ui && npm ci
 
+      - name: Audit root dependencies
+        run: npm audit --audit-level=moderate
+
+      - name: Audit UI dependencies
+        run: cd ui && npm audit --audit-level=moderate
+
       - name: Verify release tag matches package.json version
         if: github.event_name == 'release'
         run: |

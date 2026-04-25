@@ -7,10 +7,11 @@
  */
 import { readdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
+const tsxBin = resolve(here, "..", "..", "node_modules/.bin/tsx");
 const files = readdirSync(here)
   .filter((f) => f.startsWith("test-") && f.endsWith(".ts"))
   .sort();
@@ -31,10 +32,15 @@ for (const file of files) {
   const label = file.replace(/^test-/, "").replace(/\.ts$/, "");
   process.stdout.write(`  ${label} ... `);
   const start = Date.now();
-  const result = spawnSync("npx", ["tsx", full], {
+  // Spawn `tsx` directly (not via `npx`) so each smoke test's PID *is* the
+  // Node process running the test — `npx tsx` adds a wrapper that on Linux
+  // can swallow signals and inflate cold-start by seconds, both of which
+  // poisoned our 30 s budget on cold CI runners. Total budget is 60 s
+  // (25 s harness deadline + ~30 s test work + slack).
+  const result = spawnSync(tsxBin, [full], {
     stdio: "pipe",
     encoding: "utf8",
-    timeout: 30_000,
+    timeout: 60_000,
     env: process.env,
   });
   const ms = Date.now() - start;

@@ -176,6 +176,125 @@
       "when": 1752200000000,
       "tag": "0024_add_secrets",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "5",
+      "when": 1752300000000,
+      "tag": "0025_add_chat_todos",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "5",
+      "when": 1752400000000,
+      "tag": "0026_add_task_spec_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "5",
+      "when": 1752500000000,
+      "tag": "0027_add_chat_attachments",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "5",
+      "when": 1752600000000,
+      "tag": "0028_add_chats_entity_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "5",
+      "when": 1752700000000,
+      "tag": "0029_add_agent_questions",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "5",
+      "when": 1752800000000,
+      "tag": "0030_add_usage_activity_type",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "5",
+      "when": 1752900000000,
+      "tag": "0031_add_incidents",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "5",
+      "when": 1753000000000,
+      "tag": "0032_recompute_opus_47_cost",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "5",
+      "when": 1753100000000,
+      "tag": "0033_add_chats_key_and_model",
+      "breakpoints": true
+    },
+    {
+      "idx": 34,
+      "version": "5",
+      "when": 1753200000000,
+      "tag": "0034_add_chat_approval_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "5",
+      "when": 1753300000000,
+      "tag": "0035_drop_task_state_machine",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "5",
+      "when": 1753400000000,
+      "tag": "0036_add_file_edits",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "5",
+      "when": 1753500000000,
+      "tag": "0037_templates_to_files",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "5",
+      "when": 1753600000000,
+      "tag": "0038_add_gitignore_toggles",
+      "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "5",
+      "when": 1753700000000,
+      "tag": "0039_add_chat_thinking_and_effort",
+      "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "5",
+      "when": 1753800000000,
+      "tag": "0040_add_chat_pinned",
+      "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "5",
+      "when": 1753900000000,
+      "tag": "0041_add_chat_todos_parent_tool_use_id",
+      "breakpoints": true
     }
   ]
 }

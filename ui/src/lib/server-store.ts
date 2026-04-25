@@ -2,7 +2,8 @@ import type { ServerConnection } from "./types";
 
 /**
  * Active-server id lives in localStorage so the choice survives reloads.
- * Tokens NEVER touch localStorage — they live only in the in-memory Maps below.
+ * Bearer tokens never touch the UI — remote access is tunnelled over SSH
+ * and the loopback endpoint the tunnel exposes does not require auth.
  */
 const ACTIVE_KEY = "flockctl_active_server";
 
@@ -11,37 +12,51 @@ export const LOCAL_SERVER_ID = "local";
 export const LOCAL_SERVER: ServerConnection = {
   id: LOCAL_SERVER_ID,
   name: "Local",
-  url: "",
   is_local: true,
-  has_token: false,
 };
 
-const tokenCache = new Map<string, string>();
-const serverUrlMap = new Map<string, string>();
+/**
+ * Per-remote loopback port the SSH tunnel is bound to. `getApiBaseUrl()`
+ * and `getWsBaseUrl()` read from this map to assemble
+ * `http://127.0.0.1:${tunnelPort}` URLs; the map is kept in sync with the
+ * server context on every refresh.
+ */
+const serverTunnelPortMap = new Map<string, number>();
 
-export function cacheToken(serverId: string, token: string): void {
-  tokenCache.set(serverId, token);
+// Subscribers notified when the active server id changes. Lets components
+// (e.g. useWebSocket) tear down and reconnect without relying on React context.
+const activeServerListeners = new Set<() => void>();
+
+export function subscribeActiveServerId(listener: () => void): () => void {
+  activeServerListeners.add(listener);
+  return () => {
+    activeServerListeners.delete(listener);
+  };
 }
 
-export function clearCachedToken(serverId: string): void {
-  tokenCache.delete(serverId);
+function notifyActiveServerChanged(): void {
+  for (const listener of activeServerListeners) {
+    try {
+      listener();
+    } catch {
+      // listeners must not throw; swallow to keep other subscribers alive
+    }
+  }
 }
 
-export function getCachedToken(serverId: string): string | undefined {
-  return tokenCache.get(serverId);
+export function setServerMap(
+  servers: Array<{ id: string; tunnelPort: number | null | undefined }>,
+): void {
+  serverTunnelPortMap.clear();
+  for (const s of servers) {
+    if (typeof s.tunnelPort === "number") {
+      serverTunnelPortMap.set(s.id, s.tunnelPort);
+    }
+  }
 }
 
-export function clearTokenCache(): void {
-  tokenCache.clear();
-}
-
-export function setServerMap(servers: Array<{ id: string; url: string }>): void {
-  serverUrlMap.clear();
-  for (const s of servers) serverUrlMap.set(s.id, s.url);
-}
-
-export function getServerUrl(id: string): string | undefined {
-  return serverUrlMap.get(id);
+export function getServerTunnelPort(id: string): number | undefined {
+  return serverTunnelPortMap.get(id);
 }
 
 export function getActiveServerId(): string {
@@ -58,4 +73,5 @@ export function setActiveServerId(id: string): void {
   } catch {
     // ignore storage errors
   }
+  notifyActiveServerChanged();
 }

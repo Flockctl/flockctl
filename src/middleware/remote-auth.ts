@@ -1,35 +1,12 @@
 import { createMiddleware } from "hono/factory";
 import { timingSafeEqual } from "crypto";
 import type { Context } from "hono";
-import { findMatchingToken, hasRemoteAuth } from "../config.js";
-
-const failedAttempts = new Map<string, { count: number; resetAt: number }>();
-const MAX_ATTEMPTS = 5;
-const WINDOW_MS = 60_000;
+import { findMatchingToken, hasRemoteAuth } from "../config/index.js";
+import { authRateLimiter } from "../lib/rate-limit.js";
 
 /** @internal — reset for tests only */
 export function _resetRateLimiter() {
-  failedAttempts.clear();
-}
-
-function isRateLimited(ip: string): boolean {
-  const entry = failedAttempts.get(ip);
-  if (!entry) return false;
-  /* v8 ignore next 4 — defensive: window expiry race; covered by recordFailure path */
-  if (Date.now() > entry.resetAt) {
-    failedAttempts.delete(ip);
-    return false;
-  }
-  return entry.count >= MAX_ATTEMPTS;
-}
-
-function recordFailure(ip: string): void {
-  const entry = failedAttempts.get(ip);
-  if (!entry || Date.now() > entry.resetAt) {
-    failedAttempts.set(ip, { count: 1, resetAt: Date.now() + WINDOW_MS });
-  } else {
-    entry.count++;
-  }
+  authRateLimiter.reset();
 }
 
 export function safeCompare(a: string, b: string): boolean {
@@ -93,7 +70,7 @@ export const remoteAuth = createMiddleware(async (c, next) => {
     return next();
   }
 
-  if (isRateLimited(clientIp)) {
+  if (authRateLimiter.isLimited(clientIp)) {
     return c.json({ error: "Too many failed attempts. Try again later." }, 429);
   }
 
@@ -102,11 +79,41 @@ export const remoteAuth = createMiddleware(async (c, next) => {
 
   const match = provided ? findMatchingToken(provided) : null;
   if (!match) {
-    recordFailure(clientIp);
+    authRateLimiter.recordFailure(clientIp);
     return c.json({ error: "Unauthorized" }, 401);
   }
 
   c.set("authTokenLabel" as never, match.label as never);
+  return next();
+});
+
+/**
+ * Loopback-only gate. A per-route middleware that 403s any non-localhost
+ * caller, even if they hold a valid bearer token. This is intentionally
+ * ADDITIVE to `remoteAuth`: bearer tokens remain valid for every other
+ * endpoint; only routes that explicitly wrap themselves in `requireLoopback()`
+ * get the extra restriction.
+ *
+ * Use for endpoints whose threat model assumes the caller already has
+ * filesystem-level access to the machine (e.g. `/fs/browse`), where exposing
+ * them to a remote token holder — even a legitimate one — would broaden the
+ * attack surface far beyond what the token was meant to grant.
+ */
+export const requireLoopback = createMiddleware(async (c, next) => {
+  // In local-only mode the server is already bound to 127.0.0.1 by
+  // server-entry.ts, so there is no remote caller to block — the gate is a
+  // no-op to keep the local CLI workflow (and in-memory `app.request` tests,
+  // which carry no socket info) unimpeded. The gate only becomes meaningful
+  // once remote access is opted in: the control plane now accepts bearer
+  // tokens, so we must reject those tokens on routes that are not safe to
+  // expose off-box.
+  if (!hasRemoteAuth()) {
+    return next();
+  }
+  const clientIp = getClientIp(c);
+  if (!isLocalhost(clientIp)) {
+    return c.json({ error: "endpoint is loopback-only" }, 403);
+  }
   return next();
 });
 

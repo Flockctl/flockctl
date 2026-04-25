@@ -1,0 +1,22 @@
+# Keep the build context small — we only need package manifests, dist/,
+# migrations/, and a couple of src/ subtrees (listed in the Dockerfile).
+node_modules
+ui
+coverage
+tmp
+.flockctl
+.git
+.github
+.vscode
+.idea
+
+# Exclude the whole tests/ tree EXCEPT tests/cli-docker/ itself, so the
+# Dockerfile sits in context but smoke/live test sources don't bloat it.
+tests/*
+!tests/cli-docker
+
+# Misc
+*.log
+.DS_Store
+.env
+.env.*

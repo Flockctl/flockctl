@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from "vitest";
-import { createTestDb } from "../helpers.js";
+import { createTestDb, seedActiveKey } from "../helpers.js";
 import { setDb, type FlockctlDb } from "../../db/index.js";
 import { workspaces, projects, tasks, usageRecords } from "../../db/schema.js";
 import Database from "better-sqlite3";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync } from "fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 
@@ -18,6 +18,7 @@ import { execSync } from "child_process";
 let db: FlockctlDb;
 let sqlite: Database.Database;
 let tempDir: string;
+let keyId: number;
 
 beforeAll(() => {
   const t = createTestDb();
@@ -25,6 +26,9 @@ beforeAll(() => {
   sqlite = t.sqlite;
   setDb(db, sqlite);
   tempDir = mkdtempSync(join(tmpdir(), "flockctl-wsfull-"));
+  // POST /workspaces and POST /workspaces/:id/projects require at least one
+  // active key in allowedKeyIds (see src/routes/_allowed-keys.ts).
+  keyId = seedActiveKey(sqlite);
 });
 
 afterAll(() => {
@@ -56,12 +60,12 @@ describe("workspaces — config endpoints", () => {
     expect(await res.json()).toEqual({});
   });
 
-  it("GET /workspaces/:id/config reads from .flockctl/config.yaml", async () => {
+  it("GET /workspaces/:id/config reads from .flockctl/config.json", async () => {
     const wsPath = mkdtempSync(join(tempDir, "ws-cfg-"));
     mkdirSync(join(wsPath, ".flockctl"), { recursive: true });
     writeFileSync(
-      join(wsPath, ".flockctl", "config.yaml"),
-      "permissionMode: acceptEdits\n",
+      join(wsPath, ".flockctl", "config.json"),
+      JSON.stringify({ permissionMode: "acceptEdits" }),
     );
     const ws = db.insert(workspaces).values({
       name: "c1", path: wsPath,
@@ -100,8 +104,12 @@ describe("workspaces — config endpoints", () => {
     const wsPath = mkdtempSync(join(tempDir, "ws-put-clear-"));
     mkdirSync(join(wsPath, ".flockctl"), { recursive: true });
     writeFileSync(
-      join(wsPath, ".flockctl", "config.yaml"),
-      "permissionMode: strict\ndisabledSkills:\n  - s1\ndisabledMcpServers:\n  - m1\n",
+      join(wsPath, ".flockctl", "config.json"),
+      JSON.stringify({
+        permissionMode: "strict",
+        disabledSkills: ["s1"],
+        disabledMcpServers: ["m1"],
+      }),
     );
     const ws = db.insert(workspaces).values({
       name: "c3", path: wsPath,
@@ -147,53 +155,86 @@ describe("workspaces — config endpoints", () => {
   });
 });
 
-describe("workspaces — agents-md endpoints", () => {
-  it("GET /workspaces/:id/agents-md returns blank source/effective initially", async () => {
-    const wsPath = mkdtempSync(join(tempDir, "ws-md-"));
-    const ws = db.insert(workspaces).values({
-      name: "md1", path: wsPath,
-    }).returning().get()!;
+// NOTE: GET/PUT /workspaces/:id/agents-md coverage lives in
+// src/__tests__/routes/agents-md.test.ts — the endpoint now returns a
+// per-layer shape (`{layers: {"workspace-public", "workspace-private"}}`)
+// and the PUT body takes a `{layer, content}` pair.
 
-    const res = await app.request(`/workspaces/${ws.id}/agents-md`);
+describe("workspaces — TODO.md endpoints", () => {
+  it("POST /workspaces seeds TODO.md at workspace root", async () => {
+    const wsPath = mkdtempSync(join(tempDir, "ws-todo-seed-"));
+    const res = await app.request("/workspaces", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "ws-todo-seed", path: wsPath, allowedKeyIds: [keyId] }),
+    });
+    expect(res.status).toBe(201);
+    const p = join(wsPath, "TODO.md");
+    expect(existsSync(p)).toBe(true);
+    expect(readFileSync(p, "utf-8")).toContain("# TODO");
+  });
+
+  it("POST /workspaces does not overwrite existing TODO.md", async () => {
+    const wsPath = mkdtempSync(join(tempDir, "ws-todo-keep-"));
+    writeFileSync(join(wsPath, "TODO.md"), "keep me");
+    const res = await app.request("/workspaces", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "ws-todo-keep", path: wsPath, allowedKeyIds: [keyId] }),
+    });
+    expect(res.status).toBe(201);
+    expect(readFileSync(join(wsPath, "TODO.md"), "utf-8")).toBe("keep me");
+  });
+
+  it("POST /workspaces/:id/projects seeds TODO.md in the nested project dir", async () => {
+    const wsPath = mkdtempSync(join(tempDir, "ws-nested-todo-"));
+    const ws = db.insert(workspaces).values({ name: "ws-nested", path: wsPath }).returning().get()!;
+    const res = await app.request(`/workspaces/${ws.id}/projects`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "nested-proj", allowedKeyIds: [keyId] }),
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(existsSync(join(body.path, "TODO.md"))).toBe(true);
+  });
+
+  it("GET /workspaces/:id/todo reads TODO.md", async () => {
+    const wsPath = mkdtempSync(join(tempDir, "ws-todo-read-"));
+    writeFileSync(join(wsPath, "TODO.md"), "work stream");
+    const ws = db.insert(workspaces).values({ name: "ws-todo-read", path: wsPath }).returning().get()!;
+    const res = await app.request(`/workspaces/${ws.id}/todo`);
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(typeof body.source).toBe("string");
-    expect(typeof body.effective).toBe("string");
+    expect(body.content).toBe("work stream");
+    expect(body.path).toBe(join(wsPath, "TODO.md"));
   });
 
-  it("GET /workspaces/:id/agents-md returns {source:'', effective:''} when no path", async () => {
-    const ws = db.insert(workspaces).values({ name: "md-np", path: "/tmp" }).returning().get()!;
-    sqlite.prepare("UPDATE workspaces SET path='' WHERE id=?").run(ws.id);
-
-    const res = await app.request(`/workspaces/${ws.id}/agents-md`);
+  it("GET /workspaces/:id/todo returns empty shape when workspace has no path", async () => {
+    const ws = db.insert(workspaces).values({ name: "ws-todo-nopath", path: "" }).returning().get()!;
+    const res = await app.request(`/workspaces/${ws.id}/todo`);
+    expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.source).toBe("");
-    expect(body.effective).toBe("");
+    expect(body.content).toBe("");
+    expect(body.path).toBe("");
   });
 
-  it("PUT /workspaces/:id/agents-md saves source and returns both", async () => {
-    const wsPath = mkdtempSync(join(tempDir, "ws-md-put-"));
-    const ws = db.insert(workspaces).values({
-      name: "md2", path: wsPath,
-    }).returning().get()!;
-
-    const res = await app.request(`/workspaces/${ws.id}/agents-md`, {
+  it("PUT /workspaces/:id/todo saves content and reads it back", async () => {
+    const wsPath = mkdtempSync(join(tempDir, "ws-todo-put-"));
+    const ws = db.insert(workspaces).values({ name: "ws-todo-put", path: wsPath }).returning().get()!;
+    const res = await app.request(`/workspaces/${ws.id}/todo`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: "# Header" }),
+      body: JSON.stringify({ content: "# WS TODO" }),
     });
     expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.source).toContain("# Header");
+    expect(readFileSync(join(wsPath, "TODO.md"), "utf-8")).toBe("# WS TODO");
   });
 
-  it("PUT /workspaces/:id/agents-md rejects oversized content", async () => {
-    const wsPath = mkdtempSync(join(tempDir, "ws-md-big-"));
-    const ws = db.insert(workspaces).values({
-      name: "md3", path: wsPath,
-    }).returning().get()!;
-
-    const res = await app.request(`/workspaces/${ws.id}/agents-md`, {
+  it("PUT /workspaces/:id/todo rejects oversized content", async () => {
+    const wsPath = mkdtempSync(join(tempDir, "ws-todo-big-"));
+    const ws = db.insert(workspaces).values({ name: "ws-todo-big", path: wsPath }).returning().get()!;
+    const res = await app.request(`/workspaces/${ws.id}/todo`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content: "x".repeat(300_000) }),
@@ -201,27 +242,22 @@ describe("workspaces — agents-md endpoints", () => {
     expect(res.status).toBe(422);
   });
 
-  it("PUT /workspaces/:id/agents-md — non-string content coerced to ''", async () => {
-    const wsPath = mkdtempSync(join(tempDir, "ws-md-non-"));
-    const ws = db.insert(workspaces).values({
-      name: "md4", path: wsPath,
-    }).returning().get()!;
-
-    const res = await app.request(`/workspaces/${ws.id}/agents-md`, {
+  it("PUT /workspaces/:id/todo — non-string content coerced to ''", async () => {
+    const wsPath = mkdtempSync(join(tempDir, "ws-todo-nonstr-"));
+    const ws = db.insert(workspaces).values({ name: "ws-todo-nonstr", path: wsPath }).returning().get()!;
+    const res = await app.request(`/workspaces/${ws.id}/todo`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: 12345 }),
+      body: JSON.stringify({ content: 7 }),
     });
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.source).toBe("");
+    expect(body.content).toBe("");
   });
 
-  it("PUT /workspaces/:id/agents-md — requires path", async () => {
-    const ws = db.insert(workspaces).values({ name: "md-np", path: "/tmp" }).returning().get()!;
-    sqlite.prepare("UPDATE workspaces SET path='' WHERE id=?").run(ws.id);
-
-    const res = await app.request(`/workspaces/${ws.id}/agents-md`, {
+  it("PUT /workspaces/:id/todo 422 when workspace has no path", async () => {
+    const ws = db.insert(workspaces).values({ name: "ws-todo-nopath-put", path: "" }).returning().get()!;
+    const res = await app.request(`/workspaces/${ws.id}/todo`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content: "x" }),
@@ -229,10 +265,10 @@ describe("workspaces — agents-md endpoints", () => {
     expect(res.status).toBe(422);
   });
 
-  it("404 for unknown workspace on agents-md GET/PUT", async () => {
-    const g = await app.request(`/workspaces/999/agents-md`);
+  it("404 for unknown workspace on todo GET/PUT", async () => {
+    const g = await app.request(`/workspaces/9999/todo`);
     expect(g.status).toBe(404);
-    const p = await app.request(`/workspaces/999/agents-md`, {
+    const p = await app.request(`/workspaces/9999/todo`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content: "x" }),
@@ -253,7 +289,7 @@ describe("workspaces — POST existing dir resolves remote url", () => {
     const res = await app.request("/workspaces", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "existing-ws", path: wsPath }),
+      body: JSON.stringify({ name: "existing-ws", path: wsPath, allowedKeyIds: [keyId] }),
     });
 
     expect(res.status).toBe(201);
@@ -269,7 +305,7 @@ describe("workspaces — POST existing dir resolves remote url", () => {
     const res = await app.request("/workspaces", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "no-remote-ws", path: wsPath }),
+      body: JSON.stringify({ name: "no-remote-ws", path: wsPath, allowedKeyIds: [keyId] }),
     });
 
     expect(res.status).toBe(201);
@@ -287,12 +323,12 @@ describe("workspaces — POST existing dir resolves remote url", () => {
     const res = await app.request("/workspaces", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "no-git-ws", path: wsPath }),
+      body: JSON.stringify({ name: "no-git-ws", path: wsPath, allowedKeyIds: [keyId] }),
     });
     expect(res.status).toBe(201);
   });
 
-  it("permissionMode in POST body gets persisted to config.yaml", async () => {
+  it("permissionMode in POST body gets persisted to config.json", async () => {
     const wsPath = mkdtempSync(join(tempDir, "ws-pm-"));
     const res = await app.request("/workspaces", {
       method: "POST",
@@ -300,6 +336,7 @@ describe("workspaces — POST existing dir resolves remote url", () => {
       body: JSON.stringify({
         name: "pm-ws", path: wsPath,
         permissionMode: "bypassPermissions",
+        allowedKeyIds: [keyId],
       }),
     });
     expect(res.status).toBe(201);

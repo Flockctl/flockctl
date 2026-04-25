@@ -134,7 +134,7 @@ function SecretDialog({
           <DialogDescription>
             {isEditing
               ? `Rotate the value of "${editSecret.name}" at the ${props.scope} scope. The current value is never shown — entering a new one replaces it.`
-              : `Store a secret at the ${props.scope} scope. Reference it from MCP env with $\{secret:NAME\}.`}
+              : `Store a secret at the ${props.scope} scope. Reference it from MCP env with $\{secret:NAME}.`}
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4">

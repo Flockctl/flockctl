@@ -16,12 +16,12 @@ The skills system and the MCP server system have grown almost-identical architec
 
 ## Target state
 
-- Swarmctl **config files** (`.flockctl/config.yaml`) migrate to **JSON**. The `yaml` npm package stays — it's still needed for YAML frontmatter in `SKILL.md` and plan markdown files (Claude Code's native skill format mandates YAML frontmatter; see [src/services/plan-store.ts:99-119](../src/services/plan-store.ts#L99-L119)).
+- Flockctl **config files** (`.flockctl/config.yaml`) migrate to **JSON**. The `yaml` npm package stays — it's still needed for YAML frontmatter in `SKILL.md` and plan markdown files (Claude Code's native skill format mandates YAML frontmatter; see [src/services/plan-store.ts:99-119](../src/services/plan-store.ts#L99-L119)).
 
 **Skills:**
 - **Reconciler is the single mechanism** for exposing skills to Claude Code. Symlink reconciliation at **both** levels: `<workspace>/.claude/skills/` (global + workspace, minus workspace-scoped `disabledSkills[]` entries whose `level` targets `global` or `workspace`) and `<project>/.claude/skills/` (global + workspace + project, minus both workspace- and project-scoped disable entries, each matched by `(name, level)` pair). Claude Code's native loader picks up whichever set matches its cwd.
 - **`seedClaudeCodePlugin` is removed** ([src/config.ts:350](../src/config.ts#L350)). The plugin mechanism can't express project-scoped disables — a global skill exposed as a plugin can't be hidden from a specific project. Dropping it eliminates the duplication risk and makes the reconciler the single source of truth. `~/.claude/settings.json` mutations (`extraKnownMarketplaces`, `enabledPlugins`) also go away; existing entries get cleaned up on first boot.
-- **`skills-state.json` manifests** at both workspace and project level are the committed declarative source of truth for "what Swarmctl resolved as the effective skill set and at which level each skill came from." Teammates clone → they see identical skills-state → their local reconciler produces identical `.claude/skills/`. UI reads these instead of re-resolving.
+- **`skills-state.json` manifests** at both workspace and project level are the committed declarative source of truth for "what flockctl resolved as the effective skill set and at which level each skill came from." Teammates clone → they see identical skills-state → their local reconciler produces identical `.claude/skills/`. UI reads these instead of re-resolving.
 - `reconciled_at` timestamp lives in `.flockctl/.skills-reconcile` (gitignored) — **not** in the committed manifest. This keeps the committed file byte-stable across reconciles when content is unchanged, avoiding git noise.
 - No more `<skills>` XML injection in task/chat system prompts.
 - Task-level disable feature **removed entirely** — every task uses the full currently-enabled set.
@@ -44,11 +44,11 @@ The skills system and the MCP server system have grown almost-identical architec
 1. **Task-level disable: DROP the feature.** No DB column, no in-memory overlay, no per-task API. Each task runs with the full enabled set. Simplifies reconciler (no task overlay), eliminates per-project concurrency lock requirement.
 2. **`plan-prompt.ts` drops all inline injection.** Correction of earlier decision: plan generation IS already a Claude Code session (task-executor runs the plan-gen task with `agent: "claude-code"` at [src/routes/planning.ts:277-289](../src/routes/planning.ts#L277-L289)). So native skill loading works. Remove both (a) project-skill XML blocks and (b) `planning`-skill template reading (`planStructure`, `modeSection`). The new prompt passes an **explicit mode directive** (e.g. `Use the planning skill's "Quick Mode" section`) so the model loads the right skill section on demand. Reconciler guarantees `planning` skill is present via symlinks before task-executor starts the task. Delete `stripFrontmatter`, `loadPlanningSkill`, `extractModeSection`, `extractPlanStructure`, `resolveSkillsForProject` call, and unused imports.
 3. **Claude Code only.** No non-CC provider support, no `skillDelivery` discriminator. Remove inline injection path outright in agent-session.ts.
-4. **Only config files migrate to JSON.** Migrate `config.yaml` → `config.json` at workspace and project level inline with this work. No YAML-reading fallback, no deprecation window (Swarmctl is pre-release — see memory `project_swarmctl_prerelease`). One-shot boot-time conversion converts any existing local `config.yaml` to `config.json` and deletes the YAML file. **`yaml` npm package stays** — plan markdown files and `SKILL.md` use YAML frontmatter (mandated by Claude Code format); [plan-store.ts](../src/services/plan-store.ts) keeps using it.
+4. **Only config files migrate to JSON.** Migrate `config.yaml` → `config.json` at workspace and project level inline with this work. No YAML-reading fallback, no deprecation window (flockctl is pre-release — see memory `project_flockctl_prerelease`). One-shot boot-time conversion converts any existing local `config.yaml` to `config.json` and deletes the YAML file. **`yaml` npm package stays** — plan markdown files and `SKILL.md` use YAML frontmatter (mandated by Claude Code format); [plan-store.ts](../src/services/plan-store.ts) keeps using it.
 5. **`skills-state.json` is committed but byte-stable across no-op reconciles.** Lives at `<workspace>/.flockctl/skills-state.json` and `<project>/.flockctl/skills-state.json`. Shared via git so teammates see same reconciled intent and disables. `reconciled_at` is **not** in this file — it lives in `.flockctl/.skills-reconcile` (gitignored). This way re-running the reconciler on unchanged state produces zero git diff.
 6. **Manifest at both workspace and project level.** Workspace `skills-state.json` captures workspace-effective view (global + workspace, minus disables). Project `skills-state.json` captures project-effective view (global + workspace + project, minus disables). Symmetry simplifies UI listing and testing.
 7. **Reconciler is the only delivery mechanism.** `seedClaudeCodePlugin` is removed along with the `~/flockctl/.claude-plugin/` directory and `~/.claude/settings.json` entries. Global skills reach Claude Code via the same symlink reconciliation path as workspace and project skills. Cleanup pass on first boot after upgrade removes the plugin artifacts.
-8. **`Skill` tool is read-only.** Add to `READ_ONLY_TOOLS` in [permission-resolver.ts](../src/services/permission-resolver.ts#L105) so `auto` permission mode does not prompt the user for every on-demand skill load. (In `default` mode Swarmctl still prompts — that's the mode's semantic; users who chose it accept per-tool prompts including Skill.)
+8. **`Skill` tool is read-only.** Add to `READ_ONLY_TOOLS` in [permission-resolver.ts](../src/services/permission-resolver.ts#L105) so `auto` permission mode does not prompt the user for every on-demand skill load. (In `default` mode flockctl still prompts — that's the mode's semantic; users who chose it accept per-tool prompts including Skill.)
 9. **`POST /tasks` with `disabledSkills` in body → strict 400.** Pre-release, no backcompat; reject unknown/removed fields explicitly rather than silently ignore.
 10. **Chat tool events are persisted.** Task logs already persist `tool_call`/`tool_result` rows; chats currently stream them live-only. For parity and to survive refresh, add chat tool events to `chat_messages` via new role `"tool"` + structured content (see Phase 4.5 for schema).
 11. **`disabledSkills` entries are `{name, level}` objects.** Current shape `string[]` can't distinguish "disable the global `bugfix`" from "disable the workspace-level `bugfix` override". New shape in `config.json`:
@@ -335,7 +335,7 @@ Both skills and MCP reconcilers are wired in the same trigger points. Call both 
 
 **Changes:**
 
-1. **Add `Skill` to `READ_ONLY_TOOLS`** in [src/services/permission-resolver.ts:105](../src/services/permission-resolver.ts#L105). Loading a skill body mutates nothing; it's strictly a read of content Swarmctl placed there itself. `auto` mode auto-allows it; `default` mode still prompts (by mode definition).
+1. **Add `Skill` to `READ_ONLY_TOOLS`** in [src/services/permission-resolver.ts:105](../src/services/permission-resolver.ts#L105). Loading a skill body mutates nothing; it's strictly a read of content flockctl placed there itself. `auto` mode auto-allows it; `default` mode still prompts (by mode definition).
 
 2. **Extract tool formatters into `src/services/tool-format.ts`** (new module): move `formatToolCall` / `formatToolResult` / `truncate` from [task-executor.ts:46-86](../src/services/task-executor.ts#L46-L86). Single source of truth; one test suite. Add Skill case:
    ```ts
@@ -446,7 +446,7 @@ Pre-release — no data to preserve, no dump step, forward-only migration. Appli
    **How to disable a skill or MCP server:** edit `.flockctl/config.json` (or use the UI, which writes the JSON). Entries are `{name, level}` objects; `level` targets which scope's skill/server you want hidden at this config's level.
 2. **`ensureGitignore`** triggered on project and workspace creation (Phase 3) — appends all four gitignored paths atomically. Confirm in integration test. Shared helper between skills and MCP reconcilers (single write, all four patterns).
 3. **Workspace `.claude/skills/` and workspace `.mcp.json`** are created symmetrically to project-level — for users who run `claude` from workspace cwd (cross-project work). Workspace `.mcp.json` contains global+workspace effective MCP set; workspace `.claude/skills/` contains global+workspace effective skill symlinks. Reconciler calls `ensureGitignore(workspacePath)` on workspace creation/config save.
-4. **Teammate trade-off (documented, not fixed):** teammates who open a Swarmctl project in Claude Code **without** running the flockctl daemon first will have no `.mcp.json` and no `.claude/skills/` — Claude Code will see none of the project's skills or MCP servers. This is intentional: those files are generated locally and must be reconciled on each machine. Docs must call this out under a "Using a Swarmctl project on another machine" section: `flockctl daemon` (or a one-shot `flockctl reconcile` if we add one later) is a prerequisite alongside the clone.
+4. **Teammate trade-off (documented, not fixed):** teammates who open a flockctl project in Claude Code **without** running the flockctl daemon first will have no `.mcp.json` and no `.claude/skills/` — Claude Code will see none of the project's skills or MCP servers. This is intentional: those files are generated locally and must be reconciled on each machine. Docs must call this out under a "Using a flockctl project on another machine" section: `flockctl daemon` (or a one-shot `flockctl reconcile` if we add one later) is a prerequisite alongside the clone.
 
 **Verify:** manual — `git status` in a fresh project after reconcile: no `.claude/skills/`, no `.mcp.json`, no `.flockctl/.skills-reconcile`, no `.flockctl/.mcp-reconcile` in the "untracked" list. Committed `skills-state.json` and `mcp-state.json` present.
 
@@ -585,7 +585,7 @@ Goal: every behavioral change, every removed code path, every new file has at le
 
 ## Rollback & backwards-compatibility
 
-Pre-release (see memory `project_swarmctl_prerelease`) → forward-only migrations, no feature flags, no dual-format support.
+Pre-release (see memory `project_flockctl_prerelease`) → forward-only migrations, no feature flags, no dual-format support.
 
 - **Phases 0 – 4.5:** additive or replace-in-place. Revert by `git revert` of the phase commit.
 - **Phase 5:** DB column drop is destructive. No dump (no users = no data to preserve). To reverse: revert the migration commit, Drizzle picks up the re-added column on next boot.
@@ -607,7 +607,7 @@ Pre-release (see memory `project_swarmctl_prerelease`) → forward-only migratio
 
 2. **Claude Code caches skill metadata** — if a skill is removed via symlink deletion mid-session, Claude Code's currently-active session may still have the skill in context. Acceptable: next session reflects new state.
 
-3. **Non-symlink entries in `.claude/skills/`** — user may hand-place a skill file. Reconciler leaves non-symlink entries alone (warning logged). Do not touch hand-placed skills; they're outside Swarmctl's source of truth.
+3. **Non-symlink entries in `.claude/skills/`** — user may hand-place a skill file. Reconciler leaves non-symlink entries alone (warning logged). Do not touch hand-placed skills; they're outside flockctl's source of truth.
 
 4. **Server-entry order** — `reconcileAllProjects()` depends on DB migrations, `seedBundledSkills`, and the plugin cleanup step. Call strictly after those, and schedule async so it doesn't block the HTTP listener:
    ```
@@ -619,9 +619,9 @@ Pre-release (see memory `project_swarmctl_prerelease`) → forward-only migratio
    setImmediate(() => reconcileAllProjects())    ← async, post-listen
    ```
 
-5. **AgentSession system prompt references `.flockctl/` as skill location** ([src/services/agent-session.ts:448-452](../src/services/agent-session.ts#L448-L452)). After migration, that's still correct as the **authoritative** location (source of truth for `SKILL.md` files). Swarmctl manages `.claude/skills/` as generated view. Keep the instruction.
+5. **AgentSession system prompt references `.flockctl/` as skill location** ([src/services/agent-session.ts:448-452](../src/services/agent-session.ts#L448-L452)). After migration, that's still correct as the **authoritative** location (source of truth for `SKILL.md` files). flockctl manages `.claude/skills/` as generated view. Keep the instruction.
 
-6. **`Skill` in auto-mode allowlist is a policy choice.** Loading a skill body reads a file Swarmctl itself placed in `.claude/skills/` — not arbitrary filesystem access. But a malicious/confused skill body could contain prompts that steer the model. Mitigation: the skill corpus is already vetted by workspace/project owners (they committed it), so no new attack surface vs. today's inline injection. If future skill provenance widens (auto-installed from registry), revisit.
+6. **`Skill` in auto-mode allowlist is a policy choice.** Loading a skill body reads a file flockctl itself placed in `.claude/skills/` — not arbitrary filesystem access. But a malicious/confused skill body could contain prompts that steer the model. Mitigation: the skill corpus is already vetted by workspace/project owners (they committed it), so no new attack surface vs. today's inline injection. If future skill provenance widens (auto-installed from registry), revisit.
 
 7. **Chat tool events use `role: "tool"` in existing `chat_messages` table** — any code path that filters chat messages by role (e.g. usage aggregation, export) must be audited to either accept or explicitly skip the new role. Grep for `role ===` and `role IN` in chat contexts during Phase 4.5.
 

@@ -3,7 +3,7 @@ import { join } from "path";
 import { getDb } from "../db/index.js";
 import { projects, workspaces } from "../db/schema.js";
 import { eq } from "drizzle-orm";
-import { getGlobalSkillsDir } from "../config.js";
+import { getGlobalSkillsDir } from "../config/index.js";
 import { loadWorkspaceConfig } from "./workspace-config.js";
 import { loadProjectConfig } from "./project-config.js";
 import type { DisableEntry } from "./workspace-config.js";

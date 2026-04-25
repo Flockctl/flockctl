@@ -1,5 +1,6 @@
 import type { AgentProvider } from "./types.js";
 import { ClaudeCodeProvider } from "./claude-code/provider.js";
+import { CopilotProvider } from "./copilot/provider.js";
 
 const registry = new Map<string, AgentProvider>();
 let defaultAgentId: string | null = null;
@@ -53,5 +54,10 @@ function ensureBuiltIns(): void {
   if (!registry.has("claude-code")) {
     // Use asDefault only if no other provider has already claimed it.
     registerAgent(new ClaudeCodeProvider(), { asDefault: defaultAgentId === null });
+  }
+  if (!registry.has("copilot")) {
+    // Copilot is opt-in — never claims `asDefault`. Users switch via
+    // `.flockctlrc.defaultAgent = "copilot"`.
+    registerAgent(new CopilotProvider());
   }
 }

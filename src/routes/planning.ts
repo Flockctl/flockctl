@@ -1,23 +1,20 @@
 import { Hono } from "hono";
-import { streamSSE } from "hono/streaming";
 import { getDb } from "../db/index.js";
 import { projects, tasks } from "../db/schema.js";
 import { and, desc, eq, like } from "drizzle-orm";
 import { NotFoundError, ValidationError } from "../lib/errors.js";
+import { parseIdParam } from "../lib/route-params.js";
 import { buildPlanGenerationPrompt } from "../services/plan-prompt.js";
 import { startAutoExecution, stopAutoExecution, getAutoExecutionStatus } from "../services/auto-executor.js";
-import { selectKeyForTask } from "../services/key-selection.js";
-import { taskExecutor } from "../services/task-executor.js";
+import { resolveAllowedKeyIds, selectKeyForTask } from "../services/ai/key-selection.js";
+import { taskExecutor } from "../services/task-executor/index.js";
 import { computeWaves } from "../services/dependency-graph.js";
 import {
   listMilestones, getMilestone, createMilestone, updateMilestone, deleteMilestone,
   listSlices, getSlice, createSlice, updateSlice, deleteSlice,
   listPlanTasks, getPlanTask, createPlanTask, updatePlanTask, deletePlanTask,
   getPlanDir, parseMd, writeMd,
-} from "../services/plan-store.js";
-import { getAgent } from "../services/agents/registry.js";
-import { getDefaultModel } from "../config.js";
-import { loadProjectConfig } from "../services/project-config.js";
+} from "../services/plan-store/index.js";
 import { readFileSync, existsSync } from "fs";
 import { join } from "path";
 
@@ -36,7 +33,7 @@ function getProjectPath(pid: number): string {
 
 // POST /projects/:pid/milestones
 planningRoutes.post("/:pid/milestones", async (c) => {
-  const projectPath = getProjectPath(parseInt(c.req.param("pid")));
+  const projectPath = getProjectPath(parseIdParam(c, "pid"));
   const body = await c.req.json();
 
   const result = createMilestone(projectPath, {
@@ -57,13 +54,13 @@ planningRoutes.post("/:pid/milestones", async (c) => {
 
 // GET /projects/:pid/milestones
 planningRoutes.get("/:pid/milestones", (c) => {
-  const projectPath = getProjectPath(parseInt(c.req.param("pid")));
+  const projectPath = getProjectPath(parseIdParam(c, "pid"));
   return c.json(listMilestones(projectPath));
 });
 
 // GET /projects/:pid/milestones/:slug
 planningRoutes.get("/:pid/milestones/:slug", (c) => {
-  const projectPath = getProjectPath(parseInt(c.req.param("pid")));
+  const projectPath = getProjectPath(parseIdParam(c, "pid"));
   const m = getMilestone(projectPath, c.req.param("slug"));
   if (!m) throw new NotFoundError("Milestone");
   return c.json(m);
@@ -71,7 +68,7 @@ planningRoutes.get("/:pid/milestones/:slug", (c) => {
 
 // PATCH /projects/:pid/milestones/:slug
 planningRoutes.patch("/:pid/milestones/:slug", async (c) => {
-  const projectPath = getProjectPath(parseInt(c.req.param("pid")));
+  const projectPath = getProjectPath(parseIdParam(c, "pid"));
   const slug = c.req.param("slug");
   const existing = getMilestone(projectPath, slug);
   if (!existing) throw new NotFoundError("Milestone");
@@ -90,7 +87,7 @@ planningRoutes.patch("/:pid/milestones/:slug", async (c) => {
 
 // DELETE /projects/:pid/milestones/:slug
 planningRoutes.delete("/:pid/milestones/:slug", (c) => {
-  const projectPath = getProjectPath(parseInt(c.req.param("pid")));
+  const projectPath = getProjectPath(parseIdParam(c, "pid"));
   const slug = c.req.param("slug");
   const existing = getMilestone(projectPath, slug);
   if (!existing) throw new NotFoundError("Milestone");
@@ -102,7 +99,7 @@ planningRoutes.delete("/:pid/milestones/:slug", (c) => {
 
 // POST /projects/:pid/milestones/:mslug/slices
 planningRoutes.post("/:pid/milestones/:mslug/slices", async (c) => {
-  const projectPath = getProjectPath(parseInt(c.req.param("pid")));
+  const projectPath = getProjectPath(parseIdParam(c, "pid"));
   const mslug = c.req.param("mslug");
   const m = getMilestone(projectPath, mslug);
   if (!m) throw new NotFoundError("Milestone");
@@ -128,13 +125,13 @@ planningRoutes.post("/:pid/milestones/:mslug/slices", async (c) => {
 
 // GET /projects/:pid/milestones/:mslug/slices
 planningRoutes.get("/:pid/milestones/:mslug/slices", (c) => {
-  const projectPath = getProjectPath(parseInt(c.req.param("pid")));
+  const projectPath = getProjectPath(parseIdParam(c, "pid"));
   return c.json(listSlices(projectPath, c.req.param("mslug")));
 });
 
 // GET /projects/:pid/milestones/:mslug/slices/:sslug
 planningRoutes.get("/:pid/milestones/:mslug/slices/:sslug", (c) => {
-  const projectPath = getProjectPath(parseInt(c.req.param("pid")));
+  const projectPath = getProjectPath(parseIdParam(c, "pid"));
   const s = getSlice(projectPath, c.req.param("mslug"), c.req.param("sslug"));
   if (!s) throw new NotFoundError("Slice");
   return c.json(s);
@@ -142,7 +139,7 @@ planningRoutes.get("/:pid/milestones/:mslug/slices/:sslug", (c) => {
 
 // PATCH /projects/:pid/milestones/:mslug/slices/:sslug
 planningRoutes.patch("/:pid/milestones/:mslug/slices/:sslug", async (c) => {
-  const projectPath = getProjectPath(parseInt(c.req.param("pid")));
+  const projectPath = getProjectPath(parseIdParam(c, "pid"));
   const mslug = c.req.param("mslug");
   const sslug = c.req.param("sslug");
   const existing = getSlice(projectPath, mslug, sslug);
@@ -162,7 +159,7 @@ planningRoutes.patch("/:pid/milestones/:mslug/slices/:sslug", async (c) => {
 
 // DELETE /projects/:pid/milestones/:mslug/slices/:sslug
 planningRoutes.delete("/:pid/milestones/:mslug/slices/:sslug", (c) => {
-  const projectPath = getProjectPath(parseInt(c.req.param("pid")));
+  const projectPath = getProjectPath(parseIdParam(c, "pid"));
   const mslug = c.req.param("mslug");
   const sslug = c.req.param("sslug");
   const existing = getSlice(projectPath, mslug, sslug);
@@ -175,7 +172,7 @@ planningRoutes.delete("/:pid/milestones/:mslug/slices/:sslug", (c) => {
 
 // POST /.../slices/:sslug/tasks
 planningRoutes.post("/:pid/milestones/:mslug/slices/:sslug/tasks", async (c) => {
-  const projectPath = getProjectPath(parseInt(c.req.param("pid")));
+  const projectPath = getProjectPath(parseIdParam(c, "pid"));
   const mslug = c.req.param("mslug");
   const sslug = c.req.param("sslug");
   const s = getSlice(projectPath, mslug, sslug);
@@ -202,13 +199,13 @@ planningRoutes.post("/:pid/milestones/:mslug/slices/:sslug/tasks", async (c) => 
 
 // GET /.../slices/:sslug/tasks
 planningRoutes.get("/:pid/milestones/:mslug/slices/:sslug/tasks", (c) => {
-  const projectPath = getProjectPath(parseInt(c.req.param("pid")));
+  const projectPath = getProjectPath(parseIdParam(c, "pid"));
   return c.json(listPlanTasks(projectPath, c.req.param("mslug"), c.req.param("sslug")));
 });
 
 // GET /.../tasks/:tslug
 planningRoutes.get("/:pid/milestones/:mslug/slices/:sslug/tasks/:tslug", (c) => {
-  const projectPath = getProjectPath(parseInt(c.req.param("pid")));
+  const projectPath = getProjectPath(parseIdParam(c, "pid"));
   const t = getPlanTask(projectPath, c.req.param("mslug"), c.req.param("sslug"), c.req.param("tslug"));
   if (!t) throw new NotFoundError("Plan Task");
   return c.json(t);
@@ -216,7 +213,7 @@ planningRoutes.get("/:pid/milestones/:mslug/slices/:sslug/tasks/:tslug", (c) => 
 
 // PATCH /.../tasks/:tslug
 planningRoutes.patch("/:pid/milestones/:mslug/slices/:sslug/tasks/:tslug", async (c) => {
-  const projectPath = getProjectPath(parseInt(c.req.param("pid")));
+  const projectPath = getProjectPath(parseIdParam(c, "pid"));
   const mslug = c.req.param("mslug");
   const sslug = c.req.param("sslug");
   const tslug = c.req.param("tslug");
@@ -237,7 +234,7 @@ planningRoutes.patch("/:pid/milestones/:mslug/slices/:sslug/tasks/:tslug", async
 
 // DELETE /.../tasks/:tslug
 planningRoutes.delete("/:pid/milestones/:mslug/slices/:sslug/tasks/:tslug", (c) => {
-  const projectPath = getProjectPath(parseInt(c.req.param("pid")));
+  const projectPath = getProjectPath(parseIdParam(c, "pid"));
   const mslug = c.req.param("mslug");
   const sslug = c.req.param("sslug");
   const tslug = c.req.param("tslug");
@@ -252,12 +249,30 @@ planningRoutes.delete("/:pid/milestones/:mslug/slices/:sslug/tasks/:tslug", (c) 
 // POST /projects/:pid/generate-plan
 planningRoutes.post("/:pid/generate-plan", async (c) => {
   const db = getDb();
-  const pid = parseInt(c.req.param("pid"));
+  const pid = parseIdParam(c, "pid");
   const projectPath = getProjectPath(pid);
 
   const body = await c.req.json();
   const prompt = body.prompt;
   const mode = body.mode ?? "quick";
+  // Optional UI-provided overrides. When omitted, the daemon picks a key via
+  // `selectKeyForTask` (workspace/project inheritance) and leaves `model`
+  // unset so the agent falls back to the project/global default.
+  const requestedKeyIdRaw = body.aiProviderKeyId ?? body.ai_provider_key_id;
+  const requestedKeyId =
+    typeof requestedKeyIdRaw === "number"
+      ? requestedKeyIdRaw
+      : typeof requestedKeyIdRaw === "string" && requestedKeyIdRaw.trim() !== ""
+        ? parseInt(requestedKeyIdRaw, 10)
+        : null;
+  if (requestedKeyIdRaw !== undefined && requestedKeyIdRaw !== null && !Number.isFinite(requestedKeyId)) {
+    throw new ValidationError("aiProviderKeyId must be a number");
+  }
+  const requestedModelRaw = body.model;
+  const requestedModel =
+    typeof requestedModelRaw === "string" && requestedModelRaw.trim() !== ""
+      ? requestedModelRaw.trim()
+      : null;
 
   if (!prompt || typeof prompt !== "string") {
     throw new ValidationError("prompt is required");
@@ -266,9 +281,25 @@ planningRoutes.post("/:pid/generate-plan", async (c) => {
     throw new ValidationError("mode must be 'quick' or 'deep'");
   }
 
+  // Enforce the project/workspace allow-list — the user may only assign keys
+  // that are permitted for this project's scope. An empty resolved list means
+  // "no restriction" (any active key is fine).
+  if (requestedKeyId) {
+    const allowedIds = resolveAllowedKeyIds({ projectId: pid });
+    if (allowedIds.length > 0 && !allowedIds.includes(requestedKeyId)) {
+      throw new ValidationError(
+        "aiProviderKeyId is not in the project's allowed key list. " +
+        "Pick a key permitted by the project/workspace, or widen the whitelist via PATCH /projects/:id.",
+      );
+    }
+  }
+
   let selectedKey;
   try {
-    selectedKey = await selectKeyForTask({ projectId: pid });
+    selectedKey = await selectKeyForTask({
+      projectId: pid,
+      assignedKeyId: requestedKeyId ?? null,
+    });
   } catch (err: any) {
     throw new ValidationError(err?.message ?? "No available AI keys");
   }
@@ -281,6 +312,7 @@ planningRoutes.post("/:pid/generate-plan", async (c) => {
     projectId: pid,
     prompt: agentPrompt,
     agent: "claude-code",
+    model: requestedModel,
     taskType: "execution",
     label: `plan-generate-${mode}`,
     assignedKeyId: selectedKey.id,
@@ -299,7 +331,7 @@ planningRoutes.post("/:pid/generate-plan", async (c) => {
 // tasks from earlier crashed runs never mask a newer completed run.
 planningRoutes.get("/:pid/generate-plan/status", (c) => {
   const db = getDb();
-  const pid = parseInt(c.req.param("pid"));
+  const pid = parseIdParam(c, "pid");
 
   const latest = db.select()
     .from(tasks)
@@ -330,7 +362,7 @@ planningRoutes.get("/:pid/generate-plan/status", (c) => {
 
 // POST /projects/:pid/milestones/:mslug/auto-execute — start
 planningRoutes.post("/:pid/milestones/:mslug/auto-execute", async (c) => {
-  const pid = parseInt(c.req.param("pid"));
+  const pid = parseIdParam(c, "pid");
   const projectPath = getProjectPath(pid);
   const mslug = c.req.param("mslug");
 
@@ -360,7 +392,7 @@ planningRoutes.delete("/:pid/milestones/:mslug/auto-execute", (c) => {
 
 // GET /projects/:pid/milestones/:mslug/auto-execute — status
 planningRoutes.get("/:pid/milestones/:mslug/auto-execute", (c) => {
-  const projectPath = getProjectPath(parseInt(c.req.param("pid")));
+  const projectPath = getProjectPath(parseIdParam(c, "pid"));
   const mslug = c.req.param("mslug");
 
   const m = getMilestone(projectPath, mslug);
@@ -384,7 +416,7 @@ planningRoutes.get("/:pid/milestones/:mslug/auto-execute", (c) => {
 
 // GET /projects/:pid/milestones/:mslug/execution-graph
 planningRoutes.get("/:pid/milestones/:mslug/execution-graph", (c) => {
-  const projectPath = getProjectPath(parseInt(c.req.param("pid")));
+  const projectPath = getProjectPath(parseIdParam(c, "pid"));
   const mslug = c.req.param("mslug");
   const m = getMilestone(projectPath, mslug);
   if (!m) throw new NotFoundError("Milestone");
@@ -433,9 +465,20 @@ function resolveEntityPath(projectPath: string, entityType: string, milestoneSlu
   throw new ValidationError("Invalid entity type or missing slugs");
 }
 
+// GET /projects/:pid/milestones/:slug/readme — read per-milestone README.md
+planningRoutes.get("/:pid/milestones/:slug/readme", (c) => {
+  const projectPath = getProjectPath(parseIdParam(c, "pid"));
+  const slug = c.req.param("slug");
+  const filePath = join(getPlanDir(projectPath), slug, "README.md");
+  if (!existsSync(filePath)) throw new NotFoundError("README");
+
+  const content = readFileSync(filePath, "utf-8");
+  return c.json({ content, path: filePath });
+});
+
 // GET /projects/:pid/plan-file?type=milestone&milestone=slug[&slice=slug][&task=slug]
 planningRoutes.get("/:pid/plan-file", (c) => {
-  const projectPath = getProjectPath(parseInt(c.req.param("pid")));
+  const projectPath = getProjectPath(parseIdParam(c, "pid"));
   const entityType = c.req.query("type") ?? "";
   const milestoneSlug = c.req.query("milestone");
   const sliceSlug = c.req.query("slice");
@@ -450,7 +493,7 @@ planningRoutes.get("/:pid/plan-file", (c) => {
 
 // PUT /projects/:pid/plan-file — update raw file content
 planningRoutes.put("/:pid/plan-file", async (c) => {
-  const projectPath = getProjectPath(parseInt(c.req.param("pid")));
+  const projectPath = getProjectPath(parseIdParam(c, "pid"));
   const body = await c.req.json();
   const entityType = body.type ?? "";
   const milestoneSlug = body.milestone;
@@ -467,8 +510,8 @@ planningRoutes.put("/:pid/plan-file", async (c) => {
   const fmMatch = content.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
   if (fmMatch) {
     const { parse: parseYaml } = await import("yaml");
-    const frontmatter = parseYaml(fmMatch[1]) ?? {};
-    const body2 = fmMatch[2].trim();
+    const frontmatter = parseYaml(fmMatch[1] ?? "") ?? {};
+    const body2 = (fmMatch[2] ?? "").trim();
     writeMd(filePath, frontmatter, body2);
   } else {
     // No frontmatter — write as plain body with empty frontmatter
@@ -480,7 +523,7 @@ planningRoutes.put("/:pid/plan-file", async (c) => {
 
 // POST /projects/:pid/auto-execute-all — start auto-execution for all milestones
 planningRoutes.post("/:pid/auto-execute-all", async (c) => {
-  const pid = parseInt(c.req.param("pid"));
+  const pid = parseIdParam(c, "pid");
   const projectPath = getProjectPath(pid);
   const milestones = listMilestones(projectPath);
 
@@ -493,97 +536,4 @@ planningRoutes.post("/:pid/auto-execute-all", async (c) => {
   }
 
   return c.json({ status: "started", milestones: started });
-});
-
-// ─── Plan Chat (streaming SSE) ─────────────────────────────
-
-planningRoutes.post("/:pid/plan-chat/stream", async (c) => {
-  const db = getDb();
-  const pid = parseInt(c.req.param("pid"));
-  const project = db.select().from(projects).where(eq(projects.id, pid)).get();
-  if (!project) throw new NotFoundError("Project");
-
-  const projectPath = project.path ?? getProjectPath(pid);
-  const body = await c.req.json();
-  const content = body.content;
-  const entityCtx = body.entity_context;
-
-  if (!content || typeof content !== "string") {
-    throw new ValidationError("content is required");
-  }
-  if (!entityCtx?.entity_type || !entityCtx?.entity_id) {
-    throw new ValidationError("entity_context with entity_type and entity_id is required");
-  }
-
-  // Resolve entity slugs
-  const entityType = entityCtx.entity_type as string;
-  const entityId = entityCtx.entity_id as string;
-  const milestoneId = entityCtx.milestone_id as string | undefined;
-  const sliceId = entityCtx.slice_id as string | undefined;
-
-  let milestoneSlug: string | undefined;
-  let sliceSlug: string | undefined;
-  let taskSlug: string | undefined;
-
-  if (entityType === "milestone") {
-    milestoneSlug = entityId;
-  } else if (entityType === "slice") {
-    milestoneSlug = milestoneId;
-    sliceSlug = entityId;
-  } else if (entityType === "task") {
-    milestoneSlug = milestoneId;
-    sliceSlug = sliceId;
-    taskSlug = entityId;
-  }
-
-  // Read the entity's markdown file as context
-  let entityContent = "";
-  try {
-    const filePath = resolveEntityPath(projectPath, entityType, milestoneSlug, sliceSlug, taskSlug);
-    if (existsSync(filePath)) {
-      entityContent = readFileSync(filePath, "utf-8");
-    }
-  } catch {
-    // Entity file may not exist yet — proceed with no file context
-  }
-
-  // Use project's model (from yaml config) or fall back to default
-  const projectConfig = loadProjectConfig(projectPath);
-  const model = projectConfig.model ?? getDefaultModel();
-
-  // Build system prompt with entity context
-  const systemParts = [
-    `You are an AI assistant helping with project planning for "${project.name}".`,
-    `You are discussing a ${entityType}: "${entityCtx.entity_id}".`,
-  ];
-  if (entityContent) {
-    systemParts.push(`\nCurrent ${entityType} file content:\n\`\`\`markdown\n${entityContent}\n\`\`\``);
-  }
-  systemParts.push(
-    `\nHelp the user refine this ${entityType}. You can discuss goals, structure, success criteria, and implementation details.`,
-    `Keep responses focused and actionable. Use the project working directory: ${projectPath}`,
-  );
-  const system = systemParts.join("\n");
-
-  const messages = [{ role: "user", content }];
-
-  const provider = getAgent();
-  return streamSSE(c, async (stream) => {
-    try {
-      for await (const event of provider.streamChat({
-        model,
-        system,
-        messages,
-      })) {
-        if (event.type === "text" && event.text) {
-          await stream.writeSSE({ data: JSON.stringify({ content: event.text }) });
-        } else if (event.type === "done") {
-          await stream.writeSSE({ data: JSON.stringify({ done: true }) });
-        }
-      }
-    } catch (err: unknown) {
-      const errMsg = err instanceof Error ? err.message : "Unknown error";
-      await stream.writeSSE({ data: JSON.stringify({ error: errMsg }) });
-    }
-  });
 });

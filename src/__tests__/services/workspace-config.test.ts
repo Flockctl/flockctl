@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterAll, vi } from "vitest";
-import { mkdirSync, writeFileSync, existsSync, rmSync } from "fs";
+import { mkdirSync, writeFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import {
@@ -56,30 +56,6 @@ describe("loadWorkspaceConfig", () => {
     expect(second).toEqual({ permissionMode: "ask" });
   });
 
-  it("migrates legacy config.yaml to config.json", () => {
-    const ws = freshWs("yaml-migration");
-    writeFileSync(
-      join(ws, ".flockctl", "config.yaml"),
-      "permissionMode: review\ndisabledSkills:\n  - foo\n",
-    );
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-    const result = loadWorkspaceConfig(ws);
-    expect(result.permissionMode).toBe("review");
-    expect(result.disabledSkills).toEqual([{ name: "foo", level: "global" }]);
-    expect(existsSync(join(ws, ".flockctl", "config.json"))).toBe(true);
-    expect(existsSync(join(ws, ".flockctl", "config.yaml"))).toBe(false);
-    logSpy.mockRestore();
-  });
-
-  it("returns {} when legacy YAML is malformed", () => {
-    const ws = freshWs("yaml-broken");
-    writeFileSync(join(ws, ".flockctl", "config.yaml"), ":\n  - [unbalanced");
-    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const result = loadWorkspaceConfig(ws);
-    expect(result).toEqual({});
-    expect(errSpy).toHaveBeenCalled();
-    errSpy.mockRestore();
-  });
 });
 
 describe("saveWorkspaceConfig", () => {

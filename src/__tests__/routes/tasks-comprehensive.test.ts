@@ -118,9 +118,11 @@ describe("Tasks API — comprehensive", () => {
       expect(res.status).toBe(404);
     });
 
-    it("returns 404 for id=0", async () => {
+    it("returns 422 for id=0 (not a positive integer)", async () => {
+      // parseIdParam rejects non-positive ids up-front so the handler
+      // never issues a `WHERE id = 0` query that would silently 404.
       const res = await app.request("/tasks/0");
-      expect(res.status).toBe(404);
+      expect(res.status).toBe(422);
     });
   });
 

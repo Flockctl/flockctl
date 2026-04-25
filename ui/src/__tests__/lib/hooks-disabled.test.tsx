@@ -65,7 +65,7 @@ describe("useToggleWorkspaceDisabledSkill", () => {
     const { result } = renderHook(() => useToggleWorkspaceDisabledSkill("7"), { wrapper: Wrapper });
     result.current.mutate({ name: "planning", level: "global", disable: true });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    const [url, init] = fetchMock.mock.calls[0];
+    const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe("/skills/workspaces/7/disabled");
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body)).toEqual({ name: "planning", level: "global" });
@@ -78,7 +78,7 @@ describe("useToggleWorkspaceDisabledSkill", () => {
     const { result } = renderHook(() => useToggleWorkspaceDisabledSkill("7"), { wrapper: Wrapper });
     result.current.mutate({ name: "planning", level: "global", disable: false });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    const [url, init] = fetchMock.mock.calls[0];
+    const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe("/skills/workspaces/7/disabled");
     expect(init.method).toBe("DELETE");
     expect(JSON.parse(init.body)).toEqual({ name: "planning", level: "global" });
@@ -129,7 +129,7 @@ describe("useProjectDisabledSkills / toggle", () => {
     const { result } = renderHook(() => useToggleProjectDisabledSkill("42"), { wrapper: Wrapper });
     result.current.mutate({ name: "debug", level: "workspace", disable: true });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    const [url, init] = fetchMock.mock.calls[0];
+    const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe("/skills/projects/42/disabled");
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body)).toEqual({ name: "debug", level: "workspace" });
@@ -154,7 +154,7 @@ describe("useToggleWorkspaceDisabledMcpServer", () => {
     const { result } = renderHook(() => useToggleWorkspaceDisabledMcpServer("7"), { wrapper: Wrapper });
     result.current.mutate({ name: "github", level: "global", disable: true });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    const [url, init] = fetchMock.mock.calls[0];
+    const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe("/mcp/workspaces/7/disabled-mcp");
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body)).toEqual({ name: "github", level: "global" });
@@ -169,7 +169,7 @@ describe("useToggleProjectDisabledMcpServer", () => {
     const { result } = renderHook(() => useToggleProjectDisabledMcpServer("42"), { wrapper: Wrapper });
     result.current.mutate({ name: "srv", level: "workspace", disable: false });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    const [url, init] = fetchMock.mock.calls[0];
+    const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe("/mcp/projects/42/disabled-mcp");
     expect(init.method).toBe("DELETE");
     expect(JSON.parse(init.body)).toEqual({ name: "srv", level: "workspace" });

@@ -8,7 +8,7 @@ import {
   listSlices, getSlice, createSlice, updateSlice, deleteSlice,
   listPlanTasks, getPlanTask, createPlanTask, updatePlanTask, deletePlanTask,
   getProjectTree,
-} from "../../services/plan-store.js";
+} from "../../services/plan-store/index.js";
 
 describe("plan-store", () => {
   let projectPath: string;

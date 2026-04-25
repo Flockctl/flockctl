@@ -8,6 +8,8 @@ Claude Code stores credentials and settings in a **config directory** (default: 
 
 When a task runs, Flockctl sets `CLAUDE_CONFIG_DIR` to the key's config directory before launching the Claude CLI. The CLI then uses the credentials stored in that directory.
 
+Task concurrency is applied **per AI Provider Key**. Each key has its own execution pool (default: 5 concurrent tasks per key), so adding more active keys increases total parallel throughput.
+
 ## Quick Setup
 
 ### 1. Install Claude Code

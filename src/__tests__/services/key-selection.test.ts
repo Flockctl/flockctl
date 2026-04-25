@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createTestDb } from "../helpers.js";
 import { setDb } from "../../db/index.js";
 import { aiProviderKeys } from "../../db/schema.js";
-import { selectKeyForTask } from "../../services/key-selection.js";
+import { selectKeyForTask } from "../../services/ai/key-selection.js";
 
 describe("selectKeyForTask", () => {
   let testDb: ReturnType<typeof createTestDb>;

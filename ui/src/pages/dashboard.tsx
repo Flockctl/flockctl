@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useTasks, useProjects, useUsageSummary, useUsageBreakdown, useTaskStats, useAIKeys } from "@/lib/hooks";
+import { formatTokens, formatDuration } from "@/lib/format";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { StatCard } from "@/components/stat-card";
@@ -33,18 +34,13 @@ import {
   Cell,
   Legend,
 } from "recharts";
+import {
+  CHART_TICK_STYLE as TICK_STYLE,
+  CHART_GRID_STROKE as GRID_STROKE,
+  CHART_TOOLTIP_PROPS,
+} from "@/lib/chart-theme";
 
 const POLL_INTERVAL = 30_000;
-
-const TICK_STYLE = { fontSize: 12, fill: "var(--foreground)" };
-const GRID_STROKE = "var(--border)";
-const TOOLTIP_STYLE = { backgroundColor: "var(--popover)", borderColor: "var(--border)", color: "var(--popover-foreground)" };
-
-function formatTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return String(n);
-}
 
 const PERIOD_OPTIONS = [
   { label: "7 days", value: "7d" },
@@ -120,12 +116,12 @@ export default function DashboardPage() {
 
   return (
     <div>
-      <div className="mb-6 flex items-center justify-between">
-        <div>
-          <h1 className="mb-1 text-2xl font-bold">Dashboard</h1>
+      <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <h1 className="mb-1 text-xl font-bold sm:text-2xl">Dashboard</h1>
           <p className="text-sm text-muted-foreground">Flockctl</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <select
             value={aiKeyId}
             onChange={(e) => setAiKeyId(e.target.value)}
@@ -217,7 +213,7 @@ export default function DashboardPage() {
               <CartesianGrid strokeDasharray="3 3" stroke={GRID_STROKE} />
               <XAxis dataKey="date" tick={TICK_STYLE} />
               <YAxis tick={TICK_STYLE} />
-              <Tooltip formatter={(value) => [`$${Number(value).toFixed(4)}`, "Cost"]} contentStyle={TOOLTIP_STYLE} />
+              <Tooltip {...CHART_TOOLTIP_PROPS} formatter={(value) => [`$${Number(value).toFixed(4)}`, "Cost"]} />
               <Line type="monotone" dataKey="cost" stroke="var(--primary)" strokeWidth={2} dot={false} />
             </LineChart>
           </ResponsiveContainer>
@@ -229,7 +225,7 @@ export default function DashboardPage() {
               <CartesianGrid strokeDasharray="3 3" stroke={GRID_STROKE} />
               <XAxis dataKey="name" tick={TICK_STYLE} />
               <YAxis tick={TICK_STYLE} />
-              <Tooltip formatter={(value) => [`$${Number(value).toFixed(4)}`, "Cost"]} contentStyle={TOOLTIP_STYLE} />
+              <Tooltip {...CHART_TOOLTIP_PROPS} formatter={(value) => [`$${Number(value).toFixed(4)}`, "Cost"]} />
               <Bar dataKey="cost" fill="var(--primary)" radius={[4, 4, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
@@ -244,7 +240,7 @@ export default function DashboardPage() {
               <CartesianGrid strokeDasharray="3 3" stroke={GRID_STROKE} />
               <XAxis dataKey="name" tick={TICK_STYLE} />
               <YAxis tick={TICK_STYLE} />
-              <Tooltip formatter={(value) => [`$${Number(value).toFixed(4)}`, "Cost"]} contentStyle={TOOLTIP_STYLE} />
+              <Tooltip {...CHART_TOOLTIP_PROPS} formatter={(value) => [`$${Number(value).toFixed(4)}`, "Cost"]} />
               <Bar dataKey="cost" fill="#8b5cf6" radius={[4, 4, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
@@ -256,7 +252,7 @@ export default function DashboardPage() {
               <CartesianGrid strokeDasharray="3 3" stroke={GRID_STROKE} />
               <XAxis type="number" tick={TICK_STYLE} />
               <YAxis type="category" dataKey="name" tick={{ fontSize: 11, fill: "var(--foreground)" }} width={160} />
-              <Tooltip formatter={(value) => [`$${Number(value).toFixed(4)}`, "Cost"]} contentStyle={TOOLTIP_STYLE} />
+              <Tooltip {...CHART_TOOLTIP_PROPS} formatter={(value) => [`$${Number(value).toFixed(4)}`, "Cost"]} />
               <Bar dataKey="cost" fill="#0ea5e9" radius={[0, 4, 4, 0]} />
             </BarChart>
           </ResponsiveContainer>
@@ -273,7 +269,7 @@ export default function DashboardPage() {
                   <Cell key={index} fill={entry.fill} />
                 ))}
               </Pie>
-              <Tooltip contentStyle={TOOLTIP_STYLE} />
+              <Tooltip {...CHART_TOOLTIP_PROPS} />
               <Legend wrapperStyle={{ color: "var(--foreground)" }} />
             </PieChart>
           </ResponsiveContainer>
@@ -368,8 +364,3 @@ function MiniStat({
   );
 }
 
-function formatDuration(seconds: number): string {
-  if (seconds < 60) return `${Math.round(seconds)}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
-  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
-}

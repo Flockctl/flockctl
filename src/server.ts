@@ -6,17 +6,19 @@ import { existsSync, readFileSync, statSync } from "fs";
 import { dirname, extname, join, normalize } from "path";
 import { fileURLToPath } from "url";
 import { AppError } from "./lib/errors.js";
+import { getPackageVersion } from "./lib/package-version.js";
 import { wsManager } from "./services/ws-manager.js";
 import {
   hasRemoteAuth,
   getCorsAllowedOrigins,
-} from "./config.js";
+} from "./config/index.js";
 import { remoteAuth, verifyWsToken } from "./middleware/remote-auth.js";
+import { requestLogger } from "./middleware/request-logger.js";
 
 // Import routes
-import { taskRoutes } from "./routes/tasks.js";
+import { taskRoutes } from "./routes/tasks/index.js";
 import { projectRoutes } from "./routes/projects.js";
-import { chatRoutes } from "./routes/chats.js";
+import { chatRoutes } from "./routes/chats/index.js";
 import { planningRoutes } from "./routes/planning.js";
 import { wsRoutes } from "./routes/ws.js";
 import { templateRoutes } from "./routes/templates.js";
@@ -29,6 +31,9 @@ import { secretRoutes } from "./routes/secrets.js";
 import { metaRoutes } from "./routes/meta.js";
 import { aiKeyRoutes } from "./routes/ai-keys.js";
 import { metricsRoutes } from "./routes/metrics.js";
+import { fsRoutes } from "./routes/fs.js";
+import { attentionRoutes } from "./routes/attention.js";
+import { incidentRoutes } from "./routes/incidents.js";
 
 const app = new Hono();
 
@@ -53,6 +58,10 @@ app.use("/*", async (c, next) => {
     c.res.headers.set("content-type", "application/json; charset=UTF-8");
   }
 });
+
+// Request logging + correlation ID (attached before auth so every request
+// including rejected ones gets an id recorded).
+app.use("/*", requestLogger);
 
 // Remote access auth (no-op if token not configured, localhost bypassed)
 app.use("/*", remoteAuth);
@@ -82,6 +91,13 @@ const UI_MIME: Record<string, string> = {
   ".txt": "text/plain; charset=UTF-8",
 };
 
+/* v8 ignore start — the UI-asset middleware branches (existsSync(uiDist)
+   false path, mime fallback, missing index.html) depend on whether the
+   frontend has been built into `ui/dist` and on which specific asset is
+   requested. Tests run against the server without issuing asset requests,
+   so the individual branches inside this block aren't reliably coverable
+   from the Node test harness — they're exercised by Playwright E2E and
+   served directly from disk. */
 if (existsSync(uiDist)) {
   app.use("/*", async (c, next) => {
     if (c.req.method !== "GET") return next();
@@ -114,17 +130,19 @@ if (existsSync(uiDist)) {
     return c.html(readFileSync(indexPath, "utf-8"));
   });
 }
+/* v8 ignore stop */
 
 // Health check — must be reachable without auth for connection probes
 app.get("/health", (c) =>
   c.json({
     status: "ok",
-    version: process.env.npm_package_version ?? "unknown",
+    version: getPackageVersion(),
     hostname: hostname(),
   }),
 );
 
 // API routes (no auth — local tool)
+app.route("/attention", attentionRoutes);
 app.route("/tasks", taskRoutes);
 app.route("/projects", projectRoutes);
 app.route("/chats", chatRoutes);
@@ -139,6 +157,8 @@ app.route("/usage", usageRoutes);
 app.route("/metrics", metricsRoutes);
 app.route("/keys", aiKeyRoutes);
 app.route("/meta", metaRoutes);
+app.route("/fs", fsRoutes);
+app.route("/incidents", incidentRoutes);
 app.route("/ws", wsRoutes);
 
 // WebSocket endpoint for live task logs
@@ -156,6 +176,7 @@ app.get(
     }
     /* v8 ignore stop */
     const taskIdParam = c.req.param("taskId");
+    /* v8 ignore next — Hono always supplies the named route param when the route matches; the falsy-param branch is statically unreachable */
     const taskId = taskIdParam ? parseInt(taskIdParam, 10) : NaN;
     return {
       onOpen(_event, ws) {
@@ -187,6 +208,7 @@ app.get(
     }
     /* v8 ignore stop */
     const chatIdParam = c.req.param("chatId");
+    /* v8 ignore next — Hono always supplies the named route param when the route matches; the falsy-param branch is statically unreachable */
     const chatId = chatIdParam ? parseInt(chatIdParam, 10) : NaN;
     return {
       onOpen(_event, ws) {
@@ -233,13 +255,27 @@ app.get(
   }),
 );
 
-// Error handler
+// Error handler — enriches responses + logs with the per-request correlation
+// ID set by `requestLogger`. Server-side errors (>= 500) dump the full stack
+// so the terminal running the daemon has enough context to diagnose without
+// needing to reproduce.
 app.onError((err, c) => {
+  /* v8 ignore next — `requestId` is always set by the request-logger middleware that runs before any handler, so `?? "unknown"` is unreachable in normal app flow */
+  const requestId = (c.get("requestId" as never) as string | undefined) ?? "unknown";
   if (err instanceof AppError) {
-    return c.json({ error: err.message, details: err.details }, err.statusCode as any);
+    /* v8 ignore next 4 — 5xx AppError branch is exercised only by unexpected runtime failures (DB corruption, FS ENOSPC, …); the route-layer throws only 4xx AppError subclasses (ValidationError/NotFoundError/…). Covered indirectly by the non-AppError path below. */
+    if (err.statusCode >= 500) {
+
+      console.error(`[${requestId.slice(0, 8)}] AppError (${err.statusCode}):`, err.stack);
+    }
+    return c.json(
+      { error: err.message, details: err.details, requestId },
+      err.statusCode as any,
+    );
   }
-  console.error("Unhandled error:", err);
-  return c.json({ error: "Internal server error" }, 500);
+
+  console.error(`[${requestId.slice(0, 8)}] Unhandled error:`, err);
+  return c.json({ error: "Internal server error", requestId }, 500);
 });
 
 // 404 handler

@@ -1,12 +1,17 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { randomBytes, createHash } from "crypto";
 import { startDaemon, stopDaemon, statusDaemon } from "./daemon.js";
 import {
   addRemoteAccessToken,
   getConfiguredTokens,
   removeRemoteAccessToken,
-} from "./config.js";
+} from "./config/index.js";
+import { generateRemoteAccessToken, tokenFingerprint } from "./lib/token.js";
+import { runCheck, formatViolations } from "./services/state-machines/sm-diff-analyzer.js";
+import { registerProjectCommand } from "./cli-commands/project.js";
+import { registerWorkspaceCommand } from "./cli-commands/workspace.js";
+import { registerAgentsCommand } from "./cli-commands/agents.js";
+import { registerRemoteBootstrapCommand } from "./cli-commands/remote-bootstrap.js";
 
 const program = new Command();
 
@@ -42,8 +47,8 @@ program
 program
   .command("stop")
   .description("Stop Flockctl web server")
-  .action(() => {
-    stopDaemon();
+  .action(async () => {
+    await stopDaemon();
   });
 
 program
@@ -52,14 +57,6 @@ program
   .action(() => {
     statusDaemon();
   });
-
-function generateToken(): string {
-  return randomBytes(32).toString("base64url");
-}
-
-function fingerprint(token: string): string {
-  return createHash("sha256").update(token).digest("hex").slice(0, 8);
-}
 
 const tokenCmd = program
   .command("token")
@@ -75,7 +72,7 @@ tokenCmd
     false,
   )
   .action((opts) => {
-    const token = generateToken();
+    const token = generateRemoteAccessToken();
     if (opts.save) {
       try {
         addRemoteAccessToken(opts.label, token);
@@ -114,7 +111,7 @@ tokenCmd
     const labelWidth = Math.max(5, ...tokens.map((t) => t.label.length));
     console.log(`${"LABEL".padEnd(labelWidth)}  FINGERPRINT`);
     for (const t of tokens) {
-      console.log(`${t.label.padEnd(labelWidth)}  ${fingerprint(t.token)}`);
+      console.log(`${t.label.padEnd(labelWidth)}  ${tokenFingerprint(t.token)}`);
     }
   });
 
@@ -130,5 +127,57 @@ tokenCmd
       process.exit(1);
     }
   });
+
+const smCmd = program
+  .command("state-machines")
+  .description("Work with state-machine registries under .flockctl/state-machines/");
+
+smCmd
+  .command("check")
+  .description(
+    "Check the current git diff for state transitions that are not declared in the registry. " +
+      "Exits 1 on violations (suitable for pre-commit hooks).",
+  )
+  .option(
+    "-d, --diff <ref>",
+    "Git ref to diff against (default: HEAD — i.e. `git diff HEAD`)",
+    "HEAD",
+  )
+  .option(
+    "-f, --files <glob>",
+    "Restrict detection to files matching this glob (e.g. `src/models/**/*.ts`)",
+  )
+  .option("-C, --cwd <path>", "Run as if from this directory", process.cwd())
+  .action((opts) => {
+    try {
+      const result = runCheck({
+        cwd: opts.cwd,
+        diffRef: opts.diff,
+        files: opts.files,
+      });
+      if (result.violations.length === 0) {
+        const n = result.detected.length;
+        if (n === 0) {
+          console.log("No state-machine transitions found in diff.");
+        } else if (n === 1) {
+          console.log("1 detected transition matches the registry.");
+        } else {
+          console.log(`${n} detected transitions match the registry.`);
+        }
+        return;
+      }
+      console.error(formatViolations(result.violations));
+      process.exit(1);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`Error: ${msg}`);
+      process.exit(1);
+    }
+  });
+
+registerProjectCommand(program);
+registerWorkspaceCommand(program);
+registerAgentsCommand(program);
+registerRemoteBootstrapCommand(program);
 
 program.parse();

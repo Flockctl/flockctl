@@ -72,7 +72,8 @@ Model used by the planner when generating milestones and slices. Can be differen
 
 Agent backend used when a project / task does not specify one. Currently:
 
-- `claude-code` — Anthropic Claude via the Claude Code CLI / agent SDK (the only fully wired backend today)
+- `claude-code` — Anthropic Claude via the Claude Code CLI / agent SDK (default; fully wired)
+- `copilot` — GitHub Copilot via `@github/copilot-sdk`. Selected **per task / chat** by attaching a GitHub Copilot AI Provider Key (see [Adding a GitHub Copilot key](#adding-a-github-copilot-key) below) — not via this global field. Uses flat-rate billing (one premium request per prompt turn, regardless of tool calls inside the turn); pack multi-step work into a single prompt to avoid paying per milestone.
 
 OpenAI and Google Generative AI clients are present as dependencies and have stub integrations, but tasks are not routed through them yet.
 
@@ -118,6 +119,24 @@ UI-side list of other Flockctl daemons (the "server switcher" in the sidebar). M
 | `token` | Optional bearer token for that daemon |
 
 The server never returns tokens back through the API; list responses show `hasToken: true/false` only.
+
+## Adding a GitHub Copilot key
+
+GitHub Copilot is available as a first-class AI Provider Key type (alongside Anthropic / OpenAI / Google keys). Attach it to a task or chat like any other provider key — the task executor dispatches to the Copilot SDK when the selected key's `provider` is `github_copilot`.
+
+**Prerequisites:**
+
+- A Copilot-enabled GitHub account (Pro+ subscription for premium-request quota).
+- A GitHub token with Copilot access. Generate one via `gh auth token` after `gh auth login`, or create a fine-grained PAT with Copilot scope.
+
+**Create the key:**
+
+- **UI:** Settings → AI Keys → Add Key → Provider: *GitHub Copilot* → paste your GitHub token.
+- **API:** `POST /ai-keys` with body `{ "name": "my-copilot", "provider": "github_copilot", "provider_type": "oauth", "key_value": "<github-token>" }`.
+
+**Billing note.** Copilot charges per **prompt turn**, not per tool call. Each user message consumes one premium request, scaled by the model multiplier (`claude-opus-4.7` = 7.5×, `gpt-5.3-codex` = 1×, `gpt-4.1` / `gpt-5-mini` = 0× on Pro+). Packing multi-milestone work into a single prompt minimizes quota consumption.
+
+**Model IDs.** The SDK rejects unknown model names with `Model "<id>" is not available`. Run `npx tsx scripts/copilot-spike.ts` once to list the models your account can use.
 
 ## Per-project / per-workspace overrides
 

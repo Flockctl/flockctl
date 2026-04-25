@@ -3,7 +3,7 @@ import { app } from "../../server.js";
 import { createTestDb } from "../helpers.js";
 import { setDb, type FlockctlDb } from "../../db/index.js";
 import {
-  tasks, usageRecords, chats, chatMessages, schedules, taskTemplates, aiProviderKeys,
+  tasks, usageRecords, chats, chatMessages, schedules, aiProviderKeys,
 } from "../../db/schema.js";
 import Database from "better-sqlite3";
 
@@ -24,7 +24,6 @@ afterAll(() => {
 beforeEach(() => {
   sqlite.exec(`
     DELETE FROM schedules;
-    DELETE FROM task_templates;
     DELETE FROM chat_messages;
     DELETE FROM chats;
     DELETE FROM usage_records;
@@ -49,6 +48,9 @@ describe("GET /metrics/overview", () => {
     expect(body.productivity).toBeDefined();
     expect(body.productivity.tasksByStatus.total).toBe(0);
     expect(body.productivity.successRate).toBeNull();
+    expect(body.productivity.effectiveSuccessRate).toBeNull();
+    expect(body.productivity.buildAfterRerun).toBe(0);
+    expect(body.productivity.supersededFailures).toBe(0);
     expect(body.productivity.retryRate).toBeNull();
     expect(body.productivity.codeChangeRate).toBeNull();
 
@@ -103,6 +105,33 @@ describe("GET /metrics/overview", () => {
     expect(body.productivity.tasksWithCodeChanges).toBe(2);
   });
 
+  it("counts build-after-rerun and superseded-failure metrics", async () => {
+    // f1 → rescued by a successful rerun (`done`)     — bumps buildAfterRerun + supersededFailures
+    // f2 → rescued by `completed` rerun via timed_out  — bumps buildAfterRerun + supersededFailures
+    // f3 → dead failure, never re-run                  — just a plain failure
+    // f4 → still-running rerun                         — NOT superseded yet
+    const f1 = db.insert(tasks).values({ status: "failed" } as any).returning().get()!;
+    const f2 = db.insert(tasks).values({ status: "timed_out" } as any).returning().get()!;
+    db.insert(tasks).values({ status: "failed" } as any).run();
+    const f4 = db.insert(tasks).values({ status: "failed" } as any).returning().get()!;
+    db.insert(tasks).values({ status: "done", parentTaskId: f1.id } as any).run();
+    db.insert(tasks).values({ status: "completed", parentTaskId: f2.id } as any).run();
+    db.insert(tasks).values({ status: "running", parentTaskId: f4.id } as any).run();
+
+    const res = await app.request("/metrics/overview");
+    const body = await res.json();
+
+    expect(body.productivity.buildAfterRerun).toBe(2);
+    expect(body.productivity.supersededFailures).toBe(2);
+    // 2 original successes folded with 2 superseded failures = 4 effective
+    // successes out of 5 finished tasks (f1, f2, f3, f4 + 2 successful reruns
+    // = 6 terminal, minus f4's rerun which is still running = but that's not
+    // in finishedCount). finishedCount = done(2) + completed(0) + failed(3) +
+    // timed_out(1) = 6. (done counts: reruns of f1/f2 + nothing else = 2).
+    // effectiveSuccessRate = (2 success + 2 superseded) / 6 = 0.6666…
+    expect(body.productivity.effectiveSuccessRate).toBeGreaterThan(body.productivity.successRate);
+  });
+
   it("computes cost metrics and cache hit rate", async () => {
     const t1 = db.insert(tasks).values({ status: "completed" } as any).returning().get()!;
     db.insert(usageRecords).values([
@@ -154,11 +183,10 @@ describe("GET /metrics/overview", () => {
   });
 
   it("computes schedule metrics", async () => {
-    const tpl = db.insert(taskTemplates).values({ name: "t" } as any).returning().get()!;
     db.insert(schedules).values([
-      { templateId: tpl.id, scheduleType: "cron", cronExpression: "* * * * *", status: "active" },
-      { templateId: tpl.id, scheduleType: "cron", cronExpression: "* * * * *", status: "active" },
-      { templateId: tpl.id, scheduleType: "cron", cronExpression: "* * * * *", status: "paused" },
+      { templateScope: "global", templateName: "t", scheduleType: "cron", cronExpression: "* * * * *", status: "active" },
+      { templateScope: "global", templateName: "t", scheduleType: "cron", cronExpression: "* * * * *", status: "active" },
+      { templateScope: "global", templateName: "t", scheduleType: "cron", cronExpression: "* * * * *", status: "paused" },
     ] as any).run();
 
     const res = await app.request("/metrics/overview");
@@ -232,7 +260,7 @@ describe("GET /metrics/overview", () => {
     expect(body.productivity.tasksByStatus.total).toBe(1);
   });
 
-  it("filters by ai_provider_key_id — scopes tasks, templates, chats", async () => {
+  it("filters by ai_provider_key_id — scopes tasks, schedules, chats", async () => {
     const key = db.insert(aiProviderKeys).values({
       provider: "anthropic",
       providerType: "api_key",
@@ -241,7 +269,16 @@ describe("GET /metrics/overview", () => {
     } as any).returning().get()!;
     const t1 = db.insert(tasks).values({ status: "completed", assignedKeyId: key.id } as any).returning().get()!;
     db.insert(tasks).values({ status: "completed", assignedKeyId: 9999 } as any).run();
-    db.insert(taskTemplates).values({ name: "scoped", assignedKeyId: key.id } as any).run();
+    // `assignedKeyId` moved off templates onto schedules — scope by a
+    // schedule row that carries the key we're filtering for.
+    db.insert(schedules).values({
+      templateScope: "global",
+      templateName: "scoped",
+      scheduleType: "cron",
+      cronExpression: "* * * * *",
+      status: "active",
+      assignedKeyId: key.id,
+    } as any).run();
     const c1 = db.insert(chats).values({ title: "scoped-chat" } as any).returning().get()!;
     const cm = db.insert(chatMessages).values({ chatId: c1.id, role: "user", content: "x" } as any).returning().get()!;
     db.insert(usageRecords).values({

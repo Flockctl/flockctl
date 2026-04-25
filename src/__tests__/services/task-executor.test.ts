@@ -9,7 +9,7 @@ import Database from "better-sqlite3";
 const agentSessionCalls: any[] = [];
 
 // Mock heavy dependencies
-vi.mock("../../services/agent-session", () => {
+vi.mock("../../services/agent-session/index", () => {
   const EventEmitter = require("events").EventEmitter;
   class MockAgentSession extends EventEmitter {
     private shouldFail: boolean;
@@ -38,11 +38,11 @@ vi.mock("../../services/ws-manager", () => ({
   },
 }));
 
-vi.mock("../../services/claude-skills-sync", () => ({
+vi.mock("../../services/claude/skills-sync", () => ({
   reconcileClaudeSkillsForProject: vi.fn(() => {}),
 }));
 
-vi.mock("../../services/claude-mcp-sync", () => ({
+vi.mock("../../services/claude/mcp-sync", () => ({
   reconcileMcpForProject: vi.fn(() => {}),
 }));
 
@@ -87,7 +87,7 @@ afterAll(() => {
 });
 
 // Import after mocks are set up
-import { taskExecutor } from "../../services/task-executor.js";
+import { taskExecutor } from "../../services/task-executor/index.js";
 import { wsManager } from "../../services/ws-manager.js";
 
 describe("TaskExecutor", () => {

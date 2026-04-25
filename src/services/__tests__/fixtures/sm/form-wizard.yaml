@@ -1,0 +1,20 @@
+# Multi-step form wizard: user drafts, fills fields, reviews, submits.
+# Cancellation is allowed from any non-terminal step.
+states:
+  - draft
+  - fill
+  - review
+  - submitted
+  - cancelled
+initial: draft
+transitions:
+  - { from: draft,  to: fill,      event: begin }
+  - { from: fill,   to: review,    event: next }
+  - { from: review, to: fill,      event: back }
+  - { from: review, to: submitted, event: submit }
+  - { from: draft,  to: cancelled, event: cancel }
+  - { from: fill,   to: cancelled, event: cancel }
+  - { from: review, to: cancelled, event: cancel }
+final:
+  - submitted
+  - cancelled

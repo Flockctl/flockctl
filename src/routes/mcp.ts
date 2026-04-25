@@ -3,9 +3,10 @@ import { getDb } from "../db/index.js";
 import { workspaces, projects } from "../db/schema.js";
 import { eq } from "drizzle-orm";
 import { NotFoundError, ValidationError } from "../lib/errors.js";
+import { parseIdParam } from "../lib/route-params.js";
 import { resolveMcpServersForProject } from "../services/mcp.js";
 import { loadMcpServersFromDir } from "../services/mcp.js";
-import { getGlobalMcpDir } from "../config.js";
+import { getGlobalMcpDir } from "../config/index.js";
 import {
   loadWorkspaceConfig,
   saveWorkspaceConfig,
@@ -18,7 +19,7 @@ import {
   reconcileMcpForProject,
   reconcileAllMcpInWorkspace,
   reconcileAllMcp,
-} from "../services/claude-mcp-sync.js";
+} from "../services/claude/mcp-sync.js";
 import { existsSync, writeFileSync, unlinkSync, mkdirSync } from "fs";
 import { join } from "path";
 
@@ -103,7 +104,7 @@ mcpRoutes.delete("/global/:name", (c) => {
 // GET /mcp/workspaces/:id/servers — list workspace MCP servers
 mcpRoutes.get("/workspaces/:id/servers", (c) => {
   const db = getDb();
-  const id = parseInt(c.req.param("id"));
+  const id = parseIdParam(c);
   const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
   if (!ws) throw new NotFoundError("Workspace");
 
@@ -115,7 +116,7 @@ mcpRoutes.get("/workspaces/:id/servers", (c) => {
 // POST /mcp/workspaces/:id/servers — create/update workspace MCP server
 mcpRoutes.post("/workspaces/:id/servers", async (c) => {
   const db = getDb();
-  const id = parseInt(c.req.param("id"));
+  const id = parseIdParam(c);
   const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
   if (!ws) throw new NotFoundError("Workspace");
 
@@ -135,7 +136,7 @@ mcpRoutes.post("/workspaces/:id/servers", async (c) => {
 // DELETE /mcp/workspaces/:id/servers/:name
 mcpRoutes.delete("/workspaces/:id/servers/:name", (c) => {
   const db = getDb();
-  const id = parseInt(c.req.param("id"));
+  const id = parseIdParam(c);
   const name = c.req.param("name");
   validateName(name);
   const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
@@ -152,7 +153,7 @@ mcpRoutes.delete("/workspaces/:id/servers/:name", (c) => {
 // GET /mcp/workspaces/:wid/projects/:pid/servers — list project MCP servers
 mcpRoutes.get("/workspaces/:wid/projects/:pid/servers", (c) => {
   const db = getDb();
-  const pid = parseInt(c.req.param("pid"));
+  const pid = parseIdParam(c, "pid");
   const project = db.select().from(projects).where(eq(projects.id, pid)).get();
   if (!project?.path) throw new NotFoundError("Project");
 
@@ -164,7 +165,7 @@ mcpRoutes.get("/workspaces/:wid/projects/:pid/servers", (c) => {
 // POST /mcp/workspaces/:wid/projects/:pid/servers — create/update project MCP server
 mcpRoutes.post("/workspaces/:wid/projects/:pid/servers", async (c) => {
   const db = getDb();
-  const pid = parseInt(c.req.param("pid"));
+  const pid = parseIdParam(c, "pid");
   const project = db.select().from(projects).where(eq(projects.id, pid)).get();
   if (!project?.path) throw new NotFoundError("Project");
 
@@ -184,7 +185,7 @@ mcpRoutes.post("/workspaces/:wid/projects/:pid/servers", async (c) => {
 // DELETE /mcp/workspaces/:wid/projects/:pid/servers/:name
 mcpRoutes.delete("/workspaces/:wid/projects/:pid/servers/:name", (c) => {
   const db = getDb();
-  const pid = parseInt(c.req.param("pid"));
+  const pid = parseIdParam(c, "pid");
   const name = c.req.param("name");
   validateName(name);
   const project = db.select().from(projects).where(eq(projects.id, pid)).get();
@@ -203,7 +204,7 @@ mcpRoutes.delete("/workspaces/:wid/projects/:pid/servers/:name", (c) => {
 // POST /mcp/workspaces/:id/disabled-mcp — body: {name, level} with level ∈ {global, workspace}
 mcpRoutes.post("/workspaces/:id/disabled-mcp", async (c) => {
   const db = getDb();
-  const id = parseInt(c.req.param("id"));
+  const id = parseIdParam(c);
   const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
   if (!ws) throw new NotFoundError("Workspace");
   if (!ws.path) throw new ValidationError("Workspace has no path");
@@ -221,7 +222,7 @@ mcpRoutes.post("/workspaces/:id/disabled-mcp", async (c) => {
 // DELETE /mcp/workspaces/:id/disabled-mcp — body: {name, level}
 mcpRoutes.delete("/workspaces/:id/disabled-mcp", async (c) => {
   const db = getDb();
-  const id = parseInt(c.req.param("id"));
+  const id = parseIdParam(c);
   const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
   if (!ws) throw new NotFoundError("Workspace");
   if (!ws.path) throw new ValidationError("Workspace has no path");
@@ -239,7 +240,7 @@ mcpRoutes.delete("/workspaces/:id/disabled-mcp", async (c) => {
 // GET /mcp/workspaces/:id/disabled-mcp — list disabled MCP servers for workspace
 mcpRoutes.get("/workspaces/:id/disabled-mcp", (c) => {
   const db = getDb();
-  const id = parseInt(c.req.param("id"));
+  const id = parseIdParam(c);
   const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
   if (!ws) throw new NotFoundError("Workspace");
 
@@ -250,7 +251,7 @@ mcpRoutes.get("/workspaces/:id/disabled-mcp", (c) => {
 // POST /mcp/projects/:pid/disabled-mcp — body: {name, level} with level ∈ {global, workspace, project}
 mcpRoutes.post("/projects/:pid/disabled-mcp", async (c) => {
   const db = getDb();
-  const pid = parseInt(c.req.param("pid"));
+  const pid = parseIdParam(c, "pid");
   const project = db.select().from(projects).where(eq(projects.id, pid)).get();
   if (!project) throw new NotFoundError("Project");
   if (!project.path) throw new ValidationError("Project has no path");
@@ -268,7 +269,7 @@ mcpRoutes.post("/projects/:pid/disabled-mcp", async (c) => {
 // DELETE /mcp/projects/:pid/disabled-mcp — body: {name, level}
 mcpRoutes.delete("/projects/:pid/disabled-mcp", async (c) => {
   const db = getDb();
-  const pid = parseInt(c.req.param("pid"));
+  const pid = parseIdParam(c, "pid");
   const project = db.select().from(projects).where(eq(projects.id, pid)).get();
   if (!project) throw new NotFoundError("Project");
   if (!project.path) throw new ValidationError("Project has no path");
@@ -286,7 +287,7 @@ mcpRoutes.delete("/projects/:pid/disabled-mcp", async (c) => {
 // GET /mcp/projects/:pid/disabled-mcp — list disabled MCP servers for project
 mcpRoutes.get("/projects/:pid/disabled-mcp", (c) => {
   const db = getDb();
-  const pid = parseInt(c.req.param("pid"));
+  const pid = parseIdParam(c, "pid");
   const project = db.select().from(projects).where(eq(projects.id, pid)).get();
   if (!project) throw new NotFoundError("Project");
 

@@ -1,20 +1,14 @@
-import { Fragment, useState, useMemo } from "react";
-import { Link } from "react-router-dom";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { Fragment, useState } from "react";
 import {
   useSchedules,
-  useTemplates,
-  useCreateSchedule,
   usePauseSchedule,
   useResumeSchedule,
   useDeleteSchedule,
   useTriggerSchedule,
-  useProjects,
-  useScheduleTasks,
 } from "@/lib/hooks";
-import { ScheduleStatus, ScheduleType } from "@/lib/types";
-import type { Schedule, ScheduleCreate, ScheduleFilters, TaskTemplate } from "@/lib/types";
-import { statusBadge } from "@/components/status-badge";
+import { ScheduleStatus } from "@/lib/types";
+import type { Schedule, ScheduleFilters } from "@/lib/types";
+import { formatTimestamp as formatTime } from "@/lib/format";
 import {
   Table,
   TableHeader,
@@ -25,28 +19,27 @@ import {
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Select,
   SelectContent,
-  SelectGroup,
   SelectItem,
-  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
 import { ConfirmDialog, useConfirmDialog } from "@/components/confirm-dialog";
+import { ChevronDown, ChevronRight } from "lucide-react";
+import {
+  CreateScheduleDialog,
+  scopeLabel,
+} from "@/pages/schedules-components/create-schedule-dialog";
+import { ScheduleTasksRow } from "@/pages/schedules-components/schedule-tasks-row";
+
+// Re-exported for callers that still import from `@/pages/schedules` (the
+// project-detail Schedules section mounts the dialog inline with a preset
+// scope). Keep this alias stable.
+export { CreateScheduleDialog };
 
 const PAGE_SIZE = 20;
 
@@ -54,22 +47,6 @@ const SCHEDULE_STATUS_VALUES: ScheduleStatus[] = [
   ScheduleStatus.active,
   ScheduleStatus.paused,
   ScheduleStatus.expired,
-];
-
-
-
-const CRON_PRESETS: { label: string; cron: string; group: string }[] = [
-  { label: "Every 5 minutes", cron: "*/5 * * * *", group: "Frequent" },
-  { label: "Every 15 minutes", cron: "*/15 * * * *", group: "Frequent" },
-  { label: "Every 30 minutes", cron: "*/30 * * * *", group: "Frequent" },
-  { label: "Every hour", cron: "0 * * * *", group: "Frequent" },
-  { label: "Daily at midnight", cron: "0 0 * * *", group: "Daily" },
-  { label: "Daily at 6 AM", cron: "0 6 * * *", group: "Daily" },
-  { label: "Daily at noon", cron: "0 12 * * *", group: "Daily" },
-  { label: "Daily at 6 PM", cron: "0 18 * * *", group: "Daily" },
-  { label: "Weekly on Monday", cron: "0 0 * * 1", group: "Weekly" },
-  { label: "Weekly on Friday", cron: "0 0 * * 5", group: "Weekly" },
-  { label: "Custom cron...", cron: "__custom__", group: "Other" },
 ];
 
 function ScheduleStatusBadge({ status }: { status: Schedule["status"] }) {
@@ -86,286 +63,13 @@ function ScheduleStatusBadge({ status }: { status: Schedule["status"] }) {
   return <Badge variant="outline">{status}</Badge>;
 }
 
-function formatTime(iso: string | null): string {
-  if (!iso) return "-";
-  return new Date(iso).toLocaleString();
-}
-
-export function CreateScheduleDialog({
-  projectId,
-  buttonSize,
-}: {
-  projectId?: string;
-  buttonSize?: "default" | "sm";
-}) {
-  const [open, setOpen] = useState(false);
-  const [templateId, setTemplateId] = useState("");
-  const [cronExpression, setCronExpression] = useState("");
-  const [cronPreset, setCronPreset] = useState("__custom__");
-  const [timezone, setTimezone] = useState(
-    () => Intl.DateTimeFormat().resolvedOptions().timeZone,
-  );
-  const [misfireGrace, setMisfireGrace] = useState("");
-  const [formError, setFormError] = useState("");
-
-  const createSchedule = useCreateSchedule();
-  const { data: templatesData } = useTemplates(0, 100, projectId);
-
-  function resetForm() {
-    setTemplateId("");
-    setCronExpression("");
-    setCronPreset("__custom__");
-    setTimezone(Intl.DateTimeFormat().resolvedOptions().timeZone);
-    setMisfireGrace("");
-    setFormError("");
-  }
-
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setFormError("");
-
-    if (!templateId) {
-      setFormError("Template is required.");
-      return;
-    }
-
-    if (!cronExpression.trim()) {
-      setFormError("Cron expression is required.");
-      return;
-    }
-
-    const data: ScheduleCreate = {
-      template_id: templateId,
-      schedule_type: ScheduleType.cron,
-      cron_expression: cronExpression.trim(),
-    };
-
-    if (timezone.trim()) data.timezone = timezone.trim();
-    if (misfireGrace) {
-      data.misfire_grace_seconds = Number(misfireGrace);
-    }
-
-    try {
-      await createSchedule.mutateAsync(data);
-      resetForm();
-      setOpen(false);
-    } catch (err) {
-      setFormError(
-        err instanceof Error ? err.message : "Failed to create schedule",
-      );
-    }
-  }
-
-  return (
-    <Dialog
-      open={open}
-      onOpenChange={(v) => {
-        setOpen(v);
-        if (!v) resetForm();
-      }}
-    >
-      <DialogTrigger asChild>
-        <Button size={buttonSize}>Create Schedule</Button>
-      </DialogTrigger>
-      <DialogContent className="max-w-lg">
-        <DialogHeader>
-          <DialogTitle>Create Schedule</DialogTitle>
-          <DialogDescription>
-            {projectId
-              ? "Schedule a template bound to this project."
-              : "Schedule a template for automatic execution."}
-          </DialogDescription>
-        </DialogHeader>
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div className="space-y-2">
-            <Label htmlFor="sched-template">Template *</Label>
-            <Select value={templateId} onValueChange={setTemplateId}>
-              <SelectTrigger id="sched-template">
-                <SelectValue placeholder="Select a template" />
-              </SelectTrigger>
-              <SelectContent>
-                {templatesData?.items?.map((tpl) => (
-                  <SelectItem key={tpl.id} value={tpl.id}>
-                    {tpl.name}
-                  </SelectItem>
-                ))}
-                {projectId &&
-                  (!templatesData?.items ||
-                    templatesData?.items?.length === 0) && (
-                    <p className="px-2 py-1 text-xs text-muted-foreground">
-                      No templates bound to this project.{" "}
-                      <Link
-                        to="/templates"
-                        className="underline hover:text-foreground"
-                      >
-                        Create one on the Templates page
-                      </Link>
-                    </p>
-                  )}
-              </SelectContent>
-            </Select>
-          </div>
-
-          <div className="space-y-2">
-              <Label>Cron Schedule *</Label>
-              <Select
-                value={cronPreset}
-                onValueChange={(value) => {
-                  setCronPreset(value);
-                  if (value !== "__custom__") {
-                    const preset = CRON_PRESETS.find((p) => p.cron === value);
-                    if (preset) setCronExpression(preset.cron);
-                  }
-                }}
-              >
-                <SelectTrigger className="w-full">
-                  <SelectValue placeholder="Choose a schedule…" />
-                </SelectTrigger>
-                <SelectContent>
-                  {["Frequent", "Daily", "Weekly", "Other"].map((group) => (
-                    <SelectGroup key={group}>
-                      <SelectLabel>{group}</SelectLabel>
-                      {CRON_PRESETS.filter((p) => p.group === group).map(
-                        (p) => (
-                          <SelectItem key={p.cron} value={p.cron}>
-                            {p.label}
-                          </SelectItem>
-                        ),
-                      )}
-                    </SelectGroup>
-                  ))}
-                </SelectContent>
-              </Select>
-              {cronPreset === "__custom__" && (
-                <Input
-                  id="sched-cron"
-                  placeholder="*/5 * * * *"
-                  value={cronExpression}
-                  onChange={(e) => setCronExpression(e.target.value)}
-                />
-              )}
-              {cronExpression && (
-                <p className="text-xs font-mono text-muted-foreground">
-                  Cron: {cronExpression}
-                </p>
-              )}
-          </div>
-
-          <div className="grid grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <Label htmlFor="sched-tz">Timezone</Label>
-              <Select value={timezone} onValueChange={setTimezone}>
-                <SelectTrigger id="sched-tz">
-                  <SelectValue placeholder="Select timezone" />
-                </SelectTrigger>
-                <SelectContent className="max-h-60">
-                  {Intl.supportedValuesOf("timeZone").map((tz) => (
-                    <SelectItem key={tz} value={tz}>{tz.replace(/_/g, " ")}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="sched-misfire">Misfire Grace (seconds)</Label>
-              <Input
-                id="sched-misfire"
-                type="number"
-                placeholder="optional"
-                value={misfireGrace}
-                onChange={(e) => setMisfireGrace(e.target.value)}
-              />
-            </div>
-          </div>
-
-          {formError && (
-            <p className="text-sm text-destructive">{formError}</p>
-          )}
-          <DialogFooter>
-            <Button type="submit" disabled={createSchedule.isPending}>
-              {createSchedule.isPending ? "Creating…" : "Create"}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function ScheduleTasksRow({
-  scheduleId,
-  colSpan,
-}: {
-  scheduleId: string;
-  colSpan: number;
-}) {
-  const { data, isLoading, error } = useScheduleTasks(scheduleId, 0, 20, {
-    refetchInterval: 10_000,
-  });
-
-  return (
-    <TableRow className="bg-muted/30 hover:bg-muted/30">
-      <TableCell colSpan={colSpan} className="p-4">
-        {isLoading && (
-          <p className="text-xs text-muted-foreground">Loading tasks…</p>
-        )}
-        {error && (
-          <p className="text-xs text-destructive">
-            Failed to load tasks: {error.message}
-          </p>
-        )}
-        {data && data.items.length === 0 && (
-          <p className="text-xs text-muted-foreground">
-            No tasks have been created by this schedule yet.
-          </p>
-        )}
-        {data && data.items.length > 0 && (
-          <div className="space-y-2">
-            <p className="text-xs text-muted-foreground">
-              {data.total} task{data.total !== 1 ? "s" : ""} created by this schedule
-              {data.total > data.items.length && ` (showing latest ${data.items.length})`}
-            </p>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-[80px]">ID</TableHead>
-                  <TableHead>Label</TableHead>
-                  <TableHead className="w-[140px]">Status</TableHead>
-                  <TableHead className="w-[180px]">Created</TableHead>
-                  <TableHead className="w-[180px]">Completed</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {data.items.map((task) => (
-                  <TableRow key={task.id}>
-                    <TableCell className="font-mono text-xs">
-                      <Link
-                        to={`/tasks/${task.id}`}
-                        className="underline hover:text-foreground"
-                      >
-                        {String(task.id).slice(0, 8)}
-                      </Link>
-                    </TableCell>
-                    <TableCell className="text-xs text-muted-foreground max-w-[320px] truncate">
-                      {task.prompt ?? "\u2014"}
-                    </TableCell>
-                    <TableCell>{statusBadge(task.status)}</TableCell>
-                    <TableCell className="text-xs">
-                      {formatTime(task.created_at)}
-                    </TableCell>
-                    <TableCell className="text-xs">
-                      {formatTime(task.completed_at)}
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
-        )}
-      </TableCell>
-    </TableRow>
-  );
-}
-
+/**
+ * /schedules landing page. Renders the filter bar + paginated table. Row
+ * expansion drops to `ScheduleTasksRow` (fetches latest tasks spawned by the
+ * schedule) and the header "Create" button mounts `CreateScheduleDialog`.
+ * Heavy sub-trees live under `schedules-components/` so this file stays
+ * focused on the table layout and row actions.
+ */
 export default function SchedulesPage() {
   const [filters, setFilters] = useState<ScheduleFilters>({});
   const [offset, setOffset] = useState(0);
@@ -383,33 +87,11 @@ export default function SchedulesPage() {
   const { data, isLoading, error } = useSchedules(offset, PAGE_SIZE, filters, {
     refetchInterval: 10_000,
   });
-  const { data: templatesData } = useTemplates(0, 100);
-  const { data: projectsData } = useProjects();
   const pauseScheduleMutation = usePauseSchedule();
   const resumeScheduleMutation = useResumeSchedule();
   const deleteScheduleMutation = useDeleteSchedule();
   const triggerScheduleMutation = useTriggerSchedule();
   const deleteConfirm = useConfirmDialog();
-
-  const templateMap = useMemo(() => {
-    const map = new Map<string, TaskTemplate>();
-    if (templatesData?.items) {
-      for (const tpl of templatesData.items) {
-        map.set(tpl.id, tpl);
-      }
-    }
-    return map;
-  }, [templatesData]);
-
-  const projectMap = useMemo(() => {
-    const map = new Map<string, string>();
-    if (projectsData) {
-      for (const p of projectsData) {
-        map.set(p.id, p.name);
-      }
-    }
-    return map;
-  }, [projectsData]);
 
   function updateFilter<K extends keyof ScheduleFilters>(
     key: K,
@@ -435,10 +117,10 @@ export default function SchedulesPage() {
 
   return (
     <div>
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold">Schedules</h1>
-          <p className="mt-1 text-muted-foreground">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <h1 className="text-xl font-bold sm:text-2xl">Schedules</h1>
+          <p className="mt-1 text-sm text-muted-foreground sm:text-base">
             Configure and monitor scheduled task execution.
           </p>
         </div>
@@ -510,8 +192,7 @@ export default function SchedulesPage() {
                 <TableRow>
                   <TableHead className="w-[32px]" />
                   <TableHead>Template</TableHead>
-                  <TableHead>Description</TableHead>
-                  <TableHead>Project</TableHead>
+                  <TableHead>Scope</TableHead>
                   <TableHead>Schedule</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead>Next Fire</TableHead>
@@ -546,20 +227,10 @@ export default function SchedulesPage() {
                       </button>
                     </TableCell>
                     <TableCell className="font-medium">
-                      {templateMap.get(sched.template_id)?.name ??
-                        String(sched.template_id).slice(0, 8)}
+                      {sched.template_name}
                     </TableCell>
-                    <TableCell className="text-sm text-muted-foreground max-w-[200px] truncate">
-                      {templateMap.get(sched.template_id)?.description ?? "\u2014"}
-                    </TableCell>
-                    <TableCell className="text-sm text-muted-foreground">
-                      {(() => {
-                        const tpl = templateMap.get(sched.template_id);
-                        if (tpl?.project_id) {
-                          return projectMap.get(tpl.project_id) ?? String(tpl.project_id).slice(0, 8);
-                        }
-                        return "\u2014";
-                      })()}
+                    <TableCell className="text-xs">
+                      {scopeLabel(sched.template_scope)}
                     </TableCell>
                     <TableCell className="font-mono text-xs">
                       {sched.cron_expression ?? "-"}
@@ -628,7 +299,7 @@ export default function SchedulesPage() {
                     </TableCell>
                   </TableRow>
                   {isExpanded && (
-                    <ScheduleTasksRow scheduleId={sched.id} colSpan={9} />
+                    <ScheduleTasksRow scheduleId={sched.id} colSpan={8} />
                   )}
                   </Fragment>
                   );

@@ -8,7 +8,7 @@ import { join } from "path";
 import { tmpdir } from "os";
 
 // Mock task executor so generate-plan doesn't spawn subprocess
-vi.mock("../../services/task-executor", () => ({
+vi.mock("../../services/task-executor/index", () => ({
   taskExecutor: {
     execute: vi.fn(),
     cancel: vi.fn(),
@@ -32,20 +32,6 @@ vi.mock("../../services/auto-executor", () => ({
   stopAutoExecution: vi.fn(() => true),
   getAutoExecutionStatus: vi.fn(() => ({ running: false })),
 }));
-
-// Mock claude-cli for plan-chat/stream SSE
-vi.mock("../../services/claude-cli", () => {
-  async function* mockStream() {
-    yield { type: "text", text: "Hello" };
-    yield { type: "done" };
-  }
-  return {
-    streamViaClaudeAgentSDK: vi.fn(() => mockStream()),
-    renameClaudeSession: vi.fn(() => Promise.resolve()),
-    resolveModelId: vi.fn((m: string) => m),
-    SUPPORTED_MODELS: [],
-  };
-});
 
 describe("Planning — extras", () => {
   let testDb: ReturnType<typeof createTestDb>;
@@ -126,7 +112,7 @@ describe("Planning — extras", () => {
       const body = await res.json();
       expect(body.taskId).toBeGreaterThan(0);
 
-      const { taskExecutor } = await import("../../services/task-executor.js");
+      const { taskExecutor } = await import("../../services/task-executor/index.js");
       expect(taskExecutor.execute).toHaveBeenCalledWith(body.taskId);
     });
 
@@ -149,6 +135,90 @@ describe("Planning — extras", () => {
       });
       expect(res.status).toBe(422);
       testDb.sqlite.exec("UPDATE ai_provider_keys SET is_active = 1;");
+    });
+
+    // Optional UI-provided overrides: `aiProviderKeyId` pins the task to a
+    // specific key (subject to the project/workspace whitelist) and `model`
+    // pins the model string. Both are simply written onto the task row so
+    // the executor picks them up without special-casing plan generation.
+    it("persists aiProviderKeyId + model onto the generated task when provided", async () => {
+      const keyRow = testDb.db
+        .insert(aiProviderKeys)
+        .values({
+          provider: "claude_cli",
+          providerType: "cli",
+          label: "plan-key",
+        } as any)
+        .returning()
+        .get()!;
+
+      const res = await app.request(`/projects/${projectId}/generate-plan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: "Build something",
+          mode: "quick",
+          aiProviderKeyId: keyRow.id,
+          model: "claude-opus-4-7",
+        }),
+      });
+      expect(res.status).toBe(201);
+      const body = await res.json();
+
+      const row = testDb.sqlite
+        .prepare("SELECT assigned_key_id, model FROM tasks WHERE id = ?")
+        .get(body.taskId) as { assigned_key_id: number; model: string };
+      expect(row.assigned_key_id).toBe(keyRow.id);
+      expect(row.model).toBe("claude-opus-4-7");
+    });
+
+    it("rejects aiProviderKeyId that is not in the project whitelist", async () => {
+      // Pick a key not in the whitelist, then restrict the project to a
+      // different key — the API must 422 with a clear allow-list hint.
+      const permitted = testDb.db
+        .insert(aiProviderKeys)
+        .values({ provider: "claude_cli", providerType: "cli", label: "permitted" } as any)
+        .returning()
+        .get()!;
+      const forbidden = testDb.db
+        .insert(aiProviderKeys)
+        .values({ provider: "claude_cli", providerType: "cli", label: "forbidden" } as any)
+        .returning()
+        .get()!;
+      testDb.sqlite
+        .prepare("UPDATE projects SET allowed_key_ids = ? WHERE id = ?")
+        .run(JSON.stringify([permitted.id]), projectId);
+
+      const res = await app.request(`/projects/${projectId}/generate-plan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: "Build something",
+          mode: "quick",
+          aiProviderKeyId: forbidden.id,
+        }),
+      });
+      expect(res.status).toBe(422);
+      const body = await res.json();
+      expect(String(body.error ?? body.message ?? "")).toMatch(/allowed key list/i);
+
+      // Clean up so later tests don't inherit the restriction.
+      testDb.sqlite
+        .prepare("UPDATE projects SET allowed_key_ids = NULL WHERE id = ?")
+        .run(projectId);
+    });
+
+    it("rejects non-numeric aiProviderKeyId", async () => {
+      const res = await app.request(`/projects/${projectId}/generate-plan`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: "Build something",
+          mode: "quick",
+          aiProviderKeyId: "not-a-number",
+        }),
+      });
+      expect(res.status).toBe(422);
     });
   });
 
@@ -275,6 +345,42 @@ describe("Planning — extras", () => {
     });
   });
 
+  describe("GET /projects/:pid/milestones/:slug/readme", () => {
+    it("returns 404 when README.md is absent", async () => {
+      const mRes = await app.request(`/projects/${projectId}/milestones`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "No Readme Milestone" }),
+      });
+      const m = await mRes.json();
+
+      const res = await app.request(
+        `/projects/${projectId}/milestones/${m.slug}/readme`,
+      );
+      expect(res.status).toBe(404);
+    });
+
+    it("serves README.md when present", async () => {
+      const mRes = await app.request(`/projects/${projectId}/milestones`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "Has Readme" }),
+      });
+      const m = await mRes.json();
+
+      const readmePath = join(projectPath, ".flockctl", "plan", m.slug, "README.md");
+      writeFileSync(readmePath, "# Has Readme\n\nBody prose.\n", "utf-8");
+
+      const res = await app.request(
+        `/projects/${projectId}/milestones/${m.slug}/readme`,
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.content).toContain("# Has Readme");
+      expect(body.path).toContain("README.md");
+    });
+  });
+
   describe("PUT /projects/:pid/plan-file", () => {
     it("rejects missing content", async () => {
       const res = await app.request(`/projects/${projectId}/plan-file`, {
@@ -342,133 +448,4 @@ describe("Planning — extras", () => {
     });
   });
 
-  describe("POST /projects/:pid/plan-chat/stream", () => {
-    it("returns 404 for missing project", async () => {
-      const res = await app.request(`/projects/9999/plan-chat/stream`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          content: "hi",
-          entity_context: { entity_type: "milestone", entity_id: "x" },
-        }),
-      });
-      expect(res.status).toBe(404);
-    });
-
-    it("rejects missing content", async () => {
-      const res = await app.request(`/projects/${projectId}/plan-chat/stream`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          entity_context: { entity_type: "milestone", entity_id: "x" },
-        }),
-      });
-      expect(res.status).toBe(422);
-    });
-
-    it("rejects missing entity_context", async () => {
-      const res = await app.request(`/projects/${projectId}/plan-chat/stream`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content: "hi" }),
-      });
-      expect(res.status).toBe(422);
-    });
-
-    it("streams response for a milestone entity", async () => {
-      // Create a milestone first so entity file exists
-      const mRes = await app.request(`/projects/${projectId}/milestones`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: "Chat Target" }),
-      });
-      const m = await mRes.json();
-
-      const res = await app.request(`/projects/${projectId}/plan-chat/stream`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          content: "refine this",
-          entity_context: { entity_type: "milestone", entity_id: m.slug },
-        }),
-      });
-      expect(res.status).toBe(200);
-      const body = await res.text();
-      expect(body).toContain("data:");
-    });
-
-    it("streams for a slice entity (passes entity_content when file exists)", async () => {
-      const mRes = await app.request(`/projects/${projectId}/milestones`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: "Chat Slice Holder" }),
-      });
-      const m = await mRes.json();
-      const sRes = await app.request(
-        `/projects/${projectId}/milestones/${m.slug}/slices`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ title: "Chat Slice" }),
-        },
-      );
-      const s = await sRes.json();
-
-      const res = await app.request(`/projects/${projectId}/plan-chat/stream`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          content: "discuss this slice",
-          entity_context: {
-            entity_type: "slice",
-            entity_id: s.slug,
-            milestone_id: m.slug,
-          },
-        }),
-      });
-      expect(res.status).toBe(200);
-    });
-
-    it("streams for a task entity", async () => {
-      const mRes = await app.request(`/projects/${projectId}/milestones`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: "Chat Task Holder" }),
-      });
-      const m = await mRes.json();
-      const sRes = await app.request(
-        `/projects/${projectId}/milestones/${m.slug}/slices`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ title: "Chat Task Slice" }),
-        },
-      );
-      const s = await sRes.json();
-      const tRes = await app.request(
-        `/projects/${projectId}/milestones/${m.slug}/slices/${s.slug}/tasks`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ title: "Chat Task" }),
-        },
-      );
-      const t = await tRes.json();
-
-      const res = await app.request(`/projects/${projectId}/plan-chat/stream`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          content: "refine task",
-          entity_context: {
-            entity_type: "task",
-            entity_id: t.slug,
-            milestone_id: m.slug,
-            slice_id: s.slug,
-          },
-        }),
-      });
-      expect(res.status).toBe(200);
-    });
-  });
 });

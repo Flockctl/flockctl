@@ -3,7 +3,7 @@ import { join } from "path";
 import { getDb } from "../db/index.js";
 import { projects, workspaces } from "../db/schema.js";
 import { eq } from "drizzle-orm";
-import { getGlobalMcpDir } from "../config.js";
+import { getGlobalMcpDir } from "../config/index.js";
 import { loadWorkspaceConfig } from "./workspace-config.js";
 import { loadProjectConfig } from "./project-config.js";
 import type { DisableEntry } from "./workspace-config.js";
@@ -49,6 +49,8 @@ export function loadMcpServersFromDir(dir: string, level: McpLevel): McpServer[]
         }
       }
     } catch (err) {
+      /* v8 ignore next — JSON.parse / readFileSync throw Error subclasses,
+         so String(err) is defensive glue only. */
       console.warn(`[mcp] failed to parse ${combinedPath}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
@@ -67,6 +69,8 @@ export function loadMcpServersFromDir(dir: string, level: McpLevel): McpServer[]
       try {
         config = JSON.parse(readFileSync(join(dir, entry.name), "utf-8"));
       } catch (err) {
+        /* v8 ignore next — JSON.parse/readFileSync throw Error subclasses; the
+           String(err) fallback is defensive glue only. */
         console.warn(`[mcp] failed to parse ${entry.name}: ${err instanceof Error ? err.message : String(err)}`);
         continue;
       }
@@ -79,6 +83,8 @@ export function loadMcpServersFromDir(dir: string, level: McpLevel): McpServer[]
             config = mergeLocalOverride(config, override);
           }
         } catch (err) {
+          /* v8 ignore next — JSON.parse/readFileSync throw Error subclasses;
+             the String(err) fallback is defensive glue only. */
           console.warn(`[mcp] failed to parse override ${overridePath}: ${err instanceof Error ? err.message : String(err)}`);
         }
       }

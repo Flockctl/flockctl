@@ -1,19 +1,23 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { app } from "../../server.js";
-import { createTestDb } from "../helpers.js";
+import { createTestDb, seedActiveKey } from "../helpers.js";
 import { setDb } from "../../db/index.js";
 import { mkdtempSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { createMilestone, createSlice, createPlanTask } from "../../services/plan-store.js";
+import { createMilestone, createSlice, createPlanTask } from "../../services/plan-store/index.js";
 
 describe("Projects API — comprehensive", () => {
   let testDb: ReturnType<typeof createTestDb>;
+  let keyId: number;
   const projectPath = mkdtempSync(join(tmpdir(), "flockctl-proj-comp-"));
 
   beforeAll(() => {
     testDb = createTestDb();
     setDb(testDb.db, testDb.sqlite);
+    // POST /projects requires at least one active key in allowedKeyIds
+    // (src/routes/_allowed-keys.ts).
+    keyId = seedActiveKey(testDb.sqlite);
   });
 
   afterAll(() => {
@@ -35,6 +39,7 @@ describe("Projects API — comprehensive", () => {
           repoUrl: "https://github.com/test/repo",
           baseBranch: "develop",
           model: "claude-opus-4-7",
+          allowedKeyIds: [keyId],
         }),
       });
       expect(res.status).toBe(201);
@@ -55,7 +60,7 @@ describe("Projects API — comprehensive", () => {
       const res = await app.request("/projects", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: "Minimal Project" }),
+        body: JSON.stringify({ name: "Minimal Project", allowedKeyIds: [keyId] }),
       });
       expect(res.status).toBe(201);
       const p = await res.json();

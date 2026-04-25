@@ -169,6 +169,43 @@ describe("AI Keys routes", () => {
     expect(body.key_suffix).toBe("2345");
   });
 
+  it("POST /keys accepts github_copilot provider with token", async () => {
+    const res = await app.request("/keys", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider: "github_copilot",
+        providerType: "oauth",
+        label: "my-copilot",
+        keyValue: "gho_testtoken1234567890",
+      }),
+    });
+    expect(res.status).toBe(201);
+    const key = await res.json();
+    expect(key.provider).toBe("github_copilot");
+  });
+
+  it("POST /keys rejects github_copilot without keyValue (422)", async () => {
+    const res = await app.request("/keys", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider: "github_copilot",
+        providerType: "oauth",
+        label: "no-token",
+      }),
+    });
+    expect(res.status).toBe(422);
+  });
+
+  it("GET /keys/providers includes github_copilot", async () => {
+    const res = await app.request("/keys/providers");
+    expect(res.status).toBe(200);
+    const providers = await res.json();
+    expect(providers.github_copilot).toBeDefined();
+    expect(providers.github_copilot.name).toBe("GitHub Copilot");
+  });
+
   it("PATCH returns null keyValue & key_suffix when key has no value", async () => {
     const created = await app.request("/keys", {
       method: "POST",

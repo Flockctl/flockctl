@@ -10,10 +10,10 @@ import Database from "better-sqlite3";
 import {
   createMilestone, createSlice, createPlanTask,
   listPlanTasks, listSlices, updatePlanTask,
-} from "../../services/plan-store.js";
+} from "../../services/plan-store/index.js";
 
 // Mock task-executor: simulate task completion the next tick
-vi.mock("../../services/task-executor", () => ({
+vi.mock("../../services/task-executor/index", () => ({
   taskExecutor: {
     execute: vi.fn(),
   },
@@ -25,7 +25,7 @@ vi.mock("../../services/ws-manager", () => ({
   },
 }));
 
-import { taskExecutor } from "../../services/task-executor.js";
+import { taskExecutor } from "../../services/task-executor/index.js";
 
 // Default: each execute() marks the exec task as done next microtask
 function installCompleteImmediately() {

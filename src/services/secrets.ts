@@ -4,7 +4,7 @@ import { randomBytes, createCipheriv, createDecipheriv } from "crypto";
 import { and, eq, isNull } from "drizzle-orm";
 import { getDb } from "../db/index.js";
 import { secrets, projects, workspaces } from "../db/schema.js";
-import { getFlockctlHome } from "../config.js";
+import { getFlockctlHome } from "../config/index.js";
 
 export type SecretScope = "global" | "workspace" | "project";
 
@@ -313,7 +313,7 @@ export function listPlaceholders(input: string): string[] {
   const names: string[] = [];
   for (const m of input.matchAll(PLACEHOLDER_RE)) {
     const n = m[1];
-    if (!names.includes(n)) names.push(n);
+    if (n && !names.includes(n)) names.push(n);
   }
   return names;
 }

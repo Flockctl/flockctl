@@ -1,6 +1,8 @@
+import { memo } from "react";
 import { Handle, Position } from "@xyflow/react";
 import type { Node, NodeProps } from "@xyflow/react";
 import { Badge } from "@/components/ui/badge";
+import { statusBadge } from "@/components/status-badge";
 import { NODE_WIDTH } from "./layout";
 
 const STATUS_COLORS: Record<string, { bg: string; border: string; text: string }> = {
@@ -14,32 +16,13 @@ const STATUS_COLORS: Record<string, { bg: string; border: string; text: string }
   skipped:   { bg: "bg-gray-100 dark:bg-gray-800", border: "border-gray-400", text: "text-gray-400" },
 };
 
+const DEFAULT_COLORS = { bg: "bg-gray-100 dark:bg-gray-800", border: "border-gray-400", text: "text-gray-500 dark:text-gray-400" };
+
 function getColors(status: string) {
-  return STATUS_COLORS[status] ?? STATUS_COLORS.pending;
+  return STATUS_COLORS[status] ?? STATUS_COLORS.pending ?? DEFAULT_COLORS;
 }
 
-function statusBadge(status: string) {
-  switch (status) {
-    case "pending":
-      return <Badge variant="secondary">pending</Badge>;
-    case "planning":
-      return <Badge variant="secondary">planning</Badge>;
-    case "active":
-      return <Badge>active</Badge>;
-    case "verifying":
-      return <Badge variant="outline" className="border-amber-500 text-amber-600 dark:text-amber-400">verifying</Badge>;
-    case "merging":
-      return <Badge variant="outline" className="border-amber-500 text-amber-600 dark:text-amber-400">merging</Badge>;
-    case "completed":
-      return <Badge variant="outline" className="border-green-500 text-green-600 dark:text-green-400">completed</Badge>;
-    case "failed":
-      return <Badge variant="destructive">failed</Badge>;
-    case "skipped":
-      return <Badge variant="outline">skipped</Badge>;
-    default:
-      return <Badge variant="secondary">{status}</Badge>;
-  }
-}
+// statusBadge imported from @/components/status-badge
 
 export interface SliceNodeData {
   title: string;
@@ -104,4 +87,9 @@ function SliceNode({ data }: NodeProps<SliceNodeType>) {
   );
 }
 
-export const sliceNodeTypes = { sliceNode: SliceNode };
+// Memoised — parent re-renders whenever React Flow recomputes nodes (drag,
+// zoom, selection). Node data is a stable object from React Flow's store, so
+// default shallow equality prevents unnecessary subtree re-renders.
+const MemoSliceNode = memo(SliceNode);
+
+export const sliceNodeTypes = { sliceNode: MemoSliceNode };

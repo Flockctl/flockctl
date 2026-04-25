@@ -10,10 +10,10 @@ import Database from "better-sqlite3";
 import {
   createMilestone, createSlice, createPlanTask,
   getMilestone, listSlices, listPlanTasks, updatePlanTask,
-} from "../../services/plan-store.js";
+} from "../../services/plan-store/index.js";
 
 // Mock task-executor so auto-executor doesn't actually spawn external agents
-vi.mock("../../services/task-executor", () => ({
+vi.mock("../../services/task-executor/index", () => ({
   taskExecutor: {
     execute: vi.fn(() => Promise.resolve()),
   },
@@ -25,7 +25,10 @@ import {
   getAutoExecutionStatus,
   reconcilePlanStatuses,
   resumeStaleMilestones,
+  cancelOrphanedExecutionTasks,
 } from "../../services/auto-executor.js";
+import { getPlanDir } from "../../services/plan-store/index.js";
+import { join as pjoin } from "path";
 
 let db: FlockctlDb;
 let sqlite: Database.Database;
@@ -180,5 +183,93 @@ describe("resumeStaleMilestones", () => {
   it("skips projects without a path", () => {
     db.insert(projects).values({ name: "no-path" }).run();
     expect(() => resumeStaleMilestones()).not.toThrow();
+  });
+});
+
+describe("cancelOrphanedExecutionTasks", () => {
+  it("cancels non-terminal exec tasks whose plan file points elsewhere", () => {
+    const projPath = mkdtempSync(join(tmpdir(), "ae-orphan-"));
+    const proj = db.insert(projects).values({ name: "p", path: projPath }).returning().get()!;
+    const m = createMilestone(projPath, { title: "M" });
+    const s = createSlice(projPath, m.slug, { title: "s" });
+    const pt = createPlanTask(projPath, m.slug, s.slug, { title: "t" });
+    const promptFile = pjoin(getPlanDir(projPath), m.slug, s.slug, `${pt.slug}.md`);
+
+    const orphan = db.insert(tasks).values({
+      projectId: proj.id, promptFile, status: "queued",
+    } as any).returning().get()!;
+    const live = db.insert(tasks).values({
+      projectId: proj.id, promptFile, status: "queued",
+    } as any).returning().get()!;
+
+    // Plan file points to the newer exec task → the older one is orphaned
+    updatePlanTask(projPath, m.slug, s.slug, pt.slug, { executionTaskId: live.id });
+
+    const cancelled = cancelOrphanedExecutionTasks();
+    expect(cancelled).toBe(1);
+
+    const orphanRow = db.select().from(tasks).where(eq(tasks.id, orphan.id)).get()!;
+    expect(orphanRow.status).toBe("cancelled");
+    expect(orphanRow.errorMessage).toMatch(/orphan/i);
+
+    const liveRow = db.select().from(tasks).where(eq(tasks.id, live.id)).get()!;
+    expect(liveRow.status).toBe("queued");
+
+    rmSync(projPath, { recursive: true, force: true });
+  });
+
+  it("leaves tasks whose promptFile is outside any plan dir alone", () => {
+    const projPath = mkdtempSync(join(tmpdir(), "ae-orphan-outside-"));
+    const proj = db.insert(projects).values({ name: "p", path: projPath }).returning().get()!;
+    createMilestone(projPath, { title: "M" });
+
+    // promptFile points outside the plan dir — must be ignored by the sweep
+    const t = db.insert(tasks).values({
+      projectId: proj.id,
+      promptFile: "/tmp/not-in-plan.md",
+      status: "queued",
+    } as any).returning().get()!;
+
+    expect(cancelOrphanedExecutionTasks()).toBe(0);
+    expect(db.select().from(tasks).where(eq(tasks.id, t.id)).get()!.status).toBe("queued");
+
+    rmSync(projPath, { recursive: true, force: true });
+  });
+
+  it("no-ops when there are no projects", () => {
+    expect(cancelOrphanedExecutionTasks()).toBe(0);
+  });
+});
+
+describe("executePlanTask — dedupe", () => {
+  it("reuses the existing non-terminal exec task instead of spawning a duplicate", async () => {
+    const projPath = mkdtempSync(join(tmpdir(), "ae-dedupe-"));
+    const proj = db.insert(projects).values({ name: "p", path: projPath }).returning().get()!;
+    const m = createMilestone(projPath, { title: "M", status: "active" });
+    const s = createSlice(projPath, m.slug, { title: "s" });
+    const pt = createPlanTask(projPath, m.slug, s.slug, { title: "t" });
+
+    // Pre-existing queued exec task from a previous auto-exec run
+    const promptFile = pjoin(getPlanDir(projPath), m.slug, s.slug, `${pt.slug}.md`);
+    const existing = db.insert(tasks).values({
+      projectId: proj.id, promptFile, status: "queued", label: `plan-task-${pt.slug}`,
+    } as any).returning().get()!;
+    updatePlanTask(projPath, m.slug, s.slug, pt.slug, { executionTaskId: existing.id });
+
+    const before = db.select().from(tasks).all().length;
+
+    // Simulate a re-trigger: auto-exec walks waves and hits this plan task.
+    // Since the mocked taskExecutor resolves immediately, startAutoExecution
+    // will finish without actually dispatching. Before fix: would insert a
+    // duplicate task. After fix: must reuse `existing`.
+    const p = startAutoExecution(proj.id, projPath, m.slug);
+    // Mark existing as done so the internal polling loop resolves.
+    db.update(tasks).set({ status: "done" }).where(eq(tasks.id, existing.id)).run();
+    await p;
+
+    const after = db.select().from(tasks).all().length;
+    expect(after).toBe(before);
+
+    rmSync(projPath, { recursive: true, force: true });
   });
 });

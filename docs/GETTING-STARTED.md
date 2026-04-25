@@ -53,6 +53,25 @@ curl http://127.0.0.1:52077/keys
 
 A project is a named bundle of configuration (model, agent, permission mode, …) attached to a filesystem path — typically a git repo.
 
+Either register the directory you're already in:
+
+```bash
+cd ~/code/hello-flockctl
+flockctl project add-cwd --name hello-flockctl --yes
+# → Created project #1: hello-flockctl
+#     path: /Users/me/code/hello-flockctl
+```
+
+…or register any path explicitly:
+
+```bash
+flockctl project add ~/code/hello-flockctl --name hello-flockctl --yes
+```
+
+If the directory already contains an `AGENTS.md`, `CLAUDE.md`, or `.mcp.json`, the CLI refuses to import it without an explicit decision — run `flockctl project scan <path>` first to see what it would do, then re-run with `--adopt-agents-md` / `--merge-claude-md` / `--import-mcp-json` (or `--yes` to accept all proposals).
+
+The equivalent raw HTTP call, if you prefer:
+
 ```bash
 curl -X POST http://127.0.0.1:52077/projects \
   -H 'Content-Type: application/json' \
@@ -67,7 +86,7 @@ curl -X POST http://127.0.0.1:52077/projects \
 # → {"id": 1, "name": "hello-flockctl", ...}
 ```
 
-Note the `id` — you'll pass it to the task in the next step.
+Note the `id` — you'll pass it to the task in the next step. Run `flockctl project list` any time to look it up again.
 
 Only `name` is strictly required. `path` defaults to a Flockctl-managed workspace directory if omitted; `model` / `baseBranch` / `permissionMode` are stored in the project's config and used as defaults for every task that doesn't override them.
 

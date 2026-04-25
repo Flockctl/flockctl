@@ -1,13 +1,25 @@
 import { test, expect } from "@playwright/test";
-import { createTemplate, uniq } from "./_helpers";
+import { uniq } from "./_helpers";
 
 test("schedules page lists a cron schedule created via API", async ({ page, request }) => {
   const tmplName = uniq("sched-tmpl");
-  const tmpl = await createTemplate(request, tmplName);
+  const tmplRes = await request.post("/templates", {
+    data: {
+      name: tmplName,
+      scope: "global",
+      prompt: "template prompt",
+      agent: "claude-code",
+      workingDir: "/tmp/template",
+    },
+  });
+  if (tmplRes.status() !== 201) {
+    throw new Error(`createTemplate failed: ${tmplRes.status()} ${await tmplRes.text()}`);
+  }
 
   const schedRes = await request.post("/schedules", {
     data: {
-      templateId: tmpl.id,
+      templateScope: "global",
+      templateName: tmplName,
       scheduleType: "cron",
       cronExpression: "0 */6 * * *",
       timezone: "UTC",

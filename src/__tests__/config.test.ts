@@ -40,7 +40,7 @@ import {
   updateRemoteServer,
   deleteRemoteServer,
   _resetRcCache,
-} from "../config.js";
+} from "../config/index.js";
 
 const mockExistsSync = existsSync as any;
 const mockReadFileSync = readFileSync as any;
@@ -133,12 +133,12 @@ describe("getRemoteServers", () => {
     mockReadFileSync.mockReturnValue(
       JSON.stringify({
         remoteServers: [
-          { id: "a", name: "Prod", url: "https://example.com", token: "t" },
+          { id: "a", name: "Prod", ssh: { host: "user@example.com" }, token: "t" },
         ],
       }),
     );
     expect(getRemoteServers()).toEqual([
-      { id: "a", name: "Prod", url: "https://example.com", token: "t" },
+      { id: "a", name: "Prod", ssh: { host: "user@example.com" }, token: "t" },
     ]);
   });
 
@@ -146,9 +146,11 @@ describe("getRemoteServers", () => {
     mockReadFileSync.mockReturnValue(
       JSON.stringify({
         remoteServers: [
-          { id: "a", name: "ok", url: "https://ok.example" },
+          { id: "a", name: "ok", ssh: { host: "user@ok.example" } },
           "garbage",
-          { name: "no-id", url: "https://x" },
+          { name: "no-id", ssh: { host: "x" } },           // missing id
+          { id: "b", name: "no-ssh" },                     // missing ssh block
+          { id: "c", name: "empty-host", ssh: { host: "" } }, // empty host
         ],
       }),
     );
@@ -445,7 +447,7 @@ describe("saveRemoteServers", () => {
   it("writes the file and enforces chmod 600", () => {
     mockReadFileSync.mockReturnValue("{}");
     saveRemoteServers([
-      { id: "x", name: "X", url: "https://x.example" },
+      { id: "x", name: "X", ssh: { host: "user@x.example" } },
     ]);
     expect(mockWriteFileSync).toHaveBeenCalledOnce();
     expect(mockChmodSync).toHaveBeenCalledWith(
@@ -460,7 +462,7 @@ describe("saveRemoteServers", () => {
     mockReadFileSync.mockReturnValue("{}");
     mockChmodSync.mockImplementationOnce(() => { throw new Error("EPERM"); });
     expect(() => saveRemoteServers([
-      { id: "y", name: "Y", url: "https://y.example" },
+      { id: "y", name: "Y", ssh: { host: "user@y.example" } },
     ])).not.toThrow();
   });
 });
@@ -486,19 +488,19 @@ describe("getCorsAllowedOrigins", () => {
 
   it("returns null when not configured", async () => {
     mockReadFileSync.mockReturnValue("{}");
-    const { getCorsAllowedOrigins } = await import("../config.js");
+    const { getCorsAllowedOrigins } = await import("../config/index.js");
     expect(getCorsAllowedOrigins()).toBeNull();
   });
 
   it("returns the array when configured with strings", async () => {
     mockReadFileSync.mockReturnValue(JSON.stringify({ corsOrigins: ["https://a.com", "https://b.com"] }));
-    const { getCorsAllowedOrigins } = await import("../config.js");
+    const { getCorsAllowedOrigins } = await import("../config/index.js");
     expect(getCorsAllowedOrigins()).toEqual(["https://a.com", "https://b.com"]);
   });
 
   it("returns null when the array contains non-strings", async () => {
     mockReadFileSync.mockReturnValue(JSON.stringify({ corsOrigins: ["ok", 42] }));
-    const { getCorsAllowedOrigins } = await import("../config.js");
+    const { getCorsAllowedOrigins } = await import("../config/index.js");
     expect(getCorsAllowedOrigins()).toBeNull();
   });
 });
@@ -511,25 +513,27 @@ describe("addRemoteServer / updateRemoteServer / deleteRemoteServer", () => {
     _resetRcCache();
   });
 
-  it("addRemoteServer trims trailing slash and writes new entry", () => {
+  it("addRemoteServer writes new SSH entry", () => {
     mockReadFileSync.mockReturnValue("{}");
-    const added = addRemoteServer({ name: "P", url: "https://p.com/", token: "t" });
-    expect(added.url).toBe("https://p.com");
-    expect(added.token).toBe("t");
+    const added = addRemoteServer({ name: "P", ssh: { host: "user@p.com" } });
+    expect(added.ssh.host).toBe("user@p.com");
     expect(added.id).toBeTruthy();
     const written = JSON.parse(mockWriteFileSync.mock.calls[0][1] as string);
     expect(written.remoteServers).toHaveLength(1);
   });
 
-  it("addRemoteServer with falsy token stores undefined", () => {
+  it("addRemoteServer persists optional ssh fields", () => {
     mockReadFileSync.mockReturnValue("{}");
-    const added = addRemoteServer({ name: "N", url: "https://n.com", token: "" });
-    expect(added.token).toBeUndefined();
+    const added = addRemoteServer({
+      name: "N",
+      ssh: { host: "n.com", user: "root", port: 2222, identityFile: "/k", remotePort: 52078 },
+    });
+    expect(added.ssh).toEqual({ host: "n.com", user: "root", port: 2222, identityFile: "/k", remotePort: 52078 });
   });
 
   it("updateRemoteServer returns null when id not found", () => {
     mockReadFileSync.mockReturnValue(
-      JSON.stringify({ remoteServers: [{ id: "existing", name: "n", url: "https://x.com" }] }),
+      JSON.stringify({ remoteServers: [{ id: "existing", name: "n", ssh: { host: "x" } }] }),
     );
     expect(updateRemoteServer("missing", { name: "x" })).toBeNull();
   });
@@ -537,18 +541,22 @@ describe("addRemoteServer / updateRemoteServer / deleteRemoteServer", () => {
   it("updateRemoteServer applies partial updates", () => {
     mockReadFileSync.mockReturnValue(
       JSON.stringify({
-        remoteServers: [{ id: "s1", name: "old", url: "https://old.com", token: "keep" }],
+        remoteServers: [
+          { id: "s1", name: "old", ssh: { host: "old.com", port: 22 }, token: "keep" },
+        ],
       }),
     );
-    const updated = updateRemoteServer("s1", { name: "new", url: "https://new.com/" });
+    const updated = updateRemoteServer("s1", { name: "new", ssh: { host: "new.com" } });
     expect(updated?.name).toBe("new");
-    expect(updated?.url).toBe("https://new.com");
+    expect(updated?.ssh.host).toBe("new.com");
+    // partial ssh merge preserves untouched fields
+    expect(updated?.ssh.port).toBe(22);
     expect(updated?.token).toBe("keep");
   });
 
   it("updateRemoteServer clears token when explicitly null", () => {
     mockReadFileSync.mockReturnValue(
-      JSON.stringify({ remoteServers: [{ id: "s1", name: "n", url: "https://x.com", token: "t" }] }),
+      JSON.stringify({ remoteServers: [{ id: "s1", name: "n", ssh: { host: "x" }, token: "t" }] }),
     );
     const updated = updateRemoteServer("s1", { token: null });
     expect(updated?.token).toBeUndefined();
@@ -556,7 +564,7 @@ describe("addRemoteServer / updateRemoteServer / deleteRemoteServer", () => {
 
   it("updateRemoteServer with empty-string token treats as undefined", () => {
     mockReadFileSync.mockReturnValue(
-      JSON.stringify({ remoteServers: [{ id: "s1", name: "n", url: "https://x.com", token: "t" }] }),
+      JSON.stringify({ remoteServers: [{ id: "s1", name: "n", ssh: { host: "x" }, token: "t" }] }),
     );
     const updated = updateRemoteServer("s1", { token: "" });
     expect(updated?.token).toBeUndefined();
@@ -564,7 +572,7 @@ describe("addRemoteServer / updateRemoteServer / deleteRemoteServer", () => {
 
   it("deleteRemoteServer removes matching id and returns true", () => {
     mockReadFileSync.mockReturnValue(
-      JSON.stringify({ remoteServers: [{ id: "s1", name: "x", url: "https://x.com" }] }),
+      JSON.stringify({ remoteServers: [{ id: "s1", name: "x", ssh: { host: "x.com" } }] }),
     );
     expect(deleteRemoteServer("s1")).toBe(true);
   });
@@ -606,19 +614,19 @@ describe("getDefaultKeyId / setGlobalDefaults", () => {
 
   it("returns null when defaultKeyId is unset", async () => {
     mockReadFileSync.mockReturnValue("{}");
-    const { getDefaultKeyId } = await import("../config.js");
+    const { getDefaultKeyId } = await import("../config/index.js");
     expect(getDefaultKeyId()).toBeNull();
   });
 
   it("returns the integer when configured", async () => {
     mockReadFileSync.mockReturnValue(JSON.stringify({ defaultKeyId: 7 }));
-    const { getDefaultKeyId } = await import("../config.js");
+    const { getDefaultKeyId } = await import("../config/index.js");
     expect(getDefaultKeyId()).toBe(7);
   });
 
   it("returns null for non-positive or non-integer values", async () => {
     mockReadFileSync.mockReturnValue(JSON.stringify({ defaultKeyId: -1 }));
-    const { getDefaultKeyId } = await import("../config.js");
+    const { getDefaultKeyId } = await import("../config/index.js");
     expect(getDefaultKeyId()).toBeNull();
     _resetRcCache();
     mockReadFileSync.mockReturnValue(JSON.stringify({ defaultKeyId: "abc" }));
@@ -630,7 +638,7 @@ describe("getDefaultKeyId / setGlobalDefaults", () => {
 
   it("setGlobalDefaults persists model and keyId, clears with null", async () => {
     mockReadFileSync.mockReturnValue("{}");
-    const { setGlobalDefaults } = await import("../config.js");
+    const { setGlobalDefaults } = await import("../config/index.js");
 
     setGlobalDefaults({ defaultModel: "claude-opus-4-7", defaultKeyId: 9 });
     let written = JSON.parse(mockWriteFileSync.mock.calls.at(-1)![1] as string);
@@ -647,7 +655,7 @@ describe("getDefaultKeyId / setGlobalDefaults", () => {
 
   it("setGlobalDefaults preserves other rc fields", async () => {
     mockReadFileSync.mockReturnValue(JSON.stringify({ home: "/custom", planningModel: "claude-opus-4-7" }));
-    const { setGlobalDefaults } = await import("../config.js");
+    const { setGlobalDefaults } = await import("../config/index.js");
 
     setGlobalDefaults({ defaultKeyId: 3 });
     const written = JSON.parse(mockWriteFileSync.mock.calls.at(-1)![1] as string);
@@ -662,7 +670,7 @@ describe("seedBundledSkills", () => {
     // Our fs mock's existsSync default returns falsy
     const fs = await import("fs") as any;
     fs.existsSync.mockReturnValue(false);
-    const { seedBundledSkills } = await import("../config.js");
+    const { seedBundledSkills } = await import("../config/index.js");
     expect(() => seedBundledSkills()).not.toThrow();
   });
 
@@ -684,7 +692,7 @@ describe("seedBundledSkills", () => {
       { name: "README.md", isDirectory: () => false },
     ]);
 
-    const { seedBundledSkills } = await import("../config.js");
+    const { seedBundledSkills } = await import("../config/index.js");
     seedBundledSkills();
 
     expect(fs.mkdirSync).toHaveBeenCalled();

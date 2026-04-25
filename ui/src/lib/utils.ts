@@ -9,9 +9,9 @@ export function slugify(name: string): string {
   return name
     .trim()
     .replace(/\s+/g, "_")
-    .replace(/[^\w\-\.]/g, "")
+    .replace(/[^\w.-]/g, "")
     .replace(/_+/g, "_")
-    .replace(/^[_\-]+|[_\-]+$/g, "")
+    .replace(/^[_-]+|[_-]+$/g, "")
     || "unnamed";
 }
 

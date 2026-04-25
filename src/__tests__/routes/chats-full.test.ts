@@ -8,20 +8,36 @@ import { join } from "path";
 import { tmpdir } from "os";
 import Database from "better-sqlite3";
 
-const { agentCalls, chatExecutorMock } = vi.hoisted(() => ({
+const { agentCalls, chatExecutorMock, runOverride } = vi.hoisted(() => ({
   agentCalls: [] as any[],
+  // Per-test hook to swap `MockAgentSession.run()` — set by tests that need to
+  // simulate an interrupted run (e.g. daemon shutdown mid-turn). When null,
+  // the default happy-path run() is used.
+  runOverride: { fn: null as null | ((emit: (ev: string, ...args: any[]) => void) => Promise<void>) },
   chatExecutorMock: {
     register: vi.fn(),
     unregister: vi.fn(),
+    // `claim`/`release` were added to close the torn-state race on `GET
+    // /chats/:id` between the user-message insert and `register`. The route
+    // calls `claim` on every user-message POST, so the mock needs a stub or
+    // dispatch throws with `claim is not a function`.
+    claim: vi.fn(),
+    release: vi.fn(),
     isRunning: vi.fn(),
     cancel: vi.fn(),
     resolvePermission: vi.fn(),
     pendingPermissionCounts: vi.fn(() => ({})),
     runningChatIds: vi.fn<() => number[]>(() => []),
+    pendingPermissions: vi.fn<(chatId: number) => any[]>(() => []),
+    // Called by the message endpoints after every successful turn to flip
+    // chats with `requires_approval=true` into the pending-approval state.
+    // The real method no-ops on non-approval chats, so a plain stub is fine
+    // for the tests that only exercise the regular-message path.
+    markPendingApprovalIfRequired: vi.fn(),
   },
 }));
 
-vi.mock("../../services/agent-session", async () => {
+vi.mock("../../services/agent-session/index", async () => {
   const { EventEmitter } = await import("events");
   class MockAgentSession extends EventEmitter {
     opts: any;
@@ -31,6 +47,10 @@ vi.mock("../../services/agent-session", async () => {
       agentCalls.push(this);
     }
     async run() {
+      if (runOverride.fn) {
+        await runOverride.fn((ev: string, ...args: any[]) => { this.emit(ev, ...args); });
+        return;
+      }
       this.emit("text", "Hi ");
       this.emit("text", "there");
       this.emit("session_id", "sess-new");
@@ -56,10 +76,10 @@ vi.mock("../../services/agents/registry", () => ({
   }),
 }));
 
-vi.mock("../../services/claude-skills-sync", () => ({
+vi.mock("../../services/claude/skills-sync", () => ({
   reconcileClaudeSkillsForProject: vi.fn(),
 }));
-vi.mock("../../services/claude-mcp-sync", () => ({
+vi.mock("../../services/claude/mcp-sync", () => ({
   reconcileMcpForProject: vi.fn(),
 }));
 
@@ -99,6 +119,8 @@ beforeEach(() => {
   chatExecutorMock.resolvePermission.mockReset();
   chatExecutorMock.pendingPermissionCounts.mockReturnValue({});
   chatExecutorMock.runningChatIds.mockReturnValue([]);
+  chatExecutorMock.pendingPermissions.mockReturnValue([]);
+  chatExecutorMock.markPendingApprovalIfRequired.mockReset();
 });
 
 describe("chats — POST /:id/messages (non-stream)", () => {
@@ -176,8 +198,40 @@ describe("chats — POST /:id/messages (non-stream)", () => {
     expect(records[0].totalCostUsd).toBeGreaterThan(0);
   });
 
+  it("persists claudeSessionId eagerly on session_id event even when run() aborts mid-turn", async () => {
+    // Regression guard for the "context lost after make reinstall" bug.
+    //
+    // When the daemon was restarted mid-turn (graceful shutdown triggers
+    // `session.abort`), the SDK stream used to abort BEFORE emitting the
+    // terminal `result` message — which is where the pre-fix client.ts
+    // captured `session_id`. As a result, `chats.claudeSessionId` was never
+    // written, and the next user message started a FRESH SDK session with no
+    // prior context. The fix eagerly emits `session_id` from the first SDK
+    // message that carries one and persists it to the DB from the event
+    // handler, so the id survives a mid-turn abort. This test simulates that
+    // exact sequence: emit session_id, then throw, and assert the id landed
+    // in the chat row anyway.
+    runOverride.fn = async (emit) => {
+      emit("session_id", "sess-abort");
+      throw new Error("aborted mid-turn");
+    };
+    try {
+      const chat = db.insert(chats).values({}).returning().get()!;
+      const res = await app.request(`/chats/${chat.id}/messages`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "will be interrupted" }),
+      });
+      expect(res.status).toBe(201);
+      const updated = db.select().from(chats).where(eq(chats.id, chat.id)).get()!;
+      expect(updated.claudeSessionId).toBe("sess-abort");
+    } finally {
+      runOverride.fn = null;
+    }
+  });
+
   it("tolerates reconcile errors during message send", async () => {
-    const { reconcileClaudeSkillsForProject } = await import("../../services/claude-skills-sync.js");
+    const { reconcileClaudeSkillsForProject } = await import("../../services/claude/skills-sync.js");
     (reconcileClaudeSkillsForProject as any).mockImplementationOnce(() => { throw new Error("sync fail"); });
 
     const projPath = mkdtempSync(join(tempDir, "proj-sync-fail-"));
@@ -193,7 +247,7 @@ describe("chats — POST /:id/messages (non-stream)", () => {
   });
 
   it("falls back to global defaultKeyId when body omits keyId", async () => {
-    const config = await import("../../config.js");
+    const config = await import("../../config/index.js");
     const key = db.insert(aiProviderKeys).values({
       provider: "anthropic", providerType: "anthropic-messages",
       label: "default", keyValue: "sk-d", isActive: 1, priority: 0,
@@ -216,7 +270,7 @@ describe("chats — POST /:id/messages (non-stream)", () => {
   });
 
   it("ignores defaultKeyId when the key is inactive", async () => {
-    const config = await import("../../config.js");
+    const config = await import("../../config/index.js");
     const key = db.insert(aiProviderKeys).values({
       provider: "anthropic", providerType: "anthropic-messages",
       label: "disabled", keyValue: "sk-d", isActive: 0, priority: 0,
@@ -239,7 +293,7 @@ describe("chats — POST /:id/messages (non-stream)", () => {
   });
 
   it("body keyId still wins over defaultKeyId fallback", async () => {
-    const config = await import("../../config.js");
+    const config = await import("../../config/index.js");
     const explicit = db.insert(aiProviderKeys).values({
       provider: "anthropic", providerType: "anthropic-messages",
       label: "explicit", keyValue: "sk-e", isActive: 1, priority: 0,
@@ -461,7 +515,7 @@ describe("chats — stream entity_context variants", () => {
 
 describe("chats — stream tolerates reconcile errors", () => {
   it("continues after reconcile fail in stream path", async () => {
-    const { reconcileClaudeSkillsForProject } = await import("../../services/claude-skills-sync.js");
+    const { reconcileClaudeSkillsForProject } = await import("../../services/claude/skills-sync.js");
     (reconcileClaudeSkillsForProject as any).mockImplementationOnce(() => { throw new Error("stream-sync-fail"); });
 
     const projPath = mkdtempSync(join(tempDir, "proj-streamfail-"));
@@ -496,9 +550,181 @@ describe("chats — stream preserves existing title", () => {
   });
 });
 
+describe("chats — stream persists per-turn assistant rows at tool boundaries", () => {
+  it("flushes pendingText as its own row at each tool_call, leaving only post-last-tool text in the final row", async () => {
+    // Override the shared mock to emit an interleaved text / tool_call
+    // sequence. Without per-turn flushing, all three text bursts merge
+    // into one giant final assistant row (the "wall of text on reload"
+    // the Claude Code UI explicitly avoids).
+    const mod = await import("../../services/agent-session/index.js");
+    const orig = (mod as any).AgentSession.prototype.run;
+    (mod as any).AgentSession.prototype.run = async function () {
+      this.emit("text", "turn-1 prose");
+      this.emit("tool_call", "Grep", { pattern: "foo" });
+      this.emit("text", "turn-2 prose");
+      this.emit("tool_call", "Read", { path: "x" });
+      this.emit("text", "final prose");
+      this.emit("usage", {
+        inputTokens: 10, outputTokens: 5,
+        cacheCreationInputTokens: 0, cacheReadInputTokens: 0, totalCostUsd: 0,
+      });
+    };
+
+    const projPath = mkdtempSync(join(tempDir, "proj-perturn-"));
+    const proj = db.insert(projects).values({ name: "per-turn", path: projPath }).returning().get()!;
+    const chat = db.insert(chats).values({ projectId: proj.id }).returning().get()!;
+
+    try {
+      const res = await app.request(`/chats/${chat.id}/messages/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "do the thing" }),
+      });
+      expect(res.status).toBe(200);
+      await res.text();
+
+      const rows = db
+        .select()
+        .from(chatMessages)
+        .where(eq(chatMessages.chatId, chat.id))
+        .all();
+
+      const assistantContents = rows
+        .filter((r) => r.role === "assistant")
+        .map((r) => r.content);
+
+      // Three assistant rows: one flushed at each tool_call boundary,
+      // plus the final post-last-tool text. Never one merged blob.
+      expect(assistantContents).toEqual([
+        "turn-1 prose",
+        "turn-2 prose",
+        "final prose",
+      ]);
+    } finally {
+      (mod as any).AgentSession.prototype.run = orig;
+    }
+  });
+
+  it("splits each assistant SDK message into its own row via turn_end (text-only turns do not merge)", async () => {
+    // Scenario Claude Code handles natively: two consecutive assistant
+    // messages, neither of which calls a tool. Without the `turn_end`
+    // boundary, both bursts would accumulate into `pendingText` and land
+    // in ONE merged final row — exactly the "wall of text" regression we
+    // added this event to prevent.
+    const mod = await import("../../services/agent-session/index.js");
+    const orig = (mod as any).AgentSession.prototype.run;
+    (mod as any).AgentSession.prototype.run = async function () {
+      this.emit("text", "first-turn answer");
+      this.emit("turn_end");
+      this.emit("text", "second-turn follow-up");
+      this.emit("turn_end");
+      this.emit("usage", {
+        inputTokens: 3, outputTokens: 2,
+        cacheCreationInputTokens: 0, cacheReadInputTokens: 0, totalCostUsd: 0,
+      });
+    };
+
+    const projPath = mkdtempSync(join(tempDir, "proj-turnend-"));
+    const proj = db.insert(projects).values({ name: "turn-end", path: projPath }).returning().get()!;
+    const chat = db.insert(chats).values({ projectId: proj.id }).returning().get()!;
+
+    try {
+      const res = await app.request(`/chats/${chat.id}/messages/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "two-part question" }),
+      });
+      expect(res.status).toBe(200);
+      await res.text();
+
+      const rows = db
+        .select()
+        .from(chatMessages)
+        .where(eq(chatMessages.chatId, chat.id))
+        .all();
+
+      const assistantContents = rows
+        .filter((r) => r.role === "assistant")
+        .map((r) => r.content);
+
+      // Each turn lands in its own row — no empty trailing placeholder,
+      // no merged blob. Matches Claude Code's one-bubble-per-message UI.
+      expect(assistantContents).toEqual([
+        "first-turn answer",
+        "second-turn follow-up",
+      ]);
+    } finally {
+      (mod as any).AgentSession.prototype.run = orig;
+    }
+  });
+});
+
+describe("chats — SSE mirrors tool_call / tool_result events inline", () => {
+  it("emits tool_call and tool_result SSE frames with summary payloads in the order they fire", async () => {
+    // Without this the client has no way to render tool boundaries in the
+    // live transcript — Copilot chats regress to one post-hoc blob.
+    const mod = await import("../../services/agent-session/index.js");
+    const orig = (mod as any).AgentSession.prototype.run;
+    (mod as any).AgentSession.prototype.run = async function () {
+      this.emit("text", "thinking about it");
+      this.emit("tool_call", "Grep", { pattern: "foo" });
+      this.emit("tool_result", "Grep", "match-1\nmatch-2");
+      this.emit("text", "done searching");
+      this.emit("usage", {
+        inputTokens: 5, outputTokens: 3,
+        cacheCreationInputTokens: 0, cacheReadInputTokens: 0, totalCostUsd: 0,
+      });
+    };
+
+    const projPath = mkdtempSync(join(tempDir, "proj-toolsse-"));
+    const proj = db.insert(projects).values({ name: "tool-sse", path: projPath }).returning().get()!;
+    const chat = db.insert(chats).values({ projectId: proj.id }).returning().get()!;
+
+    try {
+      const res = await app.request(`/chats/${chat.id}/messages/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "find things" }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.text();
+
+      const dataFrames = body
+        .split("\n")
+        .filter((l) => l.startsWith("data: "))
+        .map((l) => {
+          try {
+            return JSON.parse(l.slice(6));
+          } catch {
+            return null;
+          }
+        })
+        .filter((v): v is Record<string, unknown> => !!v);
+
+      const callIdx = dataFrames.findIndex((f) => "tool_call" in f);
+      const resultIdx = dataFrames.findIndex((f) => "tool_result" in f);
+
+      expect(callIdx).toBeGreaterThan(-1);
+      expect(resultIdx).toBeGreaterThan(callIdx);
+
+      const callFrame = dataFrames[callIdx] as { tool_call: { name: string; input: unknown; summary: string } };
+      expect(callFrame.tool_call.name).toBe("Grep");
+      expect(callFrame.tool_call.input).toEqual({ pattern: "foo" });
+      expect(typeof callFrame.tool_call.summary).toBe("string");
+
+      const resultFrame = dataFrames[resultIdx] as { tool_result: { name: string; output: string; summary: string } };
+      expect(resultFrame.tool_result.name).toBe("Grep");
+      expect(resultFrame.tool_result.output).toContain("match-1");
+      expect(typeof resultFrame.tool_result.summary).toBe("string");
+    } finally {
+      (mod as any).AgentSession.prototype.run = orig;
+    }
+  });
+});
+
 describe("chats — stream run() error surfaces as SSE error event", () => {
   it("emits error chunk when session.run rejects", async () => {
-    const mod = await import("../../services/agent-session.js");
+    const mod = await import("../../services/agent-session/index.js");
     const orig = (mod as any).AgentSession.prototype.run;
     (mod as any).AgentSession.prototype.run = async function () {
       this.emit("error", new Error("boom from run"));
@@ -522,6 +748,48 @@ describe("chats — stream run() error surfaces as SSE error event", () => {
       (mod as any).AgentSession.prototype.run = orig;
     }
   });
+
+  // Silent-empty-response guard: when the SDK completes without emitting a
+  // single text/thinking/tool_call/tool_result event AND without reporting an
+  // error, the stream route used to write just `{done: true}` — which the UI
+  // rendered as the ambiguous "Response was not received" fallback with no
+  // explanation. The route now synthesises an explicit error SSE frame so
+  // the cause is visible and the retry CTA makes sense.
+  it("synthesises an error SSE frame when the session finishes with zero events and no error", async () => {
+    const mod = await import("../../services/agent-session/index.js");
+    const orig = (mod as any).AgentSession.prototype.run;
+    (mod as any).AgentSession.prototype.run = async function () {
+      // Only usage + session_id — no text, no thinking, no tool calls.
+      // These are NOT counted as "meaningful events" because the UI can't
+      // render anything from them alone.
+      this.emit("usage", {
+        inputTokens: 1, outputTokens: 0,
+        cacheCreationInputTokens: 0, cacheReadInputTokens: 0, totalCostUsd: 0,
+      });
+      this.emit("session_id", "sess-empty");
+    };
+
+    const projPath = mkdtempSync(join(tempDir, "proj-empty-"));
+    const proj = db.insert(projects).values({ name: "empty-p", path: projPath }).returning().get()!;
+    const chat = db.insert(chats).values({ projectId: proj.id }).returning().get()!;
+
+    try {
+      const res = await app.request(`/chats/${chat.id}/messages/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "msg" }),
+      });
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      // Must contain an explicit error frame referencing empty response.
+      expect(text).toMatch(/"error":".*empty response/);
+      // And still close with done:true so the client exits the read loop
+      // cleanly instead of hanging.
+      expect(text).toContain('"done":true');
+    } finally {
+      (mod as any).AgentSession.prototype.run = orig;
+    }
+  });
 });
 
 describe("chats — GET /pending-permissions", () => {
@@ -534,5 +802,52 @@ describe("chats — GET /pending-permissions", () => {
     const body = await res.json();
     expect(body.pending).toEqual({ "10": 2, "11": 1 });
     expect(body.running).toEqual(["10", "11", "12"]);
+  });
+});
+
+describe("chats — GET /:id/pending-permissions", () => {
+  it("404 when chat does not exist", async () => {
+    const res = await app.request("/chats/999999/pending-permissions");
+    expect(res.status).toBe(404);
+  });
+
+  it("returns empty items when no session is running", async () => {
+    const chat = db.insert(chats).values({}).returning().get()!;
+    chatExecutorMock.pendingPermissions.mockReturnValue([]);
+
+    const res = await app.request(`/chats/${chat.id}/pending-permissions`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.items).toEqual([]);
+  });
+
+  it("returns shaped items from the session", async () => {
+    const chat = db.insert(chats).values({}).returning().get()!;
+    chatExecutorMock.pendingPermissions.mockReturnValue([
+      {
+        requestId: "perm-c1-1",
+        toolName: "Bash",
+        toolInput: { command: "ls" },
+        title: "Bash",
+        displayName: "Bash",
+        description: "list files",
+        decisionReason: "tool requires approval",
+        toolUseID: "tu-1",
+      },
+    ]);
+
+    const res = await app.request(`/chats/${chat.id}/pending-permissions`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.items).toEqual([{
+      request_id: "perm-c1-1",
+      tool_name: "Bash",
+      tool_input: { command: "ls" },
+      title: "Bash",
+      display_name: "Bash",
+      description: "list files",
+      decision_reason: "tool requires approval",
+      tool_use_id: "tu-1",
+    }]);
   });
 });

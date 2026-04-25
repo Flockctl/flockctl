@@ -1,14 +1,20 @@
-import { startFlockctl, assert } from "./_harness.js";
+import { startFlockctl, assert, seedActiveKey } from "./_harness.js";
 import { join } from "node:path";
 
 const srv = await startFlockctl();
 try {
+  const keyId = await seedActiveKey(srv);
+
   // Create project with explicit path inside FLOCKCTL_HOME (isolated tmpdir)
   const projectPath = join(srv.home, "demo-proj");
   const create = await fetch(`${srv.baseUrl}/projects`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name: "Demo Project", path: projectPath }),
+    body: JSON.stringify({
+      name: "Demo Project",
+      path: projectPath,
+      allowedKeyIds: [keyId],
+    }),
   });
   assert(create.status === 201, `POST /projects should return 201, got ${create.status}`);
   const project = (await create.json()) as { id: number; name: string; path: string };

@@ -10,9 +10,9 @@ import Database from "better-sqlite3";
 import {
   createMilestone, createSlice, createPlanTask,
   listPlanTasks, listSlices, getMilestone, updatePlanTask,
-} from "../../services/plan-store.js";
+} from "../../services/plan-store/index.js";
 
-vi.mock("../../services/task-executor", () => ({
+vi.mock("../../services/task-executor/index", () => ({
   taskExecutor: { execute: vi.fn() },
 }));
 
@@ -20,7 +20,7 @@ vi.mock("../../services/ws-manager", () => ({
   wsManager: { broadcastAll: vi.fn() },
 }));
 
-import { taskExecutor } from "../../services/task-executor.js";
+import { taskExecutor } from "../../services/task-executor/index.js";
 import {
   repointPlanTask,
   syncPlanFromExecutionTask,

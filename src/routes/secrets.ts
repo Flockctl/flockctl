@@ -3,6 +3,7 @@ import { getDb } from "../db/index.js";
 import { workspaces, projects } from "../db/schema.js";
 import { eq } from "drizzle-orm";
 import { NotFoundError, ValidationError } from "../lib/errors.js";
+import { parseIdParam } from "../lib/route-params.js";
 import {
   listSecrets,
   upsertSecret,
@@ -14,7 +15,7 @@ import {
   reconcileMcpForProject,
   reconcileAllMcpInWorkspace,
   reconcileAllMcp,
-} from "../services/claude-mcp-sync.js";
+} from "../services/claude/mcp-sync.js";
 
 export const secretRoutes = new Hono();
 
@@ -65,13 +66,13 @@ secretRoutes.delete("/global/:name", (c) => {
 // ─── Workspace ───
 
 secretRoutes.get("/workspaces/:id", (c) => {
-  const id = parseInt(c.req.param("id"));
+  const id = parseIdParam(c);
   requireWorkspace(id);
   return c.json({ secrets: listSecrets("workspace", id) });
 });
 
 secretRoutes.post("/workspaces/:id", async (c) => {
-  const id = parseInt(c.req.param("id"));
+  const id = parseIdParam(c);
   requireWorkspace(id);
   const body = await c.req.json();
   const parsed = parseBody(body);
@@ -87,7 +88,7 @@ secretRoutes.post("/workspaces/:id", async (c) => {
 });
 
 secretRoutes.delete("/workspaces/:id/:name", (c) => {
-  const id = parseInt(c.req.param("id"));
+  const id = parseIdParam(c);
   requireWorkspace(id);
   const name = c.req.param("name");
   const deleted = deleteSecret("workspace", id, name);
@@ -99,13 +100,13 @@ secretRoutes.delete("/workspaces/:id/:name", (c) => {
 // ─── Project ───
 
 secretRoutes.get("/projects/:pid", (c) => {
-  const pid = parseInt(c.req.param("pid"));
+  const pid = parseIdParam(c, "pid");
   requireProject(pid);
   return c.json({ secrets: listSecrets("project", pid) });
 });
 
 secretRoutes.post("/projects/:pid", async (c) => {
-  const pid = parseInt(c.req.param("pid"));
+  const pid = parseIdParam(c, "pid");
   requireProject(pid);
   const body = await c.req.json();
   const parsed = parseBody(body);
@@ -121,7 +122,7 @@ secretRoutes.post("/projects/:pid", async (c) => {
 });
 
 secretRoutes.delete("/projects/:pid/:name", (c) => {
-  const pid = parseInt(c.req.param("pid"));
+  const pid = parseIdParam(c, "pid");
   requireProject(pid);
   const name = c.req.param("name");
   const deleted = deleteSecret("project", pid, name);

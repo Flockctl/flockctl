@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { useProjects, useCreateProject, useDeleteProject, useWorkspaces } from "@/lib/hooks";
+import { useProjects, useCreateProject, useDeleteProject, useWorkspaces, useAttention, useAIKeys } from "@/lib/hooks";
 import { scanProjectPath } from "@/lib/api";
 import type { ImportAction, ProjectCreate, ProjectScan } from "@/lib/types";
 import { slugify } from "@/lib/utils";
@@ -12,6 +12,7 @@ import {
   TableHead,
   TableCell,
 } from "@/components/ui/table";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -34,6 +35,19 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { ConfirmDialog, useConfirmDialog } from "@/components/confirm-dialog";
+import { DirectoryPicker } from "@/components/DirectoryPicker";
+import { Checkbox } from "@/components/ui/checkbox";
+import {
+  GitignoreToggles,
+  DEFAULT_GITIGNORE_TOGGLES,
+  type GitignoreTogglesValue,
+} from "@/components/gitignore-toggles";
+import { FolderOpen } from "lucide-react";
+
+// localStorage key that remembers the last directory the user picked via the
+// DirectoryPicker, used as the next session's initialPath so re-opening the
+// picker lands back where the user left off instead of $HOME.
+const LAST_PICKED_PATH_KEY = "flockctl.lastPickedPath";
 
 function timeAgo(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime();
@@ -217,8 +231,26 @@ function CreateProjectDialog() {
   const [scan, setScan] = useState<ProjectScan | null>(null);
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState("");
+  // Directory picker is an augmentation of the path input, not a replacement:
+  // the input still accepts paste / manual edits (the only option in remote
+  // mode, where /fs/browse is loopback-gated). The picker just opens modally
+  // and writes its result back into the same `path` state.
+  const [pickerOpen, setPickerOpen] = useState(false);
+  // Snapshotted at picker-open time so that re-renders (e.g. user typing in
+  // the Name field) don't re-seed the picker's internal state mid-session.
+  const [pickerInitialPath, setPickerInitialPath] = useState<string | undefined>(undefined);
+  // Allowed AI keys — required at create-time (see src/routes/_allowed-keys.ts).
+  // Starts empty so the user must explicitly opt keys in: creating a project
+  // that can talk to *every* key by default is how credentials leak into the
+  // wrong project. Create is disabled until at least one is ticked.
+  const [allowedKeyIds, setAllowedKeyIds] = useState<number[]>([]);
+  const [gitignoreToggles, setGitignoreToggles] = useState<GitignoreTogglesValue>(
+    DEFAULT_GITIGNORE_TOGGLES,
+  );
   const createProject = useCreateProject();
   const { data: workspacesList } = useWorkspaces({});
+  const { data: aiKeys } = useAIKeys();
+  const activeKeys = (aiKeys ?? []).filter((k) => k.is_active);
 
   function resetForm() {
     setName("");
@@ -232,6 +264,36 @@ function CreateProjectDialog() {
     setScan(null);
     setScanning(false);
     setScanError("");
+    setPickerOpen(false);
+    setAllowedKeyIds([]);
+    setGitignoreToggles(DEFAULT_GITIGNORE_TOGGLES);
+  }
+
+  // Resolve the picker's starting directory: prefer whatever the user has
+  // typed (so pasting a partial path and hitting Browse lands nearby), then
+  // the last-picked path from localStorage, then $HOME (undefined lets the
+  // server default). Computed lazily so SSR / first-paint don't touch
+  // localStorage.
+  function resolvePickerInitialPath(): string | undefined {
+    const typed = path.trim();
+    if (typed) return typed;
+    try {
+      const stored = window.localStorage.getItem(LAST_PICKED_PATH_KEY);
+      return stored && stored.trim() ? stored : undefined;
+    } catch {
+      // localStorage can throw in private-mode Safari etc. — just fall back
+      // to $HOME rather than blow up the create flow.
+      return undefined;
+    }
+  }
+
+  function handlePickerSelect(picked: string) {
+    setPath(picked);
+    try {
+      window.localStorage.setItem(LAST_PICKED_PATH_KEY, picked);
+    } catch {
+      /* ignore — see resolvePickerInitialPath */
+    }
   }
 
   // Debounced scan when user types a local path. Skip for git mode / empty path.
@@ -281,9 +343,15 @@ function CreateProjectDialog() {
       return;
     }
 
+    if (allowedKeyIds.length === 0) {
+      setFormError("Pick at least one AI provider key.");
+      return;
+    }
+
     const data: ProjectCreate = {
       name: trimmedName,
       baseBranch: baseBranch.trim() || "main",
+      allowed_key_ids: allowedKeyIds,
     };
     if (description.trim()) data.description = description.trim();
     if (workspaceId) data.workspace_id = Number(workspaceId);
@@ -305,6 +373,12 @@ function CreateProjectDialog() {
       data.importActions = scan.proposedActions;
     }
 
+    // Only forward toggles the user actually enabled — omitting preserves the
+    // server-side default of `false` and keeps the wire payload minimal.
+    if (gitignoreToggles.gitignore_flockctl) data.gitignore_flockctl = true;
+    if (gitignoreToggles.gitignore_todo) data.gitignore_todo = true;
+    if (gitignoreToggles.gitignore_agents_md) data.gitignore_agents_md = true;
+
     try {
       await createProject.mutateAsync(data);
       resetForm();
@@ -315,6 +389,7 @@ function CreateProjectDialog() {
   }
 
   return (
+    <>
     <Dialog open={open} onOpenChange={(v) => { setOpen(v); if (!v) resetForm(); }}>
       <DialogTrigger asChild>
         <Button>Create Project</Button>
@@ -384,12 +459,31 @@ function CreateProjectDialog() {
           {sourceMode === "local" && (
             <div className="space-y-2">
               <Label htmlFor="cp-path">Path</Label>
-              <Input
-                id="cp-path"
-                placeholder={`~/flockctl/projects/${name.trim() ? slugify(name) : "<name>"}`}
-                value={path}
-                onChange={(e) => setPath(e.target.value)}
-              />
+              {/* Input + Browse button live on the same row. The input keeps
+                  accepting paste / manual edits — remote-mode users can't use
+                  the picker (it's loopback-only on the server) and some local
+                  users prefer to paste. Browse is purely additive. */}
+              <div className="flex gap-2">
+                <Input
+                  id="cp-path"
+                  placeholder={`~/flockctl/projects/${name.trim() ? slugify(name) : "<name>"}`}
+                  value={path}
+                  onChange={(e) => setPath(e.target.value)}
+                  className="flex-1"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    setPickerInitialPath(resolvePickerInitialPath());
+                    setPickerOpen(true);
+                  }}
+                  data-testid="cp-path-browse"
+                >
+                  <FolderOpen className="mr-1 h-4 w-4" />
+                  Browse…
+                </Button>
+              </div>
               <p className="text-xs text-muted-foreground">
                 {path.trim()
                   ? "Uses this existing directory (created if missing)."
@@ -437,18 +531,76 @@ function CreateProjectDialog() {
               </p>
             </div>
           )}
+          <div className="space-y-2">
+            <Label>Allowed AI Keys *</Label>
+            <p className="text-xs text-muted-foreground">
+              Pick at least one key the project is allowed to use. All keys
+              start unchecked so access is always opt-in.
+            </p>
+            {activeKeys.length === 0 ? (
+              <p className="text-sm text-destructive">
+                No active AI keys configured. Add one in Settings → AI Keys
+                before creating a project.
+              </p>
+            ) : (
+              <div className="flex flex-wrap gap-3">
+                {activeKeys.map((k) => (
+                  <label
+                    key={k.id}
+                    className="flex items-center gap-1.5 text-sm"
+                  >
+                    <Checkbox
+                      checked={allowedKeyIds.includes(Number(k.id))}
+                      onCheckedChange={(checked) => {
+                        setAllowedKeyIds((prev) =>
+                          checked
+                            ? [...prev, Number(k.id)]
+                            : prev.filter((id) => id !== Number(k.id)),
+                        );
+                      }}
+                    />
+                    {k.name ?? k.label ?? `Key #${k.id}`}
+                  </label>
+                ))}
+              </div>
+            )}
+          </div>
+          <GitignoreToggles
+            value={gitignoreToggles}
+            onChange={setGitignoreToggles}
+            idPrefix="cp-gi"
+          />
             {formError && (
               <p className="text-sm text-destructive">{formError}</p>
             )}
           </div>
           <DialogFooter>
-            <Button type="submit" disabled={createProject.isPending}>
+            <Button
+              type="submit"
+              disabled={
+                createProject.isPending ||
+                allowedKeyIds.length === 0 ||
+                activeKeys.length === 0
+              }
+            >
               {createProject.isPending ? "Creating…" : "Create"}
             </Button>
           </DialogFooter>
         </form>
       </DialogContent>
     </Dialog>
+    {/* Mount the picker as a sibling Dialog rather than nesting it inside
+        the Create dialog — Radix handles stacked dialogs, but putting the
+        picker at the sibling level keeps focus-trap behavior predictable
+        across browsers. `initialPath` is resolved fresh each time the
+        picker opens so the last-picked value is always up to date. */}
+    <DirectoryPicker
+      open={pickerOpen}
+      onOpenChange={setPickerOpen}
+      initialPath={pickerInitialPath}
+      onSelect={handlePickerSelect}
+    />
+    </>
   );
 }
 
@@ -459,13 +611,25 @@ export default function ProjectsPage() {
   });
   const deleteProject = useDeleteProject();
   const deleteConfirm = useConfirmDialog();
+  const { items: attentionItems } = useAttention();
+
+  // Count attention items grouped by project so each row can surface its
+  // own "N waiting" badge without introducing a new column.
+  const attentionByProject = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const item of attentionItems) {
+      if (!item.project_id) continue;
+      map.set(item.project_id, (map.get(item.project_id) ?? 0) + 1);
+    }
+    return map;
+  }, [attentionItems]);
 
   return (
     <div>
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold">Projects</h1>
-          <p className="mt-1 text-muted-foreground">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <h1 className="text-xl font-bold sm:text-2xl">Projects</h1>
+          <p className="mt-1 text-sm text-muted-foreground sm:text-base">
             Manage your projects and planning hierarchy.
           </p>
         </div>
@@ -493,23 +657,42 @@ export default function ProjectsPage() {
             <TableHeader>
               <TableRow>
                 <TableHead>Name</TableHead>
-                <TableHead>Location</TableHead>
-                <TableHead>Created</TableHead>
+                <TableHead className="hidden md:table-cell">Location</TableHead>
+                <TableHead className="hidden sm:table-cell">Created</TableHead>
                 <TableHead className="w-[80px]">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {projects.map((project) => (
+              {projects.map((project) => {
+                const attentionCount = attentionByProject.get(project.id) ?? 0;
+                return (
                 <TableRow
                   key={project.id}
                   className="cursor-pointer"
                   onClick={() => navigate(`/projects/${project.id}`)}
                 >
-                  <TableCell className="font-medium">{project.name}</TableCell>
-                  <TableCell className="max-w-[300px] truncate font-mono text-xs">
+                  <TableCell className="font-medium">
+                    <div className="flex items-center gap-2">
+                      <span>{project.name}</span>
+                      {attentionCount > 0 && (
+                        <Badge
+                          variant="destructive"
+                          className="cursor-pointer"
+                          aria-label={`${attentionCount} item${attentionCount === 1 ? "" : "s"} waiting on you`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            navigate("/attention");
+                          }}
+                        >
+                          {attentionCount} waiting
+                        </Badge>
+                      )}
+                    </div>
+                  </TableCell>
+                  <TableCell className="hidden max-w-[300px] truncate font-mono text-xs md:table-cell">
                     {project.repo_url || project.path || "—"}
                   </TableCell>
-                  <TableCell className="text-xs">
+                  <TableCell className="hidden text-xs sm:table-cell">
                     {timeAgo(project.created_at)}
                   </TableCell>
                   <TableCell>
@@ -526,7 +709,8 @@ export default function ProjectsPage() {
                     </div>
                   </TableCell>
                 </TableRow>
-              ))}
+                );
+              })}
             </TableBody>
           </Table>
         )}

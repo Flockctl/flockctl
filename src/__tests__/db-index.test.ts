@@ -26,7 +26,7 @@ afterEach(() => {
 describe("db/index singleton", () => {
   it("getDb creates file under flockctl home and enables WAL + FKs", async () => {
     const home = freshHome();
-    vi.doMock("../config.js", () => ({ getFlockctlHome: () => home }));
+    vi.doMock("../config/index.js", () => ({ getFlockctlHome: () => home }));
     vi.doMock("../config", () => ({ getFlockctlHome: () => home }));
 
     const mod = await import("../db/index.js");
@@ -44,7 +44,7 @@ describe("db/index singleton", () => {
 
   it("getDb is idempotent — returns the same instance", async () => {
     const home = freshHome();
-    vi.doMock("../config.js", () => ({ getFlockctlHome: () => home }));
+    vi.doMock("../config/index.js", () => ({ getFlockctlHome: () => home }));
     vi.doMock("../config", () => ({ getFlockctlHome: () => home }));
 
     const mod = await import("../db/index.js");
@@ -56,7 +56,7 @@ describe("db/index singleton", () => {
 
   it("getRawDb lazily initializes when called first", async () => {
     const home = freshHome();
-    vi.doMock("../config.js", () => ({ getFlockctlHome: () => home }));
+    vi.doMock("../config/index.js", () => ({ getFlockctlHome: () => home }));
     vi.doMock("../config", () => ({ getFlockctlHome: () => home }));
 
     const mod = await import("../db/index.js");
@@ -67,7 +67,7 @@ describe("db/index singleton", () => {
 
   it("setDb overrides the singleton", async () => {
     const home = freshHome();
-    vi.doMock("../config.js", () => ({ getFlockctlHome: () => home }));
+    vi.doMock("../config/index.js", () => ({ getFlockctlHome: () => home }));
     vi.doMock("../config", () => ({ getFlockctlHome: () => home }));
 
     const mod = await import("../db/index.js");
@@ -87,7 +87,7 @@ describe("db/index singleton", () => {
 
   it("closeDb is safe to call twice", async () => {
     const home = freshHome();
-    vi.doMock("../config.js", () => ({ getFlockctlHome: () => home }));
+    vi.doMock("../config/index.js", () => ({ getFlockctlHome: () => home }));
     vi.doMock("../config", () => ({ getFlockctlHome: () => home }));
 
     const mod = await import("../db/index.js");

@@ -13,7 +13,7 @@ import {
   isClaudeCodeReady,
   clearReadinessCache,
   CLAUDE_CODE_MODELS,
-} from "../../services/claude-cli.js";
+} from "../../services/claude/cli.js";
 
 const mockExecFileSync = execFileSync as any;
 const mockExecSync = execSync as any;

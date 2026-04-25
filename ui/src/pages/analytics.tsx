@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useMetricsOverview, useAIKeys } from "@/lib/hooks";
+import { formatDurationCoarse as formatDuration, formatPercent, formatCost, formatTokens } from "@/lib/format";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { StatCard } from "@/components/stat-card";
@@ -29,6 +30,11 @@ import {
   ResponsiveContainer,
   CartesianGrid,
 } from "recharts";
+import {
+  CHART_TICK_STYLE as TICK_STYLE,
+  CHART_GRID_STROKE as GRID_STROKE,
+  CHART_TOOLTIP_PROPS,
+} from "@/lib/chart-theme";
 
 const PERIOD_OPTIONS = [
   { label: "7 days", value: "7d" },
@@ -37,32 +43,6 @@ const PERIOD_OPTIONS = [
   { label: "All time", value: "" },
 ];
 
-const TICK_STYLE = { fontSize: 12, fill: "var(--foreground)" };
-const GRID_STROKE = "var(--border)";
-const TOOLTIP_STYLE = { backgroundColor: "var(--popover)", borderColor: "var(--border)", color: "var(--popover-foreground)" };
-
-function formatDuration(seconds: number): string {
-  if (seconds < 60) return `${Math.round(seconds)}s`;
-  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
-  const h = Math.floor(seconds / 3600);
-  const m = Math.round((seconds % 3600) / 60);
-  return m > 0 ? `${h}h ${m}m` : `${h}h`;
-}
-
-function formatPercent(rate: number | null): string {
-  if (rate === null) return "N/A";
-  return `${(rate * 100).toFixed(1)}%`;
-}
-
-function formatCost(usd: number): string {
-  return `$${usd.toFixed(2)}`;
-}
-
-function formatTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return String(n);
-}
 
 export default function AnalyticsPage() {
   const [period, setPeriod] = useState("30d");
@@ -77,12 +57,12 @@ export default function AnalyticsPage() {
 
   return (
     <div>
-      <div className="mb-6 flex items-center justify-between">
-        <div>
-          <h1 className="mb-1 text-2xl font-bold">Analytics</h1>
+      <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <h1 className="mb-1 text-xl font-bold sm:text-2xl">Analytics</h1>
           <p className="text-sm text-muted-foreground">Agent performance and usage metrics</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <select
             value={aiKeyId}
             onChange={(e) => setAiKeyId(e.target.value)}
@@ -147,8 +127,8 @@ export default function AnalyticsPage() {
               <XAxis dataKey="label" tick={TICK_STYLE} />
               <YAxis tick={TICK_STYLE} />
               <Tooltip
+                {...CHART_TOOLTIP_PROPS}
                 formatter={(value) => [value, "Tasks"]}
-                contentStyle={TOOLTIP_STYLE}
               />
               <Bar dataKey="count" fill="var(--primary)" radius={[4, 4, 0, 0]} />
             </BarChart>
@@ -211,8 +191,8 @@ export default function AnalyticsPage() {
               <XAxis dataKey="day" tick={TICK_STYLE} />
               <YAxis tick={TICK_STYLE} allowDecimals={false} />
               <Tooltip
+                {...CHART_TOOLTIP_PROPS}
                 formatter={(value) => [value, "Tasks"]}
-                contentStyle={TOOLTIP_STYLE}
               />
               <Bar dataKey="count" fill="#22c55e" radius={[4, 4, 0, 0]} />
             </BarChart>
@@ -260,8 +240,8 @@ export default function AnalyticsPage() {
               <XAxis dataKey="day" tick={TICK_STYLE} />
               <YAxis tick={TICK_STYLE} />
               <Tooltip
+                {...CHART_TOOLTIP_PROPS}
                 formatter={(value) => [`$${Number(value).toFixed(4)}`, "Cost"]}
-                contentStyle={TOOLTIP_STYLE}
               />
               <Line type="monotone" dataKey="cost" stroke="var(--primary)" strokeWidth={2} dot={false} />
             </LineChart>

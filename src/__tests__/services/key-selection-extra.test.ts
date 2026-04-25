@@ -3,7 +3,7 @@ import { createTestDb } from "../helpers.js";
 import { setDb, type FlockctlDb } from "../../db/index.js";
 import { aiProviderKeys, projects, workspaces } from "../../db/schema.js";
 import Database from "better-sqlite3";
-import { selectKeyForTask, seedDefaultKey } from "../../services/key-selection.js";
+import { selectKeyForTask, seedDefaultKey } from "../../services/ai/key-selection.js";
 
 let db: FlockctlDb;
 let sqlite: Database.Database;
@@ -145,5 +145,30 @@ describe("selectKeyForTask — allowedKeyIds inheritance", () => {
     // Real assigned ID → returned directly even with priority
     const direct = await selectKeyForTask({ assignedKeyId: real.id });
     expect(direct.id).toBe(real.id);
+  });
+
+  it("skips excluded key ids and picks the next candidate", async () => {
+    const primary = db.insert(aiProviderKeys).values({
+      provider: "a", providerType: "anthropic-messages",
+      label: "A", keyValue: "kA", isActive: true, priority: 0,
+    }).returning().get()!;
+    const secondary = db.insert(aiProviderKeys).values({
+      provider: "b", providerType: "anthropic-messages",
+      label: "B", keyValue: "kB", isActive: true, priority: 1,
+    }).returning().get()!;
+
+    const selected = await selectKeyForTask({}, { excludeKeyIds: [primary.id] });
+    expect(selected.id).toBe(secondary.id);
+  });
+
+  it("treats assignedKeyId as unavailable when excluded", async () => {
+    const assigned = db.insert(aiProviderKeys).values({
+      provider: "a", providerType: "anthropic-messages",
+      label: "A", keyValue: "kA", isActive: true, priority: 0,
+    }).returning().get()!;
+
+    await expect(
+      selectKeyForTask({ assignedKeyId: assigned.id }, { excludeKeyIds: [assigned.id] }),
+    ).rejects.toThrow("No available AI keys");
   });
 });

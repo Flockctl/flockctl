@@ -1,14 +1,12 @@
 import {
   readFileSync,
   writeFileSync,
-  unlinkSync,
   mkdirSync,
   existsSync,
   statSync,
   renameSync,
 } from "fs";
 import { join } from "path";
-import { parse as parseYaml } from "yaml";
 
 export type DisableLevel = "global" | "workspace" | "project";
 
@@ -34,7 +32,6 @@ const configCache = new Map<string, { config: WorkspaceConfig; mtime: number }>(
 export function loadWorkspaceConfig(workspacePath: string): WorkspaceConfig {
   const flockctlDir = join(workspacePath, ".flockctl");
   const jsonPath = join(flockctlDir, "config.json");
-  const yamlPath = join(flockctlDir, "config.yaml");
 
   if (existsSync(jsonPath)) {
     try {
@@ -49,23 +46,6 @@ export function loadWorkspaceConfig(workspacePath: string): WorkspaceConfig {
       return config;
     } catch (err) {
       console.error(`[workspace-config] failed to read ${jsonPath}:`, err);
-      return {};
-    }
-  }
-
-  if (existsSync(yamlPath)) {
-    try {
-      const raw = readFileSync(yamlPath, "utf-8");
-      const parsed = parseYaml(raw);
-      const config = validateWorkspaceConfig(parsed);
-      saveWorkspaceConfig(workspacePath, config);
-      try {
-        unlinkSync(yamlPath);
-      } catch {}
-      console.log(`[workspace-config] migrated ${yamlPath} → config.json`);
-      return config;
-    } catch (err) {
-      console.error(`[workspace-config] failed to parse legacy YAML at ${yamlPath}:`, err);
       return {};
     }
   }

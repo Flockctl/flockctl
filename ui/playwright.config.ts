@@ -14,6 +14,12 @@ export default defineConfig({
   retries: process.env.CI ? 1 : 0,
   fullyParallel: false,
   workers: 1,
+  // Keep visual baselines next to the spec that produced them — Playwright's
+  // default nests each screenshot under `<spec>-snapshots/`, which gets noisy
+  // when multiple specs ship baselines. Routing all screenshots through a
+  // single `__screenshots__` tree (grouped by spec file) keeps the diff small
+  // and matches the layout the tests assume on disk.
+  snapshotPathTemplate: "{testDir}/__screenshots__/{testFilePath}/{arg}{ext}",
   reporter: process.env.CI ? [["github"], ["html", { open: "never" }]] : "list",
   use: {
     baseURL: `http://localhost:${frontendPort}`,

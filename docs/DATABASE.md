@@ -1,6 +1,9 @@
 # Flockctl — Database Schema
 
-> 11 Drizzle ORM tables, SQLite (WAL mode), drizzle-kit migrations.
+> 10 Drizzle ORM tables, SQLite (WAL mode), drizzle-kit migrations. Task templates
+> are no longer a database table — they are JSON files on disk. See
+> [`src/services/templates.ts`](../src/services/templates.ts) for the template
+> storage module.
 
 ## Database
 
@@ -14,7 +17,7 @@
 
 ```
 Workspace ──┬── Project ──┬── Task ── TaskLog
-            │             ├── TaskTemplate ── Schedule
+            │             ├── Schedule ── (template file on disk)
             │             └── (Plan files on disk)
             └── Chat ── ChatMessage
 
@@ -58,6 +61,9 @@ Logical groupings of projects.
 | description | TEXT | |
 | path | TEXT | Unique filesystem path, not null |
 | allowed_key_ids | TEXT | JSON array of allowed key IDs |
+| gitignore_flockctl | INTEGER | 0/1. Adds the whole `.flockctl/` directory to the auto-managed `.gitignore` block when 1. |
+| gitignore_todo | INTEGER | 0/1. Adds `TODO.md` to the auto-managed `.gitignore` block when 1. |
+| gitignore_agents_md | INTEGER | 0/1. Adds `AGENTS.md` + `CLAUDE.md` to the auto-managed `.gitignore` block when 1. |
 | created_at | TEXT | ISO 8601 timestamp |
 | updated_at | TEXT | ISO 8601 timestamp |
 
@@ -78,6 +84,9 @@ Code repositories managed by Flockctl. Portable config (`model`, `baseBranch`, `
 | backoff_config | TEXT | JSON config |
 | allowed_key_ids | TEXT | JSON array of allowed key IDs |
 | denied_key_ids | TEXT | JSON array of denied key IDs |
+| gitignore_flockctl | INTEGER | 0/1. Same semantics as the workspace column, applied to this project's `.gitignore`. |
+| gitignore_todo | INTEGER | 0/1. Same semantics as the workspace column. |
+| gitignore_agents_md | INTEGER | 0/1. Same semantics as the workspace column. |
 | created_at | TEXT | ISO 8601 timestamp |
 | updated_at | TEXT | ISO 8601 timestamp |
 
@@ -115,7 +124,8 @@ AI agent task execution records.
 | completed_at | TEXT | |
 | git_commit_before | TEXT | Git HEAD SHA before execution |
 | git_commit_after | TEXT | Git HEAD SHA after execution |
-| git_diff_summary | TEXT | Summary of git changes |
+| git_diff_summary | TEXT | One-line human summary (e.g. `"3 files changed, +42 / -17"`). Derived from the `file_edits` journal, not `git diff`. |
+| file_edits | TEXT | JSON-serialized file-edit journal (`{ entries: [{ filePath, original, current }, …] }`). Populated per-tool-call from Edit / Write / MultiEdit / str_replace inputs. Consumed by `GET /tasks/:id/diff` to synthesize a session-isolated unified diff. |
 | requires_approval | BOOLEAN | Whether task needs human approval (default: false) |
 | approval_status | TEXT | approved / rejected |
 | approved_at | TEXT | ISO 8601 timestamp |
@@ -138,36 +148,23 @@ Streaming output from task execution.
 | stream_type | TEXT | "stdout" or "stderr" (default: stdout) |
 | timestamp | TEXT | ISO 8601 timestamp |
 
-### task_templates
-
-Reusable task configurations.
-
-| Column | Type | Notes |
-|--------|------|-------|
-| id | INTEGER | PK, autoincrement |
-| project_id | INTEGER | FK → projects (on delete: cascade) |
-| name | TEXT | Not null |
-| description | TEXT | |
-| prompt | TEXT | |
-| agent | TEXT | |
-| model | TEXT | |
-| image | TEXT | |
-| working_dir | TEXT | |
-| env_vars | TEXT | JSON |
-| timeout_seconds | INTEGER | |
-| label_selector | TEXT | JSON |
-| assigned_key_id | INTEGER | Preferred key when scheduling tasks from this template |
-| created_at | TEXT | ISO 8601 timestamp |
-| updated_at | TEXT | ISO 8601 timestamp |
-
 ### schedules
 
-Cron and one-shot task schedules.
+Cron and one-shot task schedules. Schedules reference a template stored on disk
+rather than a row in a `task_templates` table. See
+[`src/services/templates.ts`](../src/services/templates.ts) for the template
+storage module — templates live in `~/flockctl/templates/<name>.json` (global),
+`<workspace>/.flockctl/templates/<name>.json` (workspace), or
+`<project>/.flockctl/templates/<name>.json` (project).
 
 | Column | Type | Notes |
 |--------|------|-------|
 | id | INTEGER | PK, autoincrement |
-| template_id | INTEGER | FK → task_templates (on delete: cascade) |
+| template_scope | TEXT | "global", "workspace", or "project", not null |
+| template_name | TEXT | Template file basename, not null |
+| template_workspace_id | INTEGER | FK → workspaces (on delete: cascade). Required when `template_scope = "workspace"` |
+| template_project_id | INTEGER | FK → projects (on delete: cascade). Required when `template_scope = "project"` |
+| assigned_key_id | INTEGER | FK → ai_provider_keys (on delete: set null). Preferred key for tasks spawned by this schedule — one template can be reused with different keys across schedules |
 | schedule_type | TEXT | "cron" or "once", not null |
 | cron_expression | TEXT | Cron syntax (for type "cron") |
 | run_at | TEXT | ISO 8601 timestamp (for type "once") |
@@ -178,6 +175,11 @@ Cron and one-shot task schedules.
 | misfire_grace_seconds | INTEGER | |
 | created_at | TEXT | ISO 8601 timestamp |
 | updated_at | TEXT | ISO 8601 timestamp |
+
+CHECK constraint: if `template_scope = "workspace"` then `template_workspace_id`
+must be non-null; if `template_scope = "project"` then `template_project_id`
+must be non-null; if `template_scope = "global"` both template-owner columns
+must be null.
 
 ### chats
 
@@ -193,6 +195,11 @@ AI chat sessions.
 | entity_type | TEXT | Optional: "milestone", "slice", "task" |
 | entity_id | TEXT | Entity identifier for plan-entity chats |
 | permission_mode | TEXT | Per-chat permission policy override (see tasks.permission_mode) |
+| ai_provider_key_id | INTEGER | FK → ai_provider_keys (on delete: set null). Persisted key selection; provider is derived from `ai_provider_keys.provider` via join. NULL falls back to the rc default |
+| model | TEXT | Persisted model id (e.g. `claude-sonnet-4-20250514`). NULL falls back to project config → global default |
+| file_edits | TEXT | JSON-serialized file-edit journal (`{ entries: [{ filePath, original, current }, …] }`). Accumulated across the chat's lifetime from Edit / Write / MultiEdit / str_replace tool inputs. Consumed by `GET /chats/:id/diff` to synthesize a session-isolated unified diff. |
+| thinking_enabled | INTEGER | Adaptive extended-thinking toggle (bool, default 1). When 0, the SDK call adds `thinking: { type: "disabled" }` for the next turn. |
+| effort | TEXT | Reasoning effort level (`low` / `medium` / `high` / `max`). NULL means "fall back to the default" (`high`). |
 | created_at | TEXT | ISO 8601 timestamp |
 | updated_at | TEXT | ISO 8601 timestamp |
 

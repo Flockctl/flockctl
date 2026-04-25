@@ -49,14 +49,14 @@ import {
   reconcileAllProjects,
   reconcileAllProjectsInWorkspace,
   ensureGitignore,
-} from "../../services/claude-skills-sync.js";
+} from "../../services/claude/skills-sync.js";
 
 import {
   reconcileMcpForProject,
   reconcileMcpForWorkspace,
   reconcileAllMcp,
   reconcileAllMcpInWorkspace,
-} from "../../services/claude-mcp-sync.js";
+} from "../../services/claude/mcp-sync.js";
 
 import { resolveSkillsForWorkspace } from "../../services/skills.js";
 import { resolveMcpServersForWorkspace, resolveMcpServersForProject, loadMcpServersFromDir } from "../../services/mcp.js";
@@ -201,6 +201,7 @@ describe("claude-skills-sync", () => {
       ".flockctl/.mcp-reconcile",
       ".flockctl/.agents-reconcile",
       ".flockctl/import-backup/",
+      ".flockctl/plan/",
     ].join("\n") + "\n";
     writeFileSync(join(dir, ".gitignore"), gitignore);
 
@@ -220,6 +221,7 @@ describe("claude-skills-sync", () => {
       ".flockctl/.mcp-reconcile",
       ".flockctl/.agents-reconcile",
       ".flockctl/import-backup/",
+      ".flockctl/plan/",
     ]) {
       const occurrences = after.split("\n").filter((l) => l === pattern).length;
       expect(occurrences).toBe(1);
@@ -235,6 +237,121 @@ describe("claude-skills-sync", () => {
     ensureGitignore(dir);
     const second = readFileSync(join(dir, ".gitignore"), "utf-8");
     expect(second).toBe(first);
+  });
+
+  // ─── Gitignore toggles (migration 0038) ────────────────────────────────
+
+  it("gitignore flags=off keeps the legacy base block", () => {
+    const dir = mkdtempSync(join(tmpBase, "gi-base-"));
+    writeFileSync(join(dir, ".gitignore"), "node_modules/\n");
+    ensureGitignore(dir); // no options → defaults to off
+    const after = readFileSync(join(dir, ".gitignore"), "utf-8");
+    // Base patterns present
+    expect(after).toContain(".claude/skills/");
+    expect(after).toContain(".flockctl/.skills-reconcile");
+    expect(after).toContain(".flockctl/plan/");
+    // Optional patterns absent
+    expect(after).not.toContain("\n.flockctl/\n");
+    expect(after).not.toMatch(/^TODO\.md$/m);
+    expect(after).not.toMatch(/^AGENTS\.md$/m);
+    expect(after).not.toMatch(/^CLAUDE\.md$/m);
+  });
+
+  it("gitignore flockctl=true collapses the sub-paths into .flockctl/", () => {
+    const dir = mkdtempSync(join(tmpBase, "gi-flock-"));
+    writeFileSync(join(dir, ".gitignore"), "node_modules/\n");
+    ensureGitignore(dir, { flockctl: true });
+    const after = readFileSync(join(dir, ".gitignore"), "utf-8");
+    // `.flockctl/` appears exactly once inside the block
+    const lines = after.split("\n");
+    expect(lines.filter((l) => l === ".flockctl/").length).toBe(1);
+    // The granular sub-paths are NOT listed — `.flockctl/` already covers them
+    expect(lines).not.toContain(".flockctl/.skills-reconcile");
+    expect(lines).not.toContain(".flockctl/plan/");
+    expect(lines).not.toContain(".flockctl/import-backup/");
+  });
+
+  it("gitignore todo=true adds TODO.md to the block", () => {
+    const dir = mkdtempSync(join(tmpBase, "gi-todo-"));
+    writeFileSync(join(dir, ".gitignore"), "node_modules/\n");
+    ensureGitignore(dir, { todo: true });
+    const after = readFileSync(join(dir, ".gitignore"), "utf-8");
+    expect(after.split("\n").filter((l) => l === "TODO.md").length).toBe(1);
+  });
+
+  it("gitignore agentsMd=true adds BOTH AGENTS.md and CLAUDE.md", () => {
+    const dir = mkdtempSync(join(tmpBase, "gi-agents-"));
+    writeFileSync(join(dir, ".gitignore"), "node_modules/\n");
+    ensureGitignore(dir, { agentsMd: true });
+    const after = readFileSync(join(dir, ".gitignore"), "utf-8");
+    const lines = after.split("\n");
+    expect(lines.filter((l) => l === "AGENTS.md").length).toBe(1);
+    expect(lines.filter((l) => l === "CLAUDE.md").length).toBe(1);
+  });
+
+  it("gitignore all three flags produce a superset block", () => {
+    const dir = mkdtempSync(join(tmpBase, "gi-all-"));
+    writeFileSync(join(dir, ".gitignore"), "node_modules/\n");
+    ensureGitignore(dir, { flockctl: true, todo: true, agentsMd: true });
+    const after = readFileSync(join(dir, ".gitignore"), "utf-8");
+    for (const pat of [".flockctl/", "TODO.md", "AGENTS.md", "CLAUDE.md"]) {
+      expect(after.split("\n").filter((l) => l === pat).length).toBe(1);
+    }
+    // `.claude/skills/` and `.mcp.json` still present — they live outside
+    // `.flockctl/` and must always be ignored.
+    expect(after).toContain(".claude/skills/");
+    expect(after).toContain(".mcp.json");
+  });
+
+  it("gitignore flipping a flag off strips the previous entry on next run", () => {
+    const dir = mkdtempSync(join(tmpBase, "gi-flip-"));
+    writeFileSync(join(dir, ".gitignore"), "node_modules/\n");
+    ensureGitignore(dir, { todo: true });
+    expect(readFileSync(join(dir, ".gitignore"), "utf-8")).toContain("TODO.md");
+    // Flag flips off — block is rewritten, TODO.md disappears even though a
+    // prior run put it there.
+    ensureGitignore(dir, { todo: false });
+    const after = readFileSync(join(dir, ".gitignore"), "utf-8");
+    expect(after.split("\n").filter((l) => l === "TODO.md").length).toBe(0);
+  });
+
+  it("gitignore createIfMissing=true creates .gitignore when at least one flag is on", () => {
+    const dir = mkdtempSync(join(tmpBase, "gi-create-"));
+    expect(existsSync(join(dir, ".gitignore"))).toBe(false);
+    ensureGitignore(dir, { flockctl: true, createIfMissing: true });
+    expect(existsSync(join(dir, ".gitignore"))).toBe(true);
+    const content = readFileSync(join(dir, ".gitignore"), "utf-8");
+    expect(content).toContain(".flockctl/");
+  });
+
+  it("gitignore createIfMissing=true is still a no-op when all flags are off", () => {
+    const dir = mkdtempSync(join(tmpBase, "gi-noop-"));
+    ensureGitignore(dir, { createIfMissing: true });
+    // Non-invasive: no flags = no file creation.
+    expect(existsSync(join(dir, ".gitignore"))).toBe(false);
+  });
+
+  it("gitignore toggles wired into reconcile via project row", () => {
+    const projPath = mkdtempSync(join(tmpBase, "gi-proj-"));
+    writeFileSync(join(projPath, ".gitignore"), "node_modules/\n");
+    const proj = db
+      .insert(projects)
+      .values({
+        name: "gi-proj",
+        path: projPath,
+        gitignoreFlockctl: true,
+        gitignoreTodo: true,
+        gitignoreAgentsMd: true,
+      })
+      .returning()
+      .get()!;
+
+    reconcileClaudeSkillsForProject(proj.id);
+    const after = readFileSync(join(projPath, ".gitignore"), "utf-8");
+    expect(after).toContain(".flockctl/");
+    expect(after).toContain("TODO.md");
+    expect(after).toContain("AGENTS.md");
+    expect(after).toContain("CLAUDE.md");
   });
 
   it("writeManifest skips write when content unchanged (byte-stable)", () => {

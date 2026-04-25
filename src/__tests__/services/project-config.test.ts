@@ -107,12 +107,6 @@ describe("loadProjectConfig / saveProjectConfig", () => {
     expect(second).toEqual(first);
   });
 
-  it("returns empty object on invalid YAML", () => {
-    mkdirSync(join(projectPath, ".flockctl"), { recursive: true });
-    writeFileSync(join(projectPath, ".flockctl", "config.yaml"), ":\n:\n:invalid yaml", "utf-8");
-    expect(loadProjectConfig(projectPath)).toEqual({});
-  });
-
   it("invalidates cache on save", () => {
     saveProjectConfig(projectPath, { model: "old" });
     expect(loadProjectConfig(projectPath).model).toBe("old");

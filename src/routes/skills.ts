@@ -3,8 +3,9 @@ import { getDb } from "../db/index.js";
 import { workspaces, projects, tasks } from "../db/schema.js";
 import { eq } from "drizzle-orm";
 import { NotFoundError, ValidationError } from "../lib/errors.js";
+import { parseIdParam } from "../lib/route-params.js";
 import { resolveSkillsForProject } from "../services/skills.js";
-import { getGlobalSkillsDir } from "../config.js";
+import { getGlobalSkillsDir } from "../config/index.js";
 import { loadWorkspaceConfig, saveWorkspaceConfig, type DisableEntry, type DisableLevel } from "../services/workspace-config.js";
 import { loadProjectConfig, saveProjectConfig } from "../services/project-config.js";
 import {
@@ -12,13 +13,13 @@ import {
   reconcileClaudeSkillsForProject,
   reconcileAllProjectsInWorkspace,
   reconcileAllProjects,
-} from "../services/claude-skills-sync.js";
+} from "../services/claude/skills-sync.js";
 import {
   reconcileMcpForWorkspace,
   reconcileMcpForProject,
   reconcileAllMcpInWorkspace,
   reconcileAllMcp,
-} from "../services/claude-mcp-sync.js";
+} from "../services/claude/mcp-sync.js";
 import { existsSync, readdirSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from "fs";
 import { join } from "path";
 
@@ -104,7 +105,7 @@ skillRoutes.delete("/global/:name", (c) => {
 // GET /workspaces/:id/skills — list workspace skills
 skillRoutes.get("/workspaces/:id/skills", (c) => {
   const db = getDb();
-  const id = parseInt(c.req.param("id"));
+  const id = parseIdParam(c);
   const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
   if (!ws) throw new NotFoundError("Workspace");
 
@@ -116,7 +117,7 @@ skillRoutes.get("/workspaces/:id/skills", (c) => {
 // POST /workspaces/:id/skills — create/update workspace skill
 skillRoutes.post("/workspaces/:id/skills", async (c) => {
   const db = getDb();
-  const id = parseInt(c.req.param("id"));
+  const id = parseIdParam(c);
   const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
   if (!ws) throw new NotFoundError("Workspace");
 
@@ -136,7 +137,7 @@ skillRoutes.post("/workspaces/:id/skills", async (c) => {
 // DELETE /workspaces/:id/skills/:name
 skillRoutes.delete("/workspaces/:id/skills/:name", (c) => {
   const db = getDb();
-  const id = parseInt(c.req.param("id"));
+  const id = parseIdParam(c);
   const name = c.req.param("name");
   validateName(name);
   const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
@@ -153,7 +154,7 @@ skillRoutes.delete("/workspaces/:id/skills/:name", (c) => {
 // GET /workspaces/:wid/projects/:pid/skills — list project skills
 skillRoutes.get("/workspaces/:wid/projects/:pid/skills", (c) => {
   const db = getDb();
-  const pid = parseInt(c.req.param("pid"));
+  const pid = parseIdParam(c, "pid");
   const project = db.select().from(projects).where(eq(projects.id, pid)).get();
   if (!project?.path) throw new NotFoundError("Project");
 
@@ -165,7 +166,7 @@ skillRoutes.get("/workspaces/:wid/projects/:pid/skills", (c) => {
 // POST /workspaces/:wid/projects/:pid/skills — create/update project skill
 skillRoutes.post("/workspaces/:wid/projects/:pid/skills", async (c) => {
   const db = getDb();
-  const pid = parseInt(c.req.param("pid"));
+  const pid = parseIdParam(c, "pid");
   const project = db.select().from(projects).where(eq(projects.id, pid)).get();
   if (!project?.path) throw new NotFoundError("Project");
 
@@ -185,7 +186,7 @@ skillRoutes.post("/workspaces/:wid/projects/:pid/skills", async (c) => {
 // DELETE /workspaces/:wid/projects/:pid/skills/:name
 skillRoutes.delete("/workspaces/:wid/projects/:pid/skills/:name", (c) => {
   const db = getDb();
-  const pid = parseInt(c.req.param("pid"));
+  const pid = parseIdParam(c, "pid");
   const name = c.req.param("name");
   validateName(name);
   const project = db.select().from(projects).where(eq(projects.id, pid)).get();
@@ -204,7 +205,7 @@ skillRoutes.delete("/workspaces/:wid/projects/:pid/skills/:name", (c) => {
 // POST /skills/workspaces/:id/disabled — body: {name, level} with level ∈ {global, workspace}
 skillRoutes.post("/workspaces/:id/disabled", async (c) => {
   const db = getDb();
-  const id = parseInt(c.req.param("id"));
+  const id = parseIdParam(c);
   const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
   if (!ws) throw new NotFoundError("Workspace");
   if (!ws.path) throw new ValidationError("Workspace has no path");
@@ -222,7 +223,7 @@ skillRoutes.post("/workspaces/:id/disabled", async (c) => {
 // DELETE /skills/workspaces/:id/disabled — body: {name, level}
 skillRoutes.delete("/workspaces/:id/disabled", async (c) => {
   const db = getDb();
-  const id = parseInt(c.req.param("id"));
+  const id = parseIdParam(c);
   const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
   if (!ws) throw new NotFoundError("Workspace");
   if (!ws.path) throw new ValidationError("Workspace has no path");
@@ -240,7 +241,7 @@ skillRoutes.delete("/workspaces/:id/disabled", async (c) => {
 // GET /skills/workspaces/:id/disabled — list disabled skills for workspace
 skillRoutes.get("/workspaces/:id/disabled", (c) => {
   const db = getDb();
-  const id = parseInt(c.req.param("id"));
+  const id = parseIdParam(c);
   const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
   if (!ws) throw new NotFoundError("Workspace");
 
@@ -251,7 +252,7 @@ skillRoutes.get("/workspaces/:id/disabled", (c) => {
 // POST /skills/projects/:pid/disabled — body: {name, level} with level ∈ {global, workspace, project}
 skillRoutes.post("/projects/:pid/disabled", async (c) => {
   const db = getDb();
-  const pid = parseInt(c.req.param("pid"));
+  const pid = parseIdParam(c, "pid");
   const project = db.select().from(projects).where(eq(projects.id, pid)).get();
   if (!project) throw new NotFoundError("Project");
   if (!project.path) throw new ValidationError("Project has no path");
@@ -269,7 +270,7 @@ skillRoutes.post("/projects/:pid/disabled", async (c) => {
 // DELETE /skills/projects/:pid/disabled — body: {name, level}
 skillRoutes.delete("/projects/:pid/disabled", async (c) => {
   const db = getDb();
-  const pid = parseInt(c.req.param("pid"));
+  const pid = parseIdParam(c, "pid");
   const project = db.select().from(projects).where(eq(projects.id, pid)).get();
   if (!project) throw new NotFoundError("Project");
   if (!project.path) throw new ValidationError("Project has no path");
@@ -287,7 +288,7 @@ skillRoutes.delete("/projects/:pid/disabled", async (c) => {
 // GET /skills/projects/:pid/disabled — list disabled skills for project
 skillRoutes.get("/projects/:pid/disabled", (c) => {
   const db = getDb();
-  const pid = parseInt(c.req.param("pid"));
+  const pid = parseIdParam(c, "pid");
   const project = db.select().from(projects).where(eq(projects.id, pid)).get();
   if (!project) throw new NotFoundError("Project");
 

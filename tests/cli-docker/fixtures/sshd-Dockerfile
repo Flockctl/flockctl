@@ -1,0 +1,109 @@
+# syntax=docker/dockerfile:1.6
+#
+# Flockctl SSH-remote test image (host-a in the ssh-remote-full-stack
+# scenario). Spec-mandated shape:
+#
+#   debian:slim + openssh-server + ca-certificates + the locally built
+#   flockctl tarball.
+#
+# The tarball is produced by the spec's `npm pack` step on the host and
+# copied into the build context as `flockctl.tgz` — that's the single
+# point of truth for what "locally built flockctl" means (npm's own
+# packaging rules pick up the `files` entries from package.json, i.e.
+# `dist/`, `migrations/`, CHANGELOG, README, LICENSE).
+#
+# The container runs `sshd -D -e` as its command. A per-test user `tester`
+# is created with password login disabled; auth is pubkey-only and the
+# authorized_keys file is bind-mounted read-only at /home/tester/.ssh/
+# authorized_keys from a tmpdir the spec controls. `StrictModes no` on the
+# sshd_config means a host bind mount with "wrong" ownership (the default
+# for docker volumes) still authenticates correctly — important because
+# the mounted file will be owned by the host UID, not `tester`.
+#
+# This image is built on demand by the spec (`docker image inspect
+# flockctl-sshd-test:local` → build if absent). BuildKit's layer cache
+# handles subsequent rebuilds: the apt-get layer almost never changes,
+# and only the `COPY flockctl.tgz` + `npm install -g` layer rebuilds
+# when the local dist/ changes.
+FROM debian:bookworm-slim
+
+# Core runtime: openssh-server for the remote side of the ssh connection,
+# curl+gnupg to fetch Node 20, ca-certificates so TLS works from inside
+# the container (`flockctl-remote-bootstrap` doesn't need it, but future
+# additions might — cheap to bake in). We keep python3/make/g++ only for
+# the npm install step (better-sqlite3 has Debian x86_64 prebuilds, but
+# Apple Silicon CI might land here as arm64 without a prebuild) and
+# purge them in the same layer.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      openssh-server \
+      ca-certificates \
+      curl \
+      gnupg \
+      python3 \
+      make \
+      g++ \
+      git \
+ && mkdir -p /run/sshd \
+ && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs \
+ && rm -rf /var/lib/apt/lists/*
+
+# Install flockctl globally from the locally built tarball. `npm install
+# -g <tgz>` respects the tarball's `bin` entry so `flockctl` lands on
+# PATH.
+#
+# Intentionally NOT purging the build toolchain. Observed behaviour on
+# debian:bookworm-slim + nodesource 20.x: `apt-get purge -y python3
+# make g++` cascades into removing nodejs too (apt treats the
+# nodesource-provided nodejs as depending on python3 via the gyp
+# toolchain graph), which leaves the `#!/usr/bin/env node` shebang on
+# `/usr/bin/flockctl` broken and every ssh exec returns 127. That
+# breaks the happy-path assertion and makes the image useless. Keeping
+# ~200 MB of build tools on a test-only image is the lesser evil; the
+# image is never pushed to a registry.
+COPY flockctl.tgz /tmp/flockctl.tgz
+RUN npm install -g /tmp/flockctl.tgz \
+ && rm /tmp/flockctl.tgz \
+ && rm -rf /root/.npm /root/.node-gyp /tmp/* /var/lib/apt/lists/*
+
+# Per-test user. Password is deleted AND the account is locked
+# (`usermod -L`) so only pubkey auth works. The .ssh dir is created up
+# front so the authorized_keys mount target exists before sshd starts.
+#
+# Migrations symlink: src/db/migrate.ts hard-codes the relative path
+# `./migrations`, so the drizzle migrator looks for
+# `<cwd>/migrations/meta/_journal.json` at daemon boot. On this image
+# `cwd` is tester's home (ssh login shells start in $HOME, and the
+# daemon inherits cwd when `flockctl remote-bootstrap` forks
+# server-entry.js). Without the symlink every bootstrap fails with
+# "Can't find meta/_journal.json file" — exactly what we saw on first
+# run. Linking the npm-install-dir migrations into $HOME keeps the
+# fix local to this test image; src/db/migrate.ts is not in our change
+# set.
+RUN useradd --create-home --shell /bin/bash tester \
+ && passwd -d tester \
+ && usermod -L tester \
+ && mkdir -p /home/tester/.ssh \
+ && chown tester:tester /home/tester/.ssh \
+ && chmod 700 /home/tester/.ssh \
+ && ln -s /usr/lib/node_modules/flockctl/migrations /home/tester/migrations \
+ && chown -h tester:tester /home/tester/migrations
+
+# sshd: key-only auth, StrictModes off so a bind-mounted authorized_keys
+# file with host ownership doesn't get rejected. Append (rather than
+# overwrite) AcceptEnv so the test can pass FLOCKCTL_HOME through the
+# ssh session if ever needed.
+RUN sed -i -E 's/^#?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config \
+ && sed -i -E 's/^#?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
+ && sed -i -E 's/^#?PermitEmptyPasswords.*/PermitEmptyPasswords no/' /etc/ssh/sshd_config \
+ && sed -i -E 's/^#?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config \
+ && echo "StrictModes no" >> /etc/ssh/sshd_config \
+ && echo "AcceptEnv FLOCKCTL_HOME NODE_V8_COVERAGE" >> /etc/ssh/sshd_config \
+ && ssh-keygen -A
+
+EXPOSE 22 52077
+
+# Foreground sshd. `-e` routes its log to stderr so `docker logs` shows
+# auth attempts — the spec's "token never in logs" assertion reads this.
+CMD ["/usr/sbin/sshd", "-D", "-e"]

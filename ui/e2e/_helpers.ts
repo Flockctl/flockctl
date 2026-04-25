@@ -4,13 +4,43 @@ export function uniq(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 }
 
+/**
+ * Fetch the first active AI provider key id from the seeded defaults.
+ *
+ * POST /workspaces and POST /projects now REQUIRE a non-empty
+ * `allowedKeyIds`. Every e2e test that creates a workspace/project
+ * via the helpers indirectly depends on this, so we centralize the
+ * lookup here and default to the seeded Claude CLI key that
+ * `seedDefaultKey` always inserts on a fresh `.e2e-data` boot.
+ *
+ * Caller can still override by passing `allowedKeyIds` explicitly
+ * in the `extra` bag — that path short-circuits this lookup.
+ */
+async function pickDefaultKeyId(request: APIRequestContext): Promise<number> {
+  const res = await request.get("/keys?page=1&perPage=100");
+  if (res.status() !== 200) {
+    throw new Error(`GET /keys failed: ${res.status()} ${await res.text()}`);
+  }
+  const body = (await res.json()) as {
+    items: Array<{ id: number; is_active?: boolean; isActive?: boolean }>;
+  };
+  const active = body.items.find((k) => (k.is_active ?? k.isActive) !== false);
+  if (!active) {
+    throw new Error("No active AI provider key available in e2e backend");
+  }
+  return active.id;
+}
+
 export async function createWorkspace(
   request: APIRequestContext,
   name?: string,
+  extra: Record<string, unknown> = {},
 ): Promise<{ id: number; name: string; path: string }> {
   const n = name ?? uniq("ws");
+  const allowedKeyIds =
+    (extra.allowedKeyIds as number[] | undefined) ?? [await pickDefaultKeyId(request)];
   const res = await request.post("/workspaces", {
-    data: { name: n, path: `/tmp/${n}` },
+    data: { name: n, path: `/tmp/${n}`, allowedKeyIds, ...extra },
   });
   if (res.status() !== 201) {
     throw new Error(`createWorkspace failed: ${res.status()} ${await res.text()}`);
@@ -24,8 +54,10 @@ export async function createProject(
   extra: Record<string, unknown> = {},
 ): Promise<{ id: number; name: string; path: string }> {
   const n = name ?? uniq("proj");
+  const allowedKeyIds =
+    (extra.allowedKeyIds as number[] | undefined) ?? [await pickDefaultKeyId(request)];
   const res = await request.post("/projects", {
-    data: { name: n, path: `/tmp/${n}`, ...extra },
+    data: { name: n, path: `/tmp/${n}`, allowedKeyIds, ...extra },
   });
   if (res.status() !== 201) {
     throw new Error(`createProject failed: ${res.status()} ${await res.text()}`);

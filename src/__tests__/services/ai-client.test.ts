@@ -8,12 +8,12 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
 }));
 
 // Mock renameClaudeSession — it's a dynamic import from ./claude-cli
-vi.mock("../../services/claude-cli", async () => {
-  const actual = await vi.importActual<any>("../../services/claude-cli");
+vi.mock("../../services/claude/cli", async () => {
+  const actual = await vi.importActual<any>("../../services/claude/cli");
   return { ...actual, renameClaudeSession: vi.fn(() => Promise.resolve()) };
 });
 
-import { createAIClient } from "../../services/ai-client.js";
+import { createAIClient } from "../../services/ai/client.js";
 
 beforeEach(() => {
   mockQuery.mockReset();
@@ -62,6 +62,13 @@ describe("createAIClient.chat — stream handling", () => {
         },
       },
       {
+        type: "assistant",
+        message: {
+          usage: { input_tokens: 2, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+          content: [{ type: "text", text: " world" }],
+        },
+      },
+      {
         type: "result",
         result: "final text",
         session_id: "sess-123",
@@ -80,7 +87,8 @@ describe("createAIClient.chat — stream handling", () => {
 
     expect(result.text).toBe("final text");
     expect(result.sessionId).toBe("sess-123");
-    expect(result.costUsd).toBe(0.01);
+    // Cumulative usage across assistant messages — SDK's result.usage is only
+    // the last turn, so we keep the accumulated totals instead.
     expect(result.usage?.inputTokens).toBe(12);
     expect(result.usage?.outputTokens).toBe(6);
 
@@ -236,18 +244,33 @@ it("throws AbortError when abortSignal already aborted", async () => {
     })).rejects.toThrow(/AI stream error.*boom/);
   });
 
-  it("serializes non-string message content to JSON", async () => {
+  it("forwards block-array content as an AsyncIterable<SDKUserMessage>", async () => {
+    // Multimodal turns (text + image attachments) must reach the SDK as
+    // native content blocks, not as a JSON-stringified string — otherwise
+    // the model sees a stringly-typed body and loses the image semantics.
     let captured: any;
     mockQuery.mockImplementationOnce((opts: any) => {
       captured = opts;
       return asStream([{ type: "result", result: "", session_id: "s", total_cost_usd: 0, usage: {} }]);
     });
 
+    const blocks = [{ type: "text", text: "hi" }];
     const client = createAIClient();
     await client.chat({
       model: "m", system: "",
-      messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+      messages: [{ role: "user", content: blocks }],
     });
-    expect(captured.prompt).toBe(JSON.stringify([{ type: "text", text: "hi" }]));
+
+    // The prompt should be an AsyncIterable yielding exactly one
+    // SDKUserMessage whose `content` is the original block array.
+    expect(typeof captured.prompt).toBe("object");
+    expect(typeof captured.prompt?.[Symbol.asyncIterator]).toBe("function");
+
+    const emitted: any[] = [];
+    for await (const msg of captured.prompt) emitted.push(msg);
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0].type).toBe("user");
+    expect(emitted[0].message.role).toBe("user");
+    expect(emitted[0].message.content).toBe(blocks);
   });
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from "vitest";
-import { createTestDb } from "../helpers.js";
+import { createTestDb, seedActiveKey } from "../helpers.js";
 import { setDb, type FlockctlDb } from "../../db/index.js";
 import { workspaces, projects } from "../../db/schema.js";
 import Database from "better-sqlite3";
@@ -7,18 +7,31 @@ import { mkdtempSync, rmSync, mkdirSync, existsSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 
-// Mock child_process.execSync to simulate git clone outcomes
+// Mock child_process — `git clone` went to execFileSync (no shell) as part
+// of a security fix. Tests still key off "git clone" strings for
+// readability, so execFileSync forwards to the execSync mock implementation.
 vi.mock("child_process", async () => {
   const actual = await vi.importActual<any>("child_process");
-  return { ...actual, execSync: vi.fn(actual.execSync) };
+  return {
+    ...actual,
+    execSync: vi.fn(actual.execSync),
+    execFileSync: vi.fn((file: string, args: readonly string[], opts: unknown) => {
+      const rebuiltCmd = `${file} ${args.join(" ")}`;
+      const mocked = (execSync as unknown as { getMockImplementation?: () => ((cmd: string) => unknown) | undefined });
+      const impl = mocked.getMockImplementation?.();
+      if (impl) return impl(rebuiltCmd);
+      return actual.execFileSync(file, args, opts);
+    }),
+  };
 });
 
 import { app } from "../../server.js";
-import { execSync } from "child_process";
+import { execSync, execFileSync } from "child_process";
 
 let db: FlockctlDb;
 let sqlite: Database.Database;
 let tempDir: string;
+let keyId: number;
 
 beforeAll(() => {
   const t = createTestDb();
@@ -26,6 +39,8 @@ beforeAll(() => {
   sqlite = t.sqlite;
   setDb(db, sqlite);
   tempDir = mkdtempSync(join(tmpdir(), "flockctl-wsx-"));
+  // Seeded once: POST /workspaces now requires a non-empty allowedKeyIds.
+  keyId = seedActiveKey(sqlite);
 });
 
 afterAll(() => {
@@ -58,12 +73,16 @@ describe("Workspaces — git clone path", () => {
         name: "cloned-ws",
         path: wsPath,
         repoUrl: "https://example.com/repo.git",
+        allowedKeyIds: [keyId],
       }),
     });
 
     expect(res.status).toBe(201);
-    expect(execSync).toHaveBeenCalled();
-    const cloneCall = (execSync as any).mock.calls.find((c: any[]) => c[0].includes("git clone"));
+    // `git clone` now routes through execFileSync (no shell) — check the
+    // file-exec spy instead of execSync. Other git commands (init,
+    // remote get-url) still use execSync.
+    const execFileCalls = (execFileSync as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+    const cloneCall = execFileCalls.find((c) => c[0] === "git" && Array.isArray(c[1]) && (c[1] as string[]).includes("clone"));
     expect(cloneCall).toBeTruthy();
   });
 
@@ -79,6 +98,7 @@ describe("Workspaces — git clone path", () => {
         name: "dup-ws",
         path: wsPath,
         repoUrl: "https://example.com/repo.git",
+        allowedKeyIds: [keyId],
       }),
     });
 
@@ -102,6 +122,7 @@ describe("Workspaces — git clone path", () => {
         name: "bad-ws",
         path: wsPath,
         repoUrl: "https://invalid.example/repo.git",
+        allowedKeyIds: [keyId],
       }),
     });
 
@@ -164,7 +185,7 @@ describe("Workspaces — dashboard with no projects", () => {
 });
 
 describe("Workspaces — PATCH allowedKeyIds", () => {
-  it("serializes array to JSON on PATCH, nulls when empty/null", async () => {
+  it("accepts a non-empty array of active keys and persists it", async () => {
     const wsPath = mkdtempSync(join(tempDir, "ws-keys-"));
     const ws = db.insert(workspaces).values({
       name: "keys-ws", path: wsPath,
@@ -173,19 +194,73 @@ describe("Workspaces — PATCH allowedKeyIds", () => {
     const res = await app.request(`/workspaces/${ws.id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ allowedKeyIds: [1, 2, 3] }),
+      body: JSON.stringify({ allowedKeyIds: [keyId] }),
     });
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.allowedKeyIds).toBe("[1,2,3]");
+    expect(body.allowedKeyIds).toBe(JSON.stringify([keyId]));
+  });
 
-    const res2 = await app.request(`/workspaces/${ws.id}`, {
+  it("rejects null — clearing the allow-list is no longer permitted", async () => {
+    const wsPath = mkdtempSync(join(tempDir, "ws-keys-null-"));
+    const ws = db.insert(workspaces).values({
+      name: "keys-null-ws", path: wsPath,
+      allowedKeyIds: JSON.stringify([keyId]),
+    }).returning().get()!;
+
+    const res = await app.request(`/workspaces/${ws.id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ allowedKeyIds: null }),
     });
-    const body2 = await res2.json();
-    expect(body2.allowedKeyIds).toBeNull();
+    expect(res.status).toBe(422);
+  });
+
+  it("rejects an empty array", async () => {
+    const wsPath = mkdtempSync(join(tempDir, "ws-keys-empty-"));
+    const ws = db.insert(workspaces).values({
+      name: "keys-empty-ws", path: wsPath,
+      allowedKeyIds: JSON.stringify([keyId]),
+    }).returning().get()!;
+
+    const res = await app.request(`/workspaces/${ws.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ allowedKeyIds: [] }),
+    });
+    expect(res.status).toBe(422);
+  });
+
+  it("rejects unknown key IDs", async () => {
+    const wsPath = mkdtempSync(join(tempDir, "ws-keys-unknown-"));
+    const ws = db.insert(workspaces).values({
+      name: "keys-unknown-ws", path: wsPath,
+    }).returning().get()!;
+
+    const res = await app.request(`/workspaces/${ws.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ allowedKeyIds: [99999] }),
+    });
+    expect(res.status).toBe(422);
+  });
+
+  it("leaves the allow-list untouched when field is omitted", async () => {
+    const wsPath = mkdtempSync(join(tempDir, "ws-keys-omit-"));
+    const ws = db.insert(workspaces).values({
+      name: "keys-omit-ws", path: wsPath,
+      allowedKeyIds: JSON.stringify([keyId]),
+    }).returning().get()!;
+
+    const res = await app.request(`/workspaces/${ws.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "renamed-only" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.name).toBe("renamed-only");
+    expect(body.allowedKeyIds).toBe(JSON.stringify([keyId]));
   });
 });
 

@@ -20,12 +20,22 @@ describe("Database connection", () => {
     expect(names).toContain("plan_slices");
     expect(names).toContain("plan_tasks");
     expect(names).toContain("task_logs");
-    expect(names).toContain("task_templates");
+    // task_templates is gone — templates now live on disk. See migration 0037.
+    expect(names).not.toContain("task_templates");
     expect(names).toContain("schedules");
     expect(names).toContain("chats");
     expect(names).toContain("chat_messages");
     expect(names).toContain("budget_limits");
     expect(names).toContain("secrets");
-    expect(names).toHaveLength(15);
+    expect(names).toContain("incidents");
+    expect(names).toContain("chat_attachments");
+    expect(names).toContain("chat_todos");
+    expect(names).toContain("agent_questions");
+    // FTS5 virtual table for incidents + its 4 shadow tables
+    // (incidents_fts_data / idx / docsize / config) are also registered
+    // as tables by SQLite. Total is 18 real + 1 virtual + 4 shadow = 23
+    // (task_templates was removed in migration 0037).
+    expect(names).toContain("incidents_fts");
+    expect(names).toHaveLength(23);
   });
 });

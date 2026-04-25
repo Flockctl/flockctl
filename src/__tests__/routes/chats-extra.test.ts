@@ -12,7 +12,7 @@ import { tmpdir } from "os";
 const agentSessionCalls: Array<{ opts: any }> = [];
 
 // Mock AgentSession: on run() it emits text chunks then usage + session_id.
-vi.mock("../../services/agent-session", async () => {
+vi.mock("../../services/agent-session/index", async () => {
   const { EventEmitter } = await import("events");
   class MockAgentSession extends EventEmitter {
     opts: any;
@@ -35,6 +35,8 @@ vi.mock("../../services/agent-session", async () => {
     }
     abort() { /* no-op */ }
     resolvePermission() { return false; }
+    updatePermissionMode = vi.fn();
+    pendingPermissionCount = 0;
   }
   return { AgentSession: MockAgentSession };
 });
@@ -48,7 +50,7 @@ vi.mock("../../services/agents/registry", () => ({
 }));
 
 // Mock ai-client — not used by PATCH
-vi.mock("../../services/ai-client", () => ({
+vi.mock("../../services/ai/client", () => ({
   createAIClient: vi.fn().mockReturnValue({
     chat: vi.fn().mockResolvedValue({
       text: "non-stream response",
@@ -58,7 +60,7 @@ vi.mock("../../services/ai-client", () => ({
 }));
 
 // Mock claude-cli so any legacy imports resolve without spawning processes.
-vi.mock("../../services/claude-cli", () => ({
+vi.mock("../../services/claude/cli", () => ({
   streamViaClaudeAgentSDK: vi.fn(),
   renameClaudeSession: vi.fn(() => Promise.resolve()),
   resolveModelId: vi.fn((m: string) => m),
@@ -137,6 +139,174 @@ describe("Chats — PATCH /chats/:id", () => {
       body: JSON.stringify({ title: "X" }),
     });
     expect(res.status).toBe(404);
+  });
+
+  // Variant B — live permission-mode propagation from PATCH to the running
+  // AgentSession. The DB column is always updated; the session mutation is
+  // only triggered when a session is in-flight for this chat. We assert
+  // both: DB persistence (visible in the response) AND the executor call.
+  it("PATCH permission_mode propagates to running session (variant B)", async () => {
+    const chat = testDb.db.insert(chats).values({ projectId, permissionMode: "default" }).returning().get()!;
+
+    // Register a fake session in the executor so `chatExecutor.isRunning(id)`
+    // is true when the PATCH handler runs.
+    const { chatExecutor } = await import("../../services/chat-executor.js");
+    const { EventEmitter } = await import("events");
+    class Fake extends EventEmitter {
+      abort = vi.fn();
+      resolvePermission = vi.fn();
+      updatePermissionMode = vi.fn();
+      pendingPermissionCount = 0;
+    }
+    const fake = new Fake();
+    chatExecutor.register(chat.id, fake as any);
+
+    try {
+      const res = await app.request(`/chats/${chat.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ permission_mode: "bypassPermissions" }),
+      });
+      expect(res.status).toBe(200);
+      const updated = await res.json();
+      expect(updated.permissionMode).toBe("bypassPermissions");
+
+      // Effective mode for a chat with explicit value = the value itself.
+      expect(fake.updatePermissionMode).toHaveBeenCalledWith("bypassPermissions");
+    } finally {
+      chatExecutor.unregister(chat.id);
+    }
+  });
+
+  // Pin toggle — boolean-only so a stray string can't silently pin. Default
+  // is `false` on create (no backfill needed — migration sets the column
+  // default to 0) and the PATCH flips either direction.
+  it("PATCH pinned=true sets pinned on the chat row", async () => {
+    const chat = testDb.db.insert(chats).values({ projectId, title: "Pin me" }).returning().get()!;
+    expect(chat.pinned).toBe(false);
+
+    const res = await app.request(`/chats/${chat.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pinned: true }),
+    });
+    expect(res.status).toBe(200);
+    const updated = await res.json();
+    expect(updated.pinned).toBe(true);
+  });
+
+  it("PATCH pinned=false unpins a pinned chat", async () => {
+    const chat = testDb.db.insert(chats).values({ projectId, title: "Already pinned", pinned: true }).returning().get()!;
+    expect(chat.pinned).toBe(true);
+
+    const res = await app.request(`/chats/${chat.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pinned: false }),
+    });
+    expect(res.status).toBe(200);
+    const updated = await res.json();
+    expect(updated.pinned).toBe(false);
+  });
+
+  it("PATCH pinned rejects non-boolean payloads", async () => {
+    const chat = testDb.db.insert(chats).values({ projectId }).returning().get()!;
+    const res = await app.request(`/chats/${chat.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pinned: "true" }),
+    });
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.error).toMatch(/pinned must be a boolean/);
+  });
+
+  it("PATCH permission_mode=null falls back to resolver default (auto) for live session", async () => {
+    const chat = testDb.db.insert(chats).values({ projectId, permissionMode: "bypassPermissions" }).returning().get()!;
+
+    const { chatExecutor } = await import("../../services/chat-executor.js");
+    const { EventEmitter } = await import("events");
+    class Fake extends EventEmitter {
+      abort = vi.fn();
+      resolvePermission = vi.fn();
+      updatePermissionMode = vi.fn();
+      pendingPermissionCount = 0;
+    }
+    const fake = new Fake();
+    chatExecutor.register(chat.id, fake as any);
+
+    try {
+      const res = await app.request(`/chats/${chat.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ permission_mode: null }),
+      });
+      expect(res.status).toBe(200);
+      const updated = await res.json();
+      expect(updated.permissionMode).toBeNull();
+
+      // No project/workspace override in this test fixture → resolver fallback = "auto".
+      expect(fake.updatePermissionMode).toHaveBeenCalledWith("auto");
+    } finally {
+      chatExecutor.unregister(chat.id);
+    }
+  });
+});
+
+// Pin ordering + filter interaction. Backend sorts by
+// `(pinned DESC, created_at DESC)` AFTER applying filters — so pinned rows
+// must float to the top inside the filtered bucket, and a pinned chat that
+// doesn't match the filter must still be excluded.
+describe("Chats — GET /chats pin ordering and filters", () => {
+  let testDb: ReturnType<typeof createTestDb>;
+  let pinProjectId: number;
+  let otherProjectId: number;
+
+  beforeAll(() => {
+    testDb = createTestDb();
+    setDb(testDb.db, testDb.sqlite);
+    pinProjectId = testDb.db.insert(projects).values({ name: "Pin Proj" }).returning().get()!.id;
+    otherProjectId = testDb.db.insert(projects).values({ name: "Other Proj" }).returning().get()!.id;
+
+    // Seed order (creation timestamp increases with each insert):
+    //   #1 pin-proj, unpinned, oldest
+    //   #2 pin-proj, unpinned, newer
+    //   #3 pin-proj, pinned  <-- should jump to top when filtering by pin-proj
+    //   #4 other-proj, pinned <-- must NOT appear in pin-proj filter
+    testDb.db.insert(chats).values({ projectId: pinProjectId, title: "A-oldest" }).run();
+    testDb.db.insert(chats).values({ projectId: pinProjectId, title: "B-newer" }).run();
+    testDb.db.insert(chats).values({ projectId: pinProjectId, title: "C-pinned", pinned: true }).run();
+    testDb.db.insert(chats).values({ projectId: otherProjectId, title: "D-other-pinned", pinned: true }).run();
+  });
+
+  afterAll(() => testDb.sqlite.close());
+
+  it("pinned chats float to the top of the filtered set", async () => {
+    const res = await app.request(`/chats?project_id=${pinProjectId}`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const titles: string[] = body.items.map((c: any) => c.title);
+    // Pin-proj returns exactly its 3 chats. `D-other-pinned` is pinned but
+    // belongs to the other project — it must not leak into this bucket.
+    expect(titles).toHaveLength(3);
+    expect(new Set(titles)).toEqual(new Set(["A-oldest", "B-newer", "C-pinned"]));
+    // Pin invariant: the pinned chat is strictly above every unpinned chat.
+    // Relative order among unpinned rows is not asserted — SQLite's
+    // `datetime('now')` has second precision so two rapid inserts tie on
+    // `created_at` and the tie-break is not what this test is about.
+    expect(titles[0]).toBe("C-pinned");
+    expect(body.items[0].pinned).toBe(true);
+    expect(body.items.slice(1).every((c: any) => c.pinned === false)).toBe(true);
+    expect(body.items.every((c: any) => c.projectId === pinProjectId)).toBe(true);
+  });
+
+  it("filter excludes pinned chats from other projects", async () => {
+    const res = await app.request(`/chats?project_id=${otherProjectId}`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.items.length).toBe(1);
+    expect(body.items[0].title).toBe("D-other-pinned");
+    expect(body.items[0].pinned).toBe(true);
   });
 });
 
@@ -225,7 +395,7 @@ describe("Chats — POST /chats/:id/messages/stream (SSE)", () => {
   });
 
   it("uses project model when chat is tied to a project with model", async () => {
-    writeFileSync(join(projectPath, ".flockctl", "config.yaml"), "model: claude-opus-4-7\n");
+    writeFileSync(join(projectPath, ".flockctl", "config.json"), JSON.stringify({ model: "claude-opus-4-7" }));
     agentSessionCalls.length = 0;
 
     const chat = testDb.db.insert(chats).values({ projectId }).returning().get()!;
@@ -260,5 +430,143 @@ describe("Chats — POST /chats/:id/messages/stream (SSE)", () => {
 
     // System prompt should contain entity info
     expect(agentSessionCalls[0].opts.systemPromptOverride).toBeTruthy();
+  });
+});
+
+// POST /chats/:id/{approve,reject} — symmetric with task approvals.
+// The routes gate on `approval_status = 'pending'`, flip the column to
+// approved|rejected, and fire `attention_changed`. No-op side-effects on the
+// session itself — chats have no terminal `status` equivalent to tasks.
+describe("Chats — POST /chats/:id/approve|reject", () => {
+  let testDb: ReturnType<typeof createTestDb>;
+  let projectId: number;
+
+  beforeAll(() => {
+    testDb = createTestDb();
+    setDb(testDb.db, testDb.sqlite);
+    const p = testDb.db.insert(projects).values({ name: "Chat Approve Proj" }).returning().get()!;
+    projectId = p.id;
+  });
+
+  afterAll(() => testDb.sqlite.close());
+
+  it("approves a chat in approval_status='pending'", async () => {
+    const chat = testDb.db
+      .insert(chats)
+      .values({ projectId, requiresApproval: true, approvalStatus: "pending" })
+      .returning()
+      .get()!;
+    const res = await app.request(`/chats/${chat.id}/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note: "looks good" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true);
+
+    const after = testDb.db.select().from(chats).where(eq(chats.id, chat.id)).get()!;
+    expect(after.approvalStatus).toBe("approved");
+    expect(after.approvalNote).toBe("looks good");
+    expect(after.approvedAt).toBeTruthy();
+  });
+
+  it("rejects a chat in approval_status='pending'", async () => {
+    const chat = testDb.db
+      .insert(chats)
+      .values({ projectId, requiresApproval: true, approvalStatus: "pending" })
+      .returning()
+      .get()!;
+    const res = await app.request(`/chats/${chat.id}/reject`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note: "not yet" }),
+    });
+    expect(res.status).toBe(200);
+
+    const after = testDb.db.select().from(chats).where(eq(chats.id, chat.id)).get()!;
+    expect(after.approvalStatus).toBe("rejected");
+    expect(after.approvalNote).toBe("not yet");
+  });
+
+  it("accepts an empty JSON body (note becomes null)", async () => {
+    const chat = testDb.db
+      .insert(chats)
+      .values({ projectId, requiresApproval: true, approvalStatus: "pending" })
+      .returning()
+      .get()!;
+    const res = await app.request(`/chats/${chat.id}/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "",
+    });
+    expect(res.status).toBe(200);
+    const after = testDb.db.select().from(chats).where(eq(chats.id, chat.id)).get()!;
+    expect(after.approvalStatus).toBe("approved");
+    expect(after.approvalNote).toBeNull();
+  });
+
+  it("returns 404 when the chat does not exist", async () => {
+    const res = await app.request(`/chats/99999/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("returns 422 when approval_status is null (never entered pending)", async () => {
+    const chat = testDb.db
+      .insert(chats)
+      .values({ projectId, requiresApproval: true })
+      .returning()
+      .get()!;
+    const res = await app.request(`/chats/${chat.id}/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(422);
+  });
+
+  it("returns 422 when approval_status is already 'approved' (no double-approve)", async () => {
+    const chat = testDb.db
+      .insert(chats)
+      .values({ projectId, requiresApproval: true, approvalStatus: "approved" })
+      .returning()
+      .get()!;
+    const res = await app.request(`/chats/${chat.id}/reject`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(422);
+  });
+
+  // Mirror of the approve-side branch tests to exercise the reject handler's
+  // NotFound (line 145) and the approvalStatus-null message fallback (line 148).
+  it("reject returns 404 when the chat does not exist", async () => {
+    const res = await app.request(`/chats/99999/reject`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("reject returns 422 when approval_status is null (exercises `?? 'null'` message fallback)", async () => {
+    const chat = testDb.db
+      .insert(chats)
+      .values({ projectId, requiresApproval: true })
+      .returning()
+      .get()!;
+    const res = await app.request(`/chats/${chat.id}/reject`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.error).toMatch(/approval_status='null'/);
   });
 });

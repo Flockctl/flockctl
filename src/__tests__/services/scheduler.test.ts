@@ -1,23 +1,36 @@
-import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from "vitest";
-import { createTestDb } from "../helpers.js";
-import { setDb, getDb, type FlockctlDb } from "../../db/index.js";
-import { schedules, taskTemplates, tasks, projects } from "../../db/schema.js";
+import { describe, it, expect, beforeAll, afterAll, afterEach, beforeEach } from "vitest";
+import { mkdtempSync, rmSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
+import { createTestDb, createTestTemplate } from "../helpers.js";
+import { setDb, type FlockctlDb } from "../../db/index.js";
+import { schedules } from "../../db/schema.js";
+import { eq } from "drizzle-orm";
 import Database from "better-sqlite3";
 import { SchedulerService } from "../../services/scheduler.js";
 
 let db: FlockctlDb;
 let sqlite: Database.Database;
 let scheduler: SchedulerService;
+let homeDir: string;
+let origHome: string | undefined;
 
 beforeAll(() => {
   const t = createTestDb();
   db = t.db;
   sqlite = t.sqlite;
   setDb(db, sqlite);
+
+  origHome = process.env.FLOCKCTL_HOME;
+  homeDir = mkdtempSync(join(tmpdir(), "flockctl-scheduler-"));
+  process.env.FLOCKCTL_HOME = homeDir;
 });
 
 afterAll(() => {
   sqlite.close();
+  if (origHome === undefined) delete process.env.FLOCKCTL_HOME;
+  else process.env.FLOCKCTL_HOME = origHome;
+  rmSync(homeDir, { recursive: true, force: true });
 });
 
 beforeEach(() => {
@@ -27,8 +40,6 @@ beforeEach(() => {
 afterEach(() => {
   scheduler.stopAll();
 });
-
-import { afterEach } from "vitest";
 
 describe("SchedulerService", () => {
   it("schedule() throws for invalid cron expression", () => {
@@ -55,16 +66,10 @@ describe("SchedulerService", () => {
   });
 
   it("pause() updates DB status to paused", () => {
-    // Create a template and schedule in DB
-    const proj = db.insert(projects).values({ name: "sched-proj" }).returning().get();
-    const tmpl = db.insert(taskTemplates).values({
-      projectId: proj!.id,
-      name: "tmpl1",
-      prompt: "do stuff",
-    }).returning().get();
-
+    const ref = createTestTemplate({ name: "tmpl1", prompt: "do stuff" });
     const sched = db.insert(schedules).values({
-      templateId: tmpl!.id,
+      templateScope: ref.templateScope,
+      templateName: ref.templateName,
       scheduleType: "cron",
       cronExpression: "*/10 * * * *",
       status: "active",
@@ -73,20 +78,15 @@ describe("SchedulerService", () => {
     scheduler.schedule(sched!.id, "*/10 * * * *");
     scheduler.pause(sched!.id);
 
-    const updated = db.select().from(schedules).where(require("drizzle-orm").eq(schedules.id, sched!.id)).get();
+    const updated = db.select().from(schedules).where(eq(schedules.id, sched!.id)).get();
     expect(updated!.status).toBe("paused");
   });
 
   it("resume() updates DB status to active", () => {
-    const proj = db.insert(projects).values({ name: "sched-proj-2" }).returning().get();
-    const tmpl = db.insert(taskTemplates).values({
-      projectId: proj!.id,
-      name: "tmpl2",
-      prompt: "do more",
-    }).returning().get();
-
+    const ref = createTestTemplate({ name: "tmpl2", prompt: "do more" });
     const sched = db.insert(schedules).values({
-      templateId: tmpl!.id,
+      templateScope: ref.templateScope,
+      templateName: ref.templateName,
       scheduleType: "cron",
       cronExpression: "0 12 * * *",
       status: "paused",
@@ -94,27 +94,24 @@ describe("SchedulerService", () => {
 
     scheduler.resume(sched!.id);
 
-    const updated = db.select().from(schedules).where(require("drizzle-orm").eq(schedules.id, sched!.id)).get();
+    const updated = db.select().from(schedules).where(eq(schedules.id, sched!.id)).get();
     expect(updated!.status).toBe("active");
   });
 
   it("loadExistingSchedules() loads active schedules from DB", () => {
-    const proj = db.insert(projects).values({ name: "sched-proj-3" }).returning().get();
-    const tmpl = db.insert(taskTemplates).values({
-      projectId: proj!.id,
-      name: "tmpl3",
-      prompt: "test",
-    }).returning().get();
+    const ref = createTestTemplate({ name: "tmpl3", prompt: "test" });
 
     db.insert(schedules).values({
-      templateId: tmpl!.id,
+      templateScope: ref.templateScope,
+      templateName: ref.templateName,
       scheduleType: "cron",
       cronExpression: "0 0 * * *",
       status: "active",
     }).run();
 
     db.insert(schedules).values({
-      templateId: tmpl!.id,
+      templateScope: ref.templateScope,
+      templateName: ref.templateName,
       scheduleType: "cron",
       cronExpression: "0 6 * * *",
       status: "paused",

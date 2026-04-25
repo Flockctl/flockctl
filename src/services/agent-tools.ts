@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSy
 import { join, resolve, dirname, relative } from "path";
 import { execSync, execFileSync } from "child_process";
 import { globSync } from "glob";
-import { getFlockctlHome } from "../config.js";
+import { getFlockctlHome } from "../config/index.js";
 
 // Dangerous commands that could escape sandbox or damage the system
 const BLOCKED_PATTERNS = [
@@ -26,6 +26,16 @@ function isCommandBlocked(command: string): string | null {
   }
   return null;
 }
+
+// Input schema for the AskUserQuestion tool. Exported so the session
+// interception layer can reuse it for validation.
+export const askUserQuestionInputSchema = {
+  type: "object" as const,
+  properties: {
+    question: { type: "string" as const, maxLength: 2000 },
+  },
+  required: ["question"],
+};
 
 // Tool definitions for Anthropic API (tool_use)
 export function getAgentTools(workingDir?: string) {
@@ -151,6 +161,11 @@ export function getAgentTools(workingDir?: string) {
         required: ["path"],
       },
     },
+    {
+      name: "AskUserQuestion",
+      description: "Ask the user an open-ended clarification question that cannot be answered by calling another tool. Use sparingly — only when progress is blocked on information only the user can provide.",
+      input_schema: askUserQuestionInputSchema,
+    },
   ];
 }
 
@@ -237,6 +252,8 @@ export function executeToolCall(
         return result || "(no output)";
       } catch (e: any) {
         const output = [e.stdout, e.stderr].filter(Boolean).join("\n");
+        /* v8 ignore next — execFileSync's thrown error always carries a
+           numeric `status`; the ?? 1 fallback is TS glue only. */
         return `Exit code ${e.status ?? 1}\n${output}`;
       }
     }
@@ -249,6 +266,8 @@ export function executeToolCall(
         const result = execFileSync("grep", args, {
           cwd, encoding: "utf-8", timeout: 30_000, stdio: ["pipe", "pipe", "pipe"],
         });
+        /* v8 ignore next — grep exits non-zero (→ catch below) when there
+           are no matches; the empty-string truthy fallback here is defensive. */
         return result || "No matches found";
       } catch (e: any) {
         if (e.status === 1) return "No matches found";
@@ -276,6 +295,11 @@ export function executeToolCall(
           return e;
         }
       }).join("\n") || "(empty directory)";
+    }
+    case "AskUserQuestion": {
+      // No-op placeholder — the real routing happens in agent-session before
+      // a tool_use for AskUserQuestion ever reaches this executor.
+      throw new Error("AskUserQuestion must be handled by the session, not the tool executor");
     }
     case "Delete": {
       const abs = safePath(input.path);

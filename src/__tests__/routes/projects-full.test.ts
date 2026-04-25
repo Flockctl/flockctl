@@ -1,18 +1,27 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from "vitest";
-import { createTestDb } from "../helpers.js";
+import { createTestDb, seedActiveKey } from "../helpers.js";
 import { setDb, type FlockctlDb } from "../../db/index.js";
 import { projects, workspaces } from "../../db/schema.js";
 import Database from "better-sqlite3";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
-import { createMilestone, createSlice } from "../../services/plan-store.js";
+import { createMilestone, createSlice } from "../../services/plan-store/index.js";
 
 vi.mock("child_process", async () => {
   const actual = await vi.importActual<any>("child_process");
   return {
     ...actual,
     execSync: vi.fn(actual.execSync),
+    // `git clone` now uses execFileSync (no shell); tests still drive it
+    // through the execSync mock by forwarding stubbed impls — matches the
+    // prior behavior of asserting on the "clone" argv.
+    execFileSync: vi.fn((file: string, args: readonly string[], opts: unknown) => {
+      const fake = (execSync as unknown as { getMockImplementation?: () => (cmd: string) => unknown })
+        .getMockImplementation?.();
+      const rebuiltCmd = `${file} ${args.join(" ")}`;
+      return fake ? fake(rebuiltCmd) : actual.execFileSync(file, args, opts);
+    }),
   };
 });
 
@@ -22,6 +31,7 @@ import { execSync } from "child_process";
 let db: FlockctlDb;
 let sqlite: Database.Database;
 let tempDir: string;
+let keyId: number;
 
 beforeAll(() => {
   const t = createTestDb();
@@ -29,6 +39,9 @@ beforeAll(() => {
   sqlite = t.sqlite;
   setDb(db, sqlite);
   tempDir = mkdtempSync(join(tmpdir(), "flockctl-projfull-"));
+  // POST /projects requires a non-empty allowedKeyIds; seed once so every
+  // test can reference the same key.
+  keyId = seedActiveKey(sqlite);
 });
 
 afterAll(() => {
@@ -55,7 +68,7 @@ describe("projects — POST derives path from workspace", () => {
     const res = await app.request("/projects", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "Derived Name", workspaceId: ws.id }),
+      body: JSON.stringify({ name: "Derived Name", workspaceId: ws.id, allowedKeyIds: [keyId] }),
     });
 
     expect(res.status).toBe(201);
@@ -68,7 +81,7 @@ describe("projects — POST derives path from workspace", () => {
     const res = await app.request("/projects", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "Solo Project" }),
+      body: JSON.stringify({ name: "Solo Project", allowedKeyIds: [keyId] }),
     });
     expect(res.status).toBe(201);
     const body = await res.json();
@@ -89,7 +102,7 @@ describe("projects — POST with existing directory", () => {
     const res = await app.request("/projects", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "proj-with-git", path: projPath }),
+      body: JSON.stringify({ name: "proj-with-git", path: projPath, allowedKeyIds: [keyId] }),
     });
     expect(res.status).toBe(201);
     const body = await res.json();
@@ -105,7 +118,7 @@ describe("projects — POST with existing directory", () => {
     const res = await app.request("/projects", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "proj-no-origin", path: projPath }),
+      body: JSON.stringify({ name: "proj-no-origin", path: projPath, allowedKeyIds: [keyId] }),
     });
     expect(res.status).toBe(201);
     const body = await res.json();
@@ -122,7 +135,7 @@ describe("projects — POST with existing directory", () => {
     const res = await app.request("/projects", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "proj-no-git", path: projPath }),
+      body: JSON.stringify({ name: "proj-no-git", path: projPath, allowedKeyIds: [keyId] }),
     });
     expect(res.status).toBe(201);
   });
@@ -136,6 +149,7 @@ describe("projects — POST with existing directory", () => {
       body: JSON.stringify({
         name: "pm-proj", path: projPath,
         permissionMode: "bypassPermissions",
+        allowedKeyIds: [keyId],
       }),
     });
     expect(res.status).toBe(201);
@@ -161,6 +175,7 @@ describe("projects — POST with repoUrl (git clone)", () => {
         name: "Clash",
         workspaceId: ws.id,
         repoUrl: "https://github.com/foo/bar.git",
+        allowedKeyIds: [keyId],
       }),
     });
     expect(res.status).toBe(422);
@@ -185,6 +200,7 @@ describe("projects — POST with repoUrl (git clone)", () => {
         name: "NotFound",
         workspaceId: ws.id,
         repoUrl: "https://example.com/missing.git",
+        allowedKeyIds: [keyId],
       }),
     });
     expect(res.status).toBe(422);
@@ -205,6 +221,7 @@ describe("projects — POST with repoUrl (git clone)", () => {
         name: "Cloned",
         workspaceId: ws.id,
         repoUrl: "https://github.com/x/y.git",
+        allowedKeyIds: [keyId],
       }),
     });
     expect(res.status).toBe(201);
@@ -239,68 +256,103 @@ describe("projects — stats with filesystem data", () => {
   });
 });
 
-describe("projects — agents-md endpoints", () => {
-  it("GET returns {source:'', effective:''} when project has no path", async () => {
-    const proj = db.insert(projects).values({ name: "no-path-proj" }).returning().get()!;
-    const res = await app.request(`/projects/${proj.id}/agents-md`);
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.source).toBe("");
-    expect(body.effective).toBe("");
+// NOTE: GET/PUT /projects/:id/agents-md coverage lives in
+// src/__tests__/routes/agents-md.test.ts — the endpoint now returns a
+// per-layer shape (`{layers: {"project-public", "project-private"}}`) and
+// the PUT body takes a `{layer, content}` pair.
+
+describe("projects — TODO.md endpoints", () => {
+  it("POST /projects seeds a TODO.md at the project root", async () => {
+    const projPath = mkdtempSync(join(tempDir, "proj-todo-seed-"));
+    const res = await app.request("/projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "todo-seed", path: projPath, allowedKeyIds: [keyId] }),
+    });
+    expect(res.status).toBe(201);
+    const todoPath = join(projPath, "TODO.md");
+    expect(existsSync(todoPath)).toBe(true);
+    expect(readFileSync(todoPath, "utf-8")).toContain("# TODO");
   });
 
-  it("GET reads .flockctl/AGENTS.md and root AGENTS.md", async () => {
-    const projPath = mkdtempSync(join(tempDir, "proj-md-"));
-    mkdirSync(join(projPath, ".flockctl"), { recursive: true });
-    writeFileSync(join(projPath, ".flockctl", "AGENTS.md"), "source body");
-    writeFileSync(join(projPath, "AGENTS.md"), "effective body");
-    const proj = db.insert(projects).values({ name: "md-proj", path: projPath }).returning().get()!;
-
-    const res = await app.request(`/projects/${proj.id}/agents-md`);
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.source).toContain("source body");
-    expect(body.effective).toContain("effective body");
+  it("POST /projects does not overwrite existing TODO.md", async () => {
+    const projPath = mkdtempSync(join(tempDir, "proj-todo-keep-"));
+    writeFileSync(join(projPath, "TODO.md"), "existing body");
+    const res = await app.request("/projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "todo-keep", path: projPath, allowedKeyIds: [keyId] }),
+    });
+    expect(res.status).toBe(201);
+    expect(readFileSync(join(projPath, "TODO.md"), "utf-8")).toBe("existing body");
   });
 
-  it("GET 404 when project missing", async () => {
-    const res = await app.request(`/projects/99999/agents-md`);
+  it("GET /projects/:id/todo returns empty shape when project has no path", async () => {
+    const proj = db.insert(projects).values({ name: "todo-no-path" }).returning().get()!;
+    const res = await app.request(`/projects/${proj.id}/todo`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.content).toBe("");
+    expect(body.path).toBe("");
+  });
+
+  it("GET /projects/:id/todo reads TODO.md from disk", async () => {
+    const projPath = mkdtempSync(join(tempDir, "proj-todo-read-"));
+    writeFileSync(join(projPath, "TODO.md"), "- [ ] item one");
+    const proj = db.insert(projects).values({ name: "todo-read", path: projPath }).returning().get()!;
+    const res = await app.request(`/projects/${proj.id}/todo`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.content).toBe("- [ ] item one");
+    expect(body.path).toBe(join(projPath, "TODO.md"));
+  });
+
+  it("GET /projects/:id/todo returns content:'' when file is absent", async () => {
+    const projPath = mkdtempSync(join(tempDir, "proj-todo-absent-"));
+    const proj = db.insert(projects).values({ name: "todo-absent", path: projPath }).returning().get()!;
+    const res = await app.request(`/projects/${proj.id}/todo`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.content).toBe("");
+    expect(body.path).toBe(join(projPath, "TODO.md"));
+  });
+
+  it("GET /projects/:id/todo 404 when project missing", async () => {
+    const res = await app.request(`/projects/99999/todo`);
     expect(res.status).toBe(404);
   });
 
-  it("PUT saves content and returns fresh source/effective", async () => {
-    const projPath = mkdtempSync(join(tempDir, "proj-md-put-"));
-    const proj = db.insert(projects).values({ name: "md-put-proj", path: projPath }).returning().get()!;
-
-    const res = await app.request(`/projects/${proj.id}/agents-md`, {
+  it("PUT /projects/:id/todo writes content and returns fresh body", async () => {
+    const projPath = mkdtempSync(join(tempDir, "proj-todo-put-"));
+    const proj = db.insert(projects).values({ name: "todo-put", path: projPath }).returning().get()!;
+    const res = await app.request(`/projects/${proj.id}/todo`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: "# My Project Agents" }),
+      body: JSON.stringify({ content: "# My TODO\n- [ ] a" }),
     });
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.source).toContain("# My Project Agents");
+    expect(body.content).toContain("My TODO");
+    expect(readFileSync(join(projPath, "TODO.md"), "utf-8")).toContain("My TODO");
   });
 
-  it("PUT coerces non-string content to ''", async () => {
-    const projPath = mkdtempSync(join(tempDir, "proj-md-nonstr-"));
-    const proj = db.insert(projects).values({ name: "md-nonstr", path: projPath }).returning().get()!;
-
-    const res = await app.request(`/projects/${proj.id}/agents-md`, {
+  it("PUT /projects/:id/todo coerces non-string content to ''", async () => {
+    const projPath = mkdtempSync(join(tempDir, "proj-todo-nonstr-"));
+    const proj = db.insert(projects).values({ name: "todo-nonstr", path: projPath }).returning().get()!;
+    const res = await app.request(`/projects/${proj.id}/todo`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content: 42 }),
     });
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.source).toBe("");
+    expect(body.content).toBe("");
   });
 
-  it("PUT rejects oversized content (>256KB)", async () => {
-    const projPath = mkdtempSync(join(tempDir, "proj-md-big-"));
-    const proj = db.insert(projects).values({ name: "md-big", path: projPath }).returning().get()!;
-
-    const res = await app.request(`/projects/${proj.id}/agents-md`, {
+  it("PUT /projects/:id/todo rejects oversized content (>256KB)", async () => {
+    const projPath = mkdtempSync(join(tempDir, "proj-todo-big-"));
+    const proj = db.insert(projects).values({ name: "todo-big", path: projPath }).returning().get()!;
+    const res = await app.request(`/projects/${proj.id}/todo`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content: "x".repeat(300_000) }),
@@ -308,23 +360,23 @@ describe("projects — agents-md endpoints", () => {
     expect(res.status).toBe(422);
   });
 
-  it("PUT 404 when project missing", async () => {
-    const res = await app.request(`/projects/99999/agents-md`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: "x" }),
-    });
-    expect(res.status).toBe(404);
-  });
-
-  it("PUT 422 when project has no path", async () => {
-    const proj = db.insert(projects).values({ name: "md-no-path" }).returning().get()!;
-    const res = await app.request(`/projects/${proj.id}/agents-md`, {
+  it("PUT /projects/:id/todo 422 when project has no path", async () => {
+    const proj = db.insert(projects).values({ name: "todo-no-path-put" }).returning().get()!;
+    const res = await app.request(`/projects/${proj.id}/todo`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content: "x" }),
     });
     expect(res.status).toBe(422);
+  });
+
+  it("PUT /projects/:id/todo 404 when project missing", async () => {
+    const res = await app.request(`/projects/99999/todo`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: "x" }),
+    });
+    expect(res.status).toBe(404);
   });
 });
 

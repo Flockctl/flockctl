@@ -1,0 +1,19 @@
+# Background task lifecycle: queued work runs, then resolves into one of
+# three terminal states (completed / failed / cancelled).
+states:
+  - pending
+  - running
+  - completed
+  - failed
+  - cancelled
+initial: pending
+transitions:
+  - { from: pending, to: running,   event: start }
+  - { from: pending, to: cancelled, event: cancel }
+  - { from: running, to: completed, event: finish }
+  - { from: running, to: failed,    event: error }
+  - { from: running, to: cancelled, event: cancel }
+final:
+  - completed
+  - failed
+  - cancelled

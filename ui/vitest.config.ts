@@ -15,5 +15,9 @@ export default defineConfig({
     setupFiles: ["./src/__tests__/setup.ts"],
     css: false,
     include: ["src/**/*.test.{ts,tsx}"],
+    // Keep the API base URL empty in tests so fetch-call assertions can
+    // compare against plain paths like `/mcp/projects/42/...` regardless of
+    // whether the code under test is using apiFetch or a raw fetch.
+    env: { VITE_API_URL: "" },
   },
 });

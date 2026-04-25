@@ -41,18 +41,39 @@ describe("Schema: insert/query for each table", () => {
     expect(rows[0].content).toBe("log line");
   });
 
-  it("inserts and queries task_templates", () => {
-    db.insert(schema.taskTemplates).values({ name: "tpl1", prompt: "Do X" }).run();
-    const rows = db.select().from(schema.taskTemplates).all();
-    expect(rows).toHaveLength(1);
-    expect(rows[0].name).toBe("tpl1");
-  });
-
-  it("inserts and queries schedules", () => {
-    db.insert(schema.schedules).values({ templateId: 1, scheduleType: "cron", cronExpression: "0 * * * *" }).run();
+  it("inserts and queries schedules (global scope)", () => {
+    db.insert(schema.schedules).values({
+      templateScope: "global",
+      templateName: "tpl1",
+      scheduleType: "cron",
+      cronExpression: "0 * * * *",
+    }).run();
     const rows = db.select().from(schema.schedules).all();
     expect(rows).toHaveLength(1);
     expect(rows[0].cronExpression).toBe("0 * * * *");
+    expect(rows[0].templateScope).toBe("global");
+    expect(rows[0].templateName).toBe("tpl1");
+  });
+
+  // Prove the CHECK constraint on schedules rejects inconsistent template
+  // scope + id combinations. Matches migration 0037 & schema.ts.
+  it("rejects schedule with scope=global but non-null workspace/project ids", () => {
+    expect(() => db.insert(schema.schedules).values({
+      templateScope: "global",
+      templateName: "bad",
+      templateWorkspaceId: 1,
+      scheduleType: "cron",
+      cronExpression: "0 * * * *",
+    }).run()).toThrow(/CHECK constraint/i);
+  });
+
+  it("rejects schedule with scope=project but null templateProjectId", () => {
+    expect(() => db.insert(schema.schedules).values({
+      templateScope: "project",
+      templateName: "bad",
+      scheduleType: "cron",
+      cronExpression: "0 * * * *",
+    }).run()).toThrow(/CHECK constraint/i);
   });
 
   it("inserts and queries chats", () => {

@@ -106,6 +106,29 @@ Keys live in the `ai_provider_keys` table as plaintext — acceptable for a user
 - Set on a **project** to override the workspace default.
 - Unset at both levels → every active key is eligible.
 
+## Secrets store
+
+Flockctl exposes a named key/value secrets store (scoped `global` / `workspace` / `project`) that MCP configs reference with `${secret:NAME}` placeholders. Values are encrypted at rest using AES-256-GCM; the 32-byte master key lives at `~/Flockctl/secret.key` (chmod `600`), and ciphertexts sit in the `secrets` table of `~/Flockctl/flockctl.db` as `base64(iv || authTag || ciphertext)`. Decryption therefore requires both the DB file **and** the master key file — backing up only one is not enough to recover values.
+
+### Plaintext exposure in `.mcp.json`
+
+Claude Code itself cannot expand `${secret:NAME}` placeholders, so Flockctl's MCP reconciler (`src/services/claude/mcp-sync.ts`) resolves secrets and writes the substituted values directly into `<project>/.mcp.json` — the file Claude Code actually reads. This file is therefore treated as confidential:
+
+1. It is **always gitignored** by `ensureGitignore()` (adds `.mcp.json` to `.gitignore` on every reconcile).
+2. The **source-of-truth configs** under `.flockctl/mcp/<server>.json` keep `${secret:NAME}` placeholders — those are the files agents and humans should edit.
+3. An **agent-tool denylist** (`denyIfTouchesSensitivePath` in `src/services/permission-resolver.ts`) blocks Read/Grep/Glob/LS/Write/Edit/MultiEdit/NotebookRead/NotebookEdit on:
+   - `<flockctlRoot>/secret.key`
+   - `<flockctlRoot>/flockctl.db`, `flockctl.db-wal`, `flockctl.db-shm`
+   - `<anyAllowedRoot>/.mcp.json`
+
+The denylist runs inside `canUseTool` **before** mode dispatch, so it applies even when the user has escalated to `bypassPermissions`, `acceptEdits`, or `plan`. To keep it effective, `bypassPermissions` is mapped to SDK `permissionMode: "default"` + an in-process allow short-circuit (instead of `allowDangerouslySkipPermissions: true`, which would make the SDK skip `canUseTool` entirely).
+
+### Known gaps
+
+- **`Bash` is not covered** by the denylist — reliable shell-command parsing is out of scope. In `auto` mode Bash always prompts, so exfiltration requires an explicit user approval; in `bypassPermissions`/`acceptEdits` a compromised agent can still `cat ~/Flockctl/secret.key`. Treat those modes as full-trust for the local user.
+- **Secrets appear in `env` only** during MCP spawn. If a user puts `${secret:NAME}` inside `command` / `args` / MCP-server URLs, substitution silently no-ops today — see `resolveServerSecrets`.
+- The **HTTP API** never returns decrypted values: `GET /secrets` lists names + metadata, there is no endpoint that returns `value_encrypted` decrypted. Remote agents driving the daemon see only names.
+
 ## Recommendations
 
 1. **Default to local mode.** If you can reach the daemon from `127.0.0.1`, stay there — the server enforces this by default.

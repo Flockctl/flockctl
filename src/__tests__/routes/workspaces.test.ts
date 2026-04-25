@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { app } from "../../server.js";
-import { createTestDb } from "../helpers.js";
+import { createTestDb, seedActiveKey } from "../helpers.js";
 import { setDb, type FlockctlDb } from "../../db/index.js";
 import Database from "better-sqlite3";
 import { mkdtempSync, rmSync } from "fs";
@@ -10,6 +10,7 @@ import { tmpdir } from "os";
 let db: FlockctlDb;
 let sqlite: Database.Database;
 let tempDir: string;
+let keyId: number;
 
 beforeAll(() => {
   const t = createTestDb();
@@ -17,6 +18,10 @@ beforeAll(() => {
   sqlite = t.sqlite;
   setDb(db, sqlite);
   tempDir = mkdtempSync(join(tmpdir(), "flockctl-ws-test-"));
+  // POST /workspaces and POST /workspaces/:id/projects now require at
+  // least one active AI-provider key in allowedKeyIds. See
+  // src/routes/_allowed-keys.ts for the exact contract.
+  keyId = seedActiveKey(sqlite);
 });
 
 afterAll(() => {
@@ -41,6 +46,7 @@ describe("Workspaces routes", () => {
         name: "Test Workspace",
         description: "A test workspace",
         path: wsPath,
+        allowedKeyIds: [keyId],
       }),
     });
     expect(res.status).toBe(201);
@@ -64,6 +70,7 @@ describe("Workspaces routes", () => {
       body: JSON.stringify({
         name: "my-project",
         description: "Test project",
+        allowedKeyIds: [keyId],
       }),
     });
     expect(res.status).toBe(201);

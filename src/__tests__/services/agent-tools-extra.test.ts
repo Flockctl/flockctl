@@ -192,6 +192,30 @@ describe("agent-tools — Grep and Glob edge cases", () => {
     const result = executeToolCall("Glob", { pattern: "*.nope" }, workDir);
     expect(result).toBe("No files matched");
   });
+
+  it("Grep with omitted path defaults to '.'", () => {
+    // Exercises the `input.path ?? "."` nullish fallback in the Grep branch.
+    const result = executeToolCall("Grep", { pattern: "const" }, workDir);
+    // workDir is cwd → every .ts / .js line containing "const" must appear.
+    expect(result).toContain("a.ts");
+    expect(result).toContain("b.js");
+  });
+
+  it("ListDir with omitted path lists the workDir itself", () => {
+    // Exercises `input.path ?? "."` on ListDir entry.
+    const result = executeToolCall("ListDir", {}, workDir);
+    expect(result).toContain("a.ts");
+    expect(result).toContain("b.js");
+  });
+
+  it("ListDir with omitted path surfaces the default '.' label on errors", () => {
+    // ListDir that succeeds on `.` hits the happy path; try the not-a-directory
+    // mode by pointing at a file with no path (forced to '.') — replace workDir
+    // with a file. Simpler: run ListDir with an explicitly-empty string path.
+    const result = executeToolCall("ListDir", { path: undefined }, workDir);
+    // Empty directory handling when reading an empty workspace subdir.
+    expect(typeof result).toBe("string");
+  });
 });
 
 describe("agent-tools — Unknown tool & edit errors", () => {

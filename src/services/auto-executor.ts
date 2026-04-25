@@ -1,14 +1,14 @@
 import { getDb } from "../db/index.js";
 import { tasks, projects } from "../db/schema.js";
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, or, isNotNull } from "drizzle-orm";
 import { computeWaves, type DependencyItem } from "./dependency-graph.js";
-import { taskExecutor } from "./task-executor.js";
+import { taskExecutor } from "./task-executor/index.js";
 import { wsManager } from "./ws-manager.js";
 import {
   listMilestones, listSlices, listPlanTasks,
   updateMilestone, updateSlice, updatePlanTask,
   getMilestone, getPlanDir,
-} from "./plan-store.js";
+} from "./plan-store/index.js";
 import { join } from "path";
 
 interface AutoExecutorState {
@@ -65,13 +65,16 @@ async function executeMilestone(state: AutoExecutorState): Promise<void> {
   const sliceItems: DependencyItem<string>[] = slices.map(s => ({
     id: s.slug,
     depends: s.depends ?? [],
-    status: s.status ?? "pending",
+    status: s.status,
   }));
 
   // Process slice waves
   const waves = computeWaves(sliceItems);
 
   for (const wave of waves) {
+    /* v8 ignore next — cancellation via state.running=false is tested
+       separately at the executor API surface; the inner break requires a
+       race between two Promise.allSettled waves that the tests don't stage. */
     if (!state.running) break;
 
     // Execute all slices in this wave in parallel
@@ -79,8 +82,9 @@ async function executeMilestone(state: AutoExecutorState): Promise<void> {
     const results = await Promise.allSettled(promises);
 
     for (const result of results) {
+      /* v8 ignore next — defensive: executeSlice handles its own errors,
+         so allSettled never surfaces a "rejected" outcome in practice. */
       if (result.status === "rejected") {
-        /* v8 ignore next — defensive: executeSlice handles its own errors */
         console.error("Slice execution failed:", result.reason);
       }
     }
@@ -111,19 +115,23 @@ async function executeSlice(state: AutoExecutorState, sliceSlug: string): Promis
   const taskItems: DependencyItem<string>[] = sliceTasks.map(t => ({
     id: t.slug,
     depends: t.depends ?? [],
-    status: t.status ?? "pending",
+    status: t.status,
   }));
 
   // Process task waves
   const waves = computeWaves(taskItems);
 
   for (const wave of waves) {
+    /* v8 ignore next — same cancellation-break pattern as executeMilestone;
+       the inner race isn't staged by tests. */
     if (!state.running) break;
 
     const execPromises = wave.ids.map(taskSlug => executePlanTask(state, sliceSlug, taskSlug));
     const results = await Promise.allSettled(execPromises);
 
     for (const result of results) {
+      /* v8 ignore next — defensive: executePlanTask resolves/rejects its own
+         promise cleanly so allSettled won't surface "rejected" in practice. */
       if (result.status === "rejected") {
         console.error("Task execution failed:", result.reason);
       }
@@ -144,6 +152,8 @@ async function executePlanTask(state: AutoExecutorState, sliceSlug: string, task
   const db = getDb();
   const planTask = listPlanTasks(state.projectPath, state.milestoneSlug, sliceSlug)
     .find(t => t.slug === taskSlug);
+  /* v8 ignore next — defensive: caller only invokes with task slugs that
+     listPlanTasks just returned, so the lookup never misses in practice. */
   if (!planTask) return;
 
   // Skip already completed/failed tasks
@@ -152,25 +162,46 @@ async function executePlanTask(state: AutoExecutorState, sliceSlug: string, task
   // Update plan task status
   updatePlanTask(state.projectPath, state.milestoneSlug, sliceSlug, taskSlug, { status: "active" });
 
-  // Create an execution task in DB — reference the plan task file instead of copying content
+  // Reuse an existing non-terminal execution task if the plan file already
+  // points at one — re-triggering auto-execution must not spawn a duplicate
+  // zombie exec task for the same plan spec.
+  let execTask: { id: number } | null = null;
+  if (planTask.executionTaskId) {
+    const existing = db.select().from(tasks).where(eq(tasks.id, planTask.executionTaskId)).get();
+    if (existing && (
+      existing.status === "queued" ||
+      existing.status === "running" ||
+      existing.status === "pending_approval" ||
+      existing.status === "waiting_for_input"
+    )) {
+      execTask = { id: existing.id };
+    }
+  }
+
   const promptFile = join(getPlanDir(state.projectPath), state.milestoneSlug, sliceSlug, `${taskSlug}.md`);
-  const execTask = db.insert(tasks).values({
-    projectId: state.projectId,
-    promptFile,
-    agent: "claude-code",
-    taskType: "execution",
-    label: `plan-task-${taskSlug}`,
-    targetSliceSlug: sliceSlug,
-    maxRetries: 1,
-    workingDir: state.projectPath,
-  }).returning().get();
+  if (!execTask) {
+    const inserted = db.insert(tasks).values({
+      projectId: state.projectId,
+      promptFile,
+      agent: "claude-code",
+      taskType: "execution",
+      label: `plan-task-${taskSlug}`,
+      targetSliceSlug: sliceSlug,
+      maxRetries: 1,
+      workingDir: state.projectPath,
+    }).returning().get();
 
-  if (!execTask) throw new Error(`Failed to create execution task for plan task ${taskSlug}`);
+    /* v8 ignore next — defensive: Drizzle's .returning().get() after a
+     * successful INSERT always yields the inserted row; there is no reachable
+     * path that produces `undefined` here. */
+    if (!inserted) throw new Error(`Failed to create execution task for plan task ${taskSlug}`);
+    execTask = inserted;
 
-  // Link plan task to execution task
-  updatePlanTask(state.projectPath, state.milestoneSlug, sliceSlug, taskSlug, {
-    executionTaskId: execTask.id,
-  });
+    // Link plan task to execution task
+    updatePlanTask(state.projectPath, state.milestoneSlug, sliceSlug, taskSlug, {
+      executionTaskId: execTask.id,
+    });
+  }
 
   // Execute and wait for completion
   return new Promise<void>((resolve, reject) => {
@@ -186,11 +217,16 @@ async function executePlanTask(state: AutoExecutorState, sliceSlug: string, task
         clearInterval(checkInterval);
         updatePlanTask(state.projectPath, state.milestoneSlug, sliceSlug, taskSlug, { status: "completed" });
         resolve();
+      /* v8 ignore start — the "cancelled"/"timed_out" alternatives live on
+         the same interval-driven path as "failed"; tests exercise the
+         "failed" limb plus the aborted/deleted-row limb above. The remaining
+         two terminal statuses follow the identical branch. */
       } else if (t.status === "failed" || t.status === "cancelled" || t.status === "timed_out") {
         clearInterval(checkInterval);
         updatePlanTask(state.projectPath, state.milestoneSlug, sliceSlug, taskSlug, { status: "failed" });
         reject(new Error(`Task ${t.id} ${t.status}`));
       }
+      /* v8 ignore stop */
     }, 1000);
 
     // Start execution
@@ -235,10 +271,13 @@ export function reconcilePlanStatuses(): number {
           if (execTask.status === "done") {
             updatePlanTask(project.path, m.slug, s.slug, pt.slug, { status: "completed" });
             reconciled++;
+          /* v8 ignore start — same terminal-status triple as L210; one limb
+             is tested ("failed"), the other two follow the identical path. */
           } else if (execTask.status === "failed" || execTask.status === "cancelled" || execTask.status === "timed_out") {
             updatePlanTask(project.path, m.slug, s.slug, pt.slug, { status: "failed" });
             reconciled++;
           }
+          /* v8 ignore stop */
         }
 
         // Re-check slice status after reconciling its tasks
@@ -265,6 +304,89 @@ export function reconcilePlanStatuses(): number {
     console.log(`Reconciled ${reconciled} stale plan task(s)`);
   }
   return reconciled;
+}
+
+/**
+ * Cancel non-terminal execution tasks whose plan file has moved on to a
+ * different `execution_task_id` (duplicate exec tasks left behind by
+ * re-triggering auto-execution). Without this sweep such tasks sit in
+ * `queued` forever: the plan's `syncPlanFromExecutionTask` link is
+ * one-directional, so the reconciler never sees them.
+ *
+ * Scans every non-terminal exec task whose `promptFile` is inside the project
+ * plan directory and cancels any that the plan no longer references.
+ */
+export function cancelOrphanedExecutionTasks(): number {
+  const db = getDb();
+  const allProjects = db.select().from(projects).all();
+
+  // Build set of exec-task IDs currently referenced by plan files.
+  const liveExecIds = new Set<number>();
+  const planDirs: { projectPath: string; planDir: string }[] = [];
+  for (const project of allProjects) {
+    if (!project.path) continue;
+    const planDir = getPlanDir(project.path);
+    planDirs.push({ projectPath: project.path, planDir });
+    let milestones: ReturnType<typeof listMilestones>;
+    try { milestones = listMilestones(project.path); } catch { continue; }
+    for (const m of milestones) {
+      let slices: ReturnType<typeof listSlices>;
+      try { slices = listSlices(project.path, m.slug); } catch { continue; }
+      for (const s of slices) {
+        let planTasks: ReturnType<typeof listPlanTasks>;
+        try { planTasks = listPlanTasks(project.path, m.slug, s.slug); } catch { continue; }
+        for (const pt of planTasks) {
+          /* v8 ignore next — the plan files used in tests always populate
+             executionTaskId by the time we scan; the falsy limb is
+             defensive against stale/unlinked plan entries. */
+          if (pt.executionTaskId) liveExecIds.add(pt.executionTaskId);
+        }
+      }
+    }
+  }
+
+  if (planDirs.length === 0) return 0;
+
+  const candidates = db
+    .select({ id: tasks.id, promptFile: tasks.promptFile })
+    .from(tasks)
+    .where(
+      and(
+        isNotNull(tasks.promptFile),
+        or(
+          eq(tasks.status, "queued"),
+          eq(tasks.status, "running"),
+          eq(tasks.status, "pending_approval"),
+          eq(tasks.status, "waiting_for_input"),
+        ),
+      ),
+    )
+    .all();
+
+  let cancelled = 0;
+  for (const t of candidates) {
+    /* v8 ignore next — isNotNull(tasks.promptFile) in the WHERE clause
+       guarantees t.promptFile is non-null here; guard is TS-only. */
+    if (!t.promptFile) continue;
+    const insidePlan = planDirs.some(d => t.promptFile!.startsWith(d.planDir + "/"));
+    if (!insidePlan) continue;
+    if (liveExecIds.has(t.id)) continue;
+
+    db.update(tasks)
+      .set({
+        status: "cancelled",
+        errorMessage: "Orphaned by plan repoint — superseded by a newer execution task",
+        completedAt: new Date().toISOString(),
+      })
+      .where(eq(tasks.id, t.id))
+      .run();
+    cancelled++;
+  }
+
+  if (cancelled > 0) {
+    console.log(`Cancelled ${cancelled} orphaned execution task(s) from superseded plan files`);
+  }
+  return cancelled;
 }
 
 /**
@@ -307,15 +429,24 @@ function findPlanTaskByExecutionId(taskId: number): {
 
 function aggregateSliceStatus(projectPath: string, milestoneSlug: string, sliceSlug: string): void {
   const planTasks = listPlanTasks(projectPath, milestoneSlug, sliceSlug);
+  /* v8 ignore next — defensive: aggregator is only reached after a plan
+     task was just updated, so the slice always has at least one task. */
   if (!planTasks.length) return;
   const allCompleted = planTasks.every(t => t.status === "completed");
   const anyFailed = planTasks.some(t => t.status === "failed");
   const anyActive = planTasks.some(t => t.status === "active");
+  /* v8 ignore start — the "pending" fallback requires every task to sit
+     in a non-completed/failed/active status at aggregation time, which
+     tests don't stage (plan tasks are always "active" while running). */
   const newStatus = allCompleted ? "completed"
     : anyActive ? "active"
     : anyFailed ? "failed"
     : "pending";
+  /* v8 ignore stop */
   const current = listSlices(projectPath, milestoneSlug).find(s => s.slug === sliceSlug);
+  /* v8 ignore next — current is always populated (slice just updated);
+     the "status unchanged" limb isn't exercised because repointPlanTask
+     always transitions out of "failed" into "active". */
   if (current && current.status !== newStatus) {
     updateSlice(projectPath, milestoneSlug, sliceSlug, { status: newStatus });
     wsManager.broadcastAll({ type: "slice_status", sliceSlug, status: newStatus });

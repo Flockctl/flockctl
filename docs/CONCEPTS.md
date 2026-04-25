@@ -74,6 +74,18 @@ Most project settings live in a `.flockctl/config.json` file inside the repo, so
 
 Every task and every chat must belong to a project.
 
+### View mode
+
+A **view mode** is how the project-detail page is laid out. The same underlying data — milestones, slices, plan-tasks — is rendered three ways, and you switch between them from the segmented toggle at the top of the page. The three modes are distinct surfaces, not cosmetic re-skins: pick the one that matches the question you're answering right now.
+
+- **Tree view** — the default. A left-rail outline of milestones and their slices; clicking a node opens the detail panel on the right. Best when you want to navigate the plan hierarchy or bounce between neighbouring slices quickly.
+- **Board view** — a Kanban-style board that groups slices into status columns (pending / active / completed, plus an "Other" fallback for any status the columns don't cover — `verifying`, `merging`, `skipped`, `failed`). The `verifying` column is hidden by default because the auto-executor doesn't transition slices into that state today; it will be reinstated once the backend starts emitting it. Best when you're trying to see "what's in flight right now" across a whole milestone.
+- **Swimlane view** — planned layout that arranges slices along dependency lanes. Currently a "coming soon" stub behind the toggle; selecting it renders a placeholder instead of crashing, and the underlying shell is identical to Board view so wiring the real layout later is purely a panel change.
+
+The active mode is stored in the URL as the `?view=` query param (`?view=board`, `?view=tree`, or `?view=swimlane`) so deep links and browser back/forward restore it; the last choice per project also persists in `localStorage` as a fallback. Any unrecognised value — empty string, a retired mode name, an injection payload — silently falls back to `tree` instead of throwing.
+
+The tasks page has its own mode switch (table vs. grouped cards), but the concept is the same: the URL is the source of truth, the layout is purely presentation over the same task list.
+
 ---
 
 ## Planning hierarchy
@@ -142,6 +154,8 @@ A task captures everything you need to reproduce or inspect the run later:
 
 ```
 queued ──► running ──► done
+              │  ▲
+              │  ╰──── waiting_for_input (agent asked, user answers)
               │
               ├──► failed ──► queued    (automatic retry)
               ├──► cancelled ──► queued (you clicked rerun)
@@ -152,6 +166,8 @@ queued ──► running ──► done
 
 - **queued** — waiting for a worker.
 - **running** — the agent is actively executing.
+- **concurrency scope** — capacity is enforced per selected AI Provider Key (default: 5 concurrent tasks per key), not as one global process-wide cap.
+- **waiting_for_input** — the agent called `AskUserQuestion` and is parked until the user answers. No tokens accrue and the task no longer counts against the concurrency budget. Answering flips it back to `running`; if the daemon restarted while parked, answering flips it back to `queued` and execute() resumes the prior Claude Code session via `claudeSessionId`.
 - **pending_approval** — the agent stopped and is waiting for a human to approve or reject its changes.
 - **done** — finished successfully.
 - **failed / cancelled / timed_out** — something went wrong. You can re-run it, which copies the config into a fresh task.
@@ -206,6 +222,15 @@ One **turn** inside a chat — either from you (`user`), from the agent (`assist
 When the agent tries to use a gated tool (running a shell command, writing a file, editing code) and the current permission mode says "ask first", the agent **pauses and raises a permission request**. You get a prompt in the UI — approve, or deny. Until you answer, the agent is waiting.
 
 Permission requests happen inside both tasks and chats.
+
+### Agent question
+
+Distinct from a permission request: the agent can also stop and ask you a **free-form clarification question** via the `AskUserQuestion` tool — "what port should I bind to?", "which of these two files did you mean?". The question is persisted in the `agent_questions` table so it survives daemon restarts, and is surfaced in the `/attention` inbox alongside pending permissions.
+
+- **For tasks**, emitting a question flips the task into `waiting_for_input` (see the task lifecycle above). Budget and concurrency accounting stop for the duration.
+- **For chats**, there is no status column — a chat is treated as waiting whenever `EXISTS(pending agent_question WHERE chat_id = <id>)`. The UI re-hydrates the pending question on page reload by calling `GET /chats/:id/pending-questions`.
+
+Answering uses `POST /tasks/:id/question/:requestId` or `POST /chats/:id/question/:requestId` with `{ answer: "…" }`. If the daemon restarted while the task was parked, the hot-path handoff to the live session is skipped — the answer is persisted, the task flips to `queued`, and the scheduler resumes the prior Claude Code session via `claudeSessionId`.
 
 ### Permission mode
 
@@ -300,6 +325,27 @@ An **encrypted key-value entry** for sensitive values that your MCP servers or t
 Secrets are scoped the same way as keys and configs — **global**, **workspace**, or **project** — so a project can have its own `DATABASE_URL` without leaking it into other projects on the same machine.
 
 *Example:* store `STRIPE_LIVE_KEY` as a project-scoped secret and reference it from the project's MCP server config — the secret never ends up in the repo.
+
+---
+
+## Attention
+
+**Items blocked on you.** Attention is a live, derived view of everything waiting on a human — tasks in `pending_approval`, chats or tasks paused on a tool permission request. It lets you see at a glance whether anything is stalled without hunting through projects.
+
+**Kinds of blockers:**
+
+- **Task approval** — a task waiting for you to approve or reject its git changes.
+- **Tool permission** — a chat or task paused on a permission request for a gated tool.
+
+**Where it appears in the UI:**
+
+- **Sidebar badge** — total count across all projects.
+- **Inbox page** — full list, grouped by project, with one-click jump to the blocked item.
+- **Project indicators** — each project card shows a badge if something inside it is waiting.
+
+Attention is **not persisted** — it's derived live from the current state of tasks and chats, so there's nothing to reconcile or migrate.
+
+See also: [Permission request](#permission-request), [Permission mode](#permission-mode), task `pending_approval` status.
 
 ---
 

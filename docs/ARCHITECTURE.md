@@ -131,7 +131,7 @@ Registered in `src/server.ts` in this order:
 | Service | File | Description |
 |---------|------|-------------|
 | **TaskExecutor** | `task-executor.ts` | Orchestrates task execution: key selection → agent session → log streaming |
-| **AgentSession** | `agent-session.ts` | Agent loop with tool calls, permission requests |
+| **AgentSession** | `agent-session/session.ts` | Agent loop with tool calls, permission requests. On every session start, `buildSystemPrompt()` runs, then `injectAgentGuidance()` appends the merged three-layer AGENTS.md cascade (user → workspace-public → project-public) to the system prompt via the pure `loadAgentGuidance` loader. No reconciler writes to disk — the merge is in-memory per session. See [AGENTS-LAYERING.md](AGENTS-LAYERING.md) for the full layer contract, size caps, and banner format. |
 | **AIClient** | `ai-client.ts` | Multi-provider AI API client (Anthropic, OpenAI, Google) |
 | **KeySelection** | `key-selection.ts` | Key priority, rotation, error backoff, project/workspace scoping |
 | **Scheduler** | `scheduler.ts` | Cron schedule management via node-cron |
@@ -141,13 +141,34 @@ Registered in `src/server.ts` in this order:
 | **PlanPrompt** | `plan-prompt.ts` | AI plan generation prompt builder |
 | **PromptResolver** | `prompt-resolver.ts` | Resolve task prompts from files and templates |
 | **Skills** | `skills.ts` | Multi-level skill resolution; reconciler materializes the resolved set into `.claude/skills/` as symlinks |
-| **MCP** | `mcp.ts` | MCP server config resolution; reconciler writes the resolved set into `.mcp.json` (read natively by Claude Code) |
+| **MCP** | `mcp.ts` | MCP server config resolution; reconciler writes `.mcp.json` (for the interactive `claude` CLI) AND `AgentSession` forwards the same resolved set to the Claude Agent SDK via `provider.chat({ mcpServers })` — the SDK does NOT auto-read `.mcp.json`, so explicit forwarding is required for agents to see `mcp__*` tools |
 | **PermissionResolver** | `permission-resolver.ts` | Resolves `permissionMode` (task → chat → project) |
 | **ProjectConfig** | `project-config.ts` | Reads/writes `<project>/.flockctl/config.json` |
 | **GitContext** | `git-context.ts` | Git history and diff extraction for agent context |
 | **Cost** | `cost.ts` | Token usage cost calculation, per-provider pricing |
 | **WSManager** | `ws-manager.ts` | WebSocket client management, broadcast |
 | **MergeQueue** | `merge-queue.ts` | Serialized merge orchestration for auto-executor |
+
+### UI Components (milestone 09 — mission-control layout)
+
+The project-detail and tasks surfaces were re-built around a URL-backed view-mode state machine (`ui/src/lib/use-view-mode.ts`, exposing `ViewMode = "board" | "tree" | "swimlane"`) together with sibling hooks `use-selection.ts`, `use-kpi-data.ts`, and `use-tasks-view-mode.ts`. The components below are the public surface of that layout — route files import them, e2e specs target them by test-id, and doc references go through this table:
+
+| Component | File | Role |
+|-----------|------|------|
+| **ViewModeToggle** | `ui/src/pages/project-detail-components/ViewModeToggle.tsx` | Segmented Board / Tree / Swimlane toggle; reads & writes `?view=` via `useViewMode()`. |
+| **ProjectDetailBoardView** | `ui/src/pages/project-detail-components/ProjectDetailBoardView.tsx` | Board-mode shell rendered when `?view=board`; hosts `SliceBoard` + detail panel. |
+| **ProjectDetailTreeView** | `ui/src/pages/project-detail-components/ProjectDetailTreeView.tsx` | Tree-mode shell rendered when `?view=tree`; hosts `ProjectTreePanel` + detail panel. |
+| **ProjectTreePanel** | `ui/src/pages/project-detail-components/ProjectTreePanel.tsx` | Left-rail milestone → slice tree with keyboard navigation and URL-synced selection. |
+| **SliceBoard** | `ui/src/pages/project-detail-components/SliceBoard.tsx` | Kanban-style board grouping slices by status column. |
+| **SliceCard** | `ui/src/pages/project-detail-components/SliceCard.tsx` | Draggable card rendered inside `SliceBoard`; shows priority, progress, and selection state. |
+| **SliceDetailPanel** | `ui/src/pages/project-detail-components/SliceDetailPanel.tsx` | Right-rail detail panel shared by both view modes. |
+| **SliceDetailTabs** | `ui/src/pages/project-detail-components/SliceDetailTabs.tsx` | Tabbed header inside `SliceDetailPanel` (overview / tasks / chat / plan file). |
+| **MissionControlKpiBar** | `ui/src/pages/project-detail-components/MissionControlKpiBar.tsx` | Top-of-page KPI strip; consumes `use-kpi-data` and collapses responsively. |
+| **TaskCard** | `ui/src/pages/tasks-components/TaskCard.tsx` | Card renderer used by `TasksGroupedView` when the tasks page is in card mode. |
+| **TasksGroupedView** | `ui/src/pages/tasks-components/TasksGroupedView.tsx` | Grouped (by status / project / key) card layout for `/tasks`. |
+| **LiveRunsRail** | `ui/src/pages/tasks-components/LiveRunsRail.tsx` | Sticky side-rail showing currently-running tasks on the tasks page. |
+
+Shared types for the board layout live in `slice-board-types.ts`; see [CONCEPTS.md §View mode](CONCEPTS.md) for the user-facing model behind Board / Tree / Swimlane.
 
 ## Task Execution Flow
 
@@ -168,6 +189,64 @@ Registered in `src/server.ts` in this order:
    └── Update task status (done/failed/pending_approval)
 ```
 
+## AI / Agent Session
+
+`AgentSession` (in `src/services/agent-session/`) is the in-process runner for every task and chat turn. Its life-cycle is:
+
+1. `buildSystemPrompt()` composes the baseline prompt (agent identity, workspace project list when workspace-scoped, incidents, state machines, tool format hints).
+2. `injectAgentGuidance()` appends the merged AGENTS.md cascade. The pure `loadAgentGuidance` loader reads up to three layers — `user` → `workspace-public` → `project-public` — and concatenates them with per-layer header banners. The call is fail-open: an I/O error logs and returns the unmodified prompt so a guidance read never blocks a chat.
+3. The final prompt is handed to the provider (Claude Agent SDK for tasks/chats, direct API for a few specialised flows) alongside resolved MCP servers, tools, and permission settings.
+
+Older versions of Flockctl materialised a reconciled `AGENTS.md` at the project root by gluing workspace + project content with `BEGIN/END` markers. That reconciler has been removed: nothing is written to disk, the merge is recomputed per session, and the Claude Agent SDK (which does not read project files on its own) now receives the same guidance as the interactive `claude` CLI. Per-layer size caps (256 KiB per layer, 1 MiB total merged) and the exact banner format used by the merged string are specified in [AGENTS-LAYERING.md](AGENTS-LAYERING.md).
+
+## Mission Control
+
+"Mission Control" is the project-detail surface introduced in milestone 09. It is the single page users land on when they click a project — planning tree, slice board, KPIs, detail panel, and the chat pane all render inside one shell. The shell is intentionally dumb: layout only, no data fetching. Every panel plugs into a fixed slot; swapping a panel does not require changes to the shell.
+
+### 3-column layout
+
+`ProjectDetailBoardView` (and the symmetric `ProjectDetailTreeView`) lay out a CSS grid with three named slots:
+
+| Slot | Width | Content |
+|------|-------|---------|
+| **left** | 260px fixed | `ProjectTreePanel` — milestone → slice outline with keyboard nav and URL-synced selection. |
+| **center** | fluid (`min-w-0`) | `SliceBoard` in board mode, milestone cards in tree mode, a "coming soon" stub in swimlane mode. |
+| **right** | 360px fixed | `SliceDetailPanel` wrapped in `SliceDetailTabs` — the currently-selected slice, tabs for future surfaces. |
+
+Height pins to the viewport minus the app bar via the `--appbar-h` custom property; if the property is missing the `calc(100vh - 0)` expression gracefully falls back to the full viewport. Every slot sets `min-w-0` so a long milestone title in the center cannot push the right pane off-screen, and every slot owns its own scroll container — the shell clips overflow but never scrolls itself.
+
+Exact dimensions match `docs/prototypes/mission-control.html` so the visual regression snapshot taken from the prototype is reusable.
+
+### View-mode state machine
+
+The `useViewMode()` hook (`ui/src/lib/use-view-mode.ts`) is a URL-backed state machine with a strict allow-list:
+
+```
+ViewMode = "board" | "tree" | "swimlane"
+```
+
+Resolution precedence, cheapest source first:
+
+1. `?view=` query param — validated against the allow-list.
+2. `localStorage["flockctl.viewMode.<projectId>"]` — the last choice persisted per project.
+3. Default `"tree"`.
+
+Any value outside the allow-list (empty string, unicode, injection payload, stale bookmark from a retired mode) silently falls back to step 2 → step 3 instead of throwing. The corrupted URL path must never crash the page or leak into the DOM unescaped.
+
+`setMode(next)` is referentially stable across renders (safe in effect dep arrays). It writes localStorage first, then pushes `?view=next` with `replace: true` so the state machine is a same-tick contract: a synchronous re-read of `useViewMode()` after `setMode()` sees the new value even if React batches the `setSearchParams` flush.
+
+The tasks page has its own mode switch (`useTasksViewMode`, table vs. cross-project kanban) built on the same pattern — URL-backed, allow-listed, fallback default.
+
+### Extension points
+
+Three public hooks keep Mission Control open for extension without re-opening the shell:
+
+- **`SliceBoard` `columns` prop.** `SliceBoard` groups slices by a caller-supplied `readonly ColumnDef[]`; it never assumes a specific column count. Swap `DEFAULT_SLICE_COLUMNS` for a 5-column layout and the board re-renders with 5 columns — no other changes required. Any slice whose status is not mentioned in any column's `matchStatuses` falls into an auto-rendered "Other" fallback column, which only appears when at least one such slice exists. Column definitions are purely structural — status → color mapping stays on `SliceCard` via the badge utility, so the board does not duplicate the palette.
+- **`SliceDetailTabs` registry.** The right-pane tabbed surface reads a `tabs?: TabDef[]` prop that defaults to `DEFAULT_SLICE_TABS`. New tabs plug in via `tabs={[...DEFAULT_SLICE_TABS, myTab]}` — no edit to the component is required. Each `TabDef` carries its own `render(ctx)` and receives a minimal `{ sliceId }` context, so a future Supervisor log tab (milestone 10) can fetch its own data without the registry growing to expose the entire slice model. If the registry changes under an uncontrolled active tab and the previously-active id disappears, the component silently resets to `tabs[0]`.
+- **`status-badge` `proposed` variant.** `statusBadge(status)` (`ui/src/components/status-badge.tsx`) is the central colour map; adding a new planning status means adding a `case` and nothing else. The current `proposed` variant renders a violet outline badge — it is the shape every new status should follow. Callers read the badge through this function; they must never hand-render `<Badge>` with a status string.
+
+Shared types for the board layout live in `ui/src/pages/project-detail-components/slice-board-types.ts`. See [CONCEPTS.md §View mode](CONCEPTS.md) for the user-facing model behind Board / Tree / Swimlane.
+
 ## Key Design Decisions
 
 - **Local-only by default, remote-capable by configuration** — no middle ground. The same binary serves both modes; remote mode is opt-in via `~/.flockctlrc`.
@@ -178,4 +257,5 @@ Registered in `src/server.ts` in this order:
 - **Portable project config** — model, baseBranch, testCommand, permissionMode live in `<project>/.flockctl/config.json` (git-tracked). DB keeps only machine-local state (identity, path, key scoping).
 - **Multi-provider** — supports Anthropic API, OpenAI API, Google API, and Claude Code CLI / SDK.
 - **Hierarchical config** — skills, MCP servers, key restrictions, and permissionMode cascade: global → workspace → project → task.
+- **AGENTS.md is read at session start, not reconciled to disk** — the three-layer cascade (user → workspace-public → project-public) is merged in memory by `loadAgentGuidance` and appended to the system prompt by `AgentSession.injectAgentGuidance()`. Each scope owns exactly one editable `AGENTS.md` file; nothing is written to the project root by Flockctl. See [AGENTS-LAYERING.md](AGENTS-LAYERING.md).
 - **Timing-safe auth** — token comparison uses `crypto.timingSafeEqual`; IP source is the Node socket, not `X-Forwarded-For` (so header spoofing can't bypass localhost detection).

@@ -1,5 +1,5 @@
 import { describe, it, expect, afterAll } from "vitest";
-import { getAgentTools, executeToolCall } from "../../services/agent-tools.js";
+import { getAgentTools, executeToolCall, askUserQuestionInputSchema } from "../../services/agent-tools.js";
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
@@ -11,9 +11,9 @@ describe("Agent Tools", () => {
     rmSync(workDir, { recursive: true, force: true });
   });
 
-  it("getAgentTools returns 9 tools", () => {
+  it("getAgentTools returns 10 tools", () => {
     const tools = getAgentTools(workDir);
-    expect(tools).toHaveLength(9);
+    expect(tools).toHaveLength(10);
     const names = tools.map(t => t.name);
     expect(names).toContain("Read");
     expect(names).toContain("Write");
@@ -24,6 +24,28 @@ describe("Agent Tools", () => {
     expect(names).toContain("Glob");
     expect(names).toContain("ListDir");
     expect(names).toContain("Delete");
+    expect(names).toContain("AskUserQuestion");
+  });
+
+  it("getAgentTools exposes AskUserQuestion with the shared input schema", () => {
+    const tools = getAgentTools(workDir);
+    const ask = tools.find(t => t.name === "AskUserQuestion");
+    expect(ask).toBeDefined();
+    expect(ask!.description).toMatch(/clarification/i);
+    expect(ask!.input_schema).toBe(askUserQuestionInputSchema);
+    expect(askUserQuestionInputSchema).toEqual({
+      type: "object",
+      properties: {
+        question: { type: "string", maxLength: 2000 },
+      },
+      required: ["question"],
+    });
+  });
+
+  it("executeToolCall throws for AskUserQuestion (session must handle it)", () => {
+    expect(() =>
+      executeToolCall("AskUserQuestion", { question: "hi" }, workDir)
+    ).toThrow("AskUserQuestion must be handled by the session, not the tool executor");
   });
 
   it("Write creates a file", () => {

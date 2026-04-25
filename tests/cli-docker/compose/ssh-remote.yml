@@ -1,0 +1,72 @@
+# Two-container stack for tests/cli-docker/scenarios/ssh-remote-full-stack.spec.ts.
+#
+# Purpose:
+#   - host-a : the far side of the ssh tunnel. Runs sshd + the flockctl
+#              CLI (installed from the locally built tarball). Has
+#              nothing running by default — the flockctl daemon is
+#              spawned ON DEMAND by `flockctl remote-bootstrap` when
+#              host-b's POST /meta/remote-servers ssh's in.
+#   - host-b : the "local" Flockctl. Reuses the existing
+#              flockctl-cli-test:local image from tests/cli-docker/
+#              Dockerfile (alpine + flockctl + c8). The spec runs
+#              `flockctl start` inside it to bring the daemon up.
+#
+# The two services share a user-defined bridge network so host-b can
+# reach host-a by the service name `host-a` (docker's embedded DNS).
+# Neither container publishes a port to the host — the spec interacts
+# with host-b via `docker exec`, so no host-port mapping is needed and
+# there's no risk of colliding with a developer's 52077.
+#
+# The spec wires four env vars into the compose invocation:
+#
+#   COMPOSE_PROJECT_NAME   unique per test run, so concurrent CI stacks
+#                          don't share containers or networks.
+#   AUTHORIZED_KEYS_FILE   abs path of the per-run id_ed25519.pub.
+#                          Mounted ro at /home/tester/.ssh/authorized_keys
+#                          on host-a so sshd accepts the key.
+#   SSH_KEY_DIR            abs path of the per-run tmpdir containing the
+#                          private key. Mounted ro at /ssh-keys on host-b
+#                          so the flockctl daemon can pass identityFile.
+#   HOST_B_TMP             host-b's FLOCKCTL_HOME (a tmpdir on the host).
+#                          Mounted rw at /flockctl-home so /health, the
+#                          pidfile, and flockctl.log survive container
+#                          restarts within the test run.
+
+services:
+  host-a:
+    image: flockctl-sshd-test:local
+    # No container_name — compose derives it from project + service so
+    # parallel test runs with different COMPOSE_PROJECT_NAME don't fight
+    # over names. Spec looks containers up via `docker compose ps`.
+    volumes:
+      - ${AUTHORIZED_KEYS_FILE}:/home/tester/.ssh/authorized_keys:ro
+    networks:
+      ssh-remote-net:
+        aliases:
+          - host-a
+
+  host-b:
+    image: flockctl-cli-test:local
+    volumes:
+      - ${HOST_B_TMP}:/flockctl-home
+      - ${SSH_KEY_DIR}:/ssh-keys:ro
+    environment:
+      - FLOCKCTL_HOME=/flockctl-home
+      # NODE_V8_COVERAGE is set for parity with the single-container
+      # harness. This spec doesn't collect coverage (the new code paths
+      # it exercises are HTTP routes, not CLI subcommands), but leaving
+      # the env var set means `flockctl start` here dumps v8 coverage
+      # in the usual place if someone later adds CLI coverage to this
+      # test — no harm done in the meantime.
+      - NODE_V8_COVERAGE=/flockctl-home/nyc_output
+    command: ["sleep", "infinity"]
+    networks:
+      ssh-remote-net:
+        aliases:
+          - host-b
+    depends_on:
+      - host-a
+
+networks:
+  ssh-remote-net:
+    driver: bridge

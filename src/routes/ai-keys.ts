@@ -4,8 +4,10 @@ import { aiProviderKeys } from "../db/schema.js";
 import { eq, sql, desc } from "drizzle-orm";
 import { paginationParams } from "../lib/pagination.js";
 import { NotFoundError, ValidationError } from "../lib/errors.js";
+import { parseIdParam } from "../lib/route-params.js";
 const PROVIDERS: Record<string, { name: string; apiType: string }> = {
   claude_cli: { name: "Claude Code CLI", apiType: "claude-agent-sdk" },
+  github_copilot: { name: "GitHub Copilot", apiType: "copilot-sdk" },
 };
 
 export const aiKeyRoutes = new Hono();
@@ -54,10 +56,28 @@ aiKeyRoutes.get("/claude-cli/status", async (c) => {
   }
 });
 
+// GET /keys/copilot/status — GitHub Copilot SDK readiness
+aiKeyRoutes.get("/copilot/status", async (c) => {
+  try {
+    const { getAgent } = await import("../services/agents/registry.js");
+    const provider = getAgent("copilot");
+    const readiness = provider.checkReadiness();
+    return c.json({
+      installed: readiness.installed,
+      authenticated: readiness.authenticated,
+      ready: readiness.ready,
+      models: provider.listModels().map(m => m.id),
+    });
+  } catch {
+    /* v8 ignore next — defensive: provider.checkReadiness shouldn't throw */
+    return c.json({ installed: false, authenticated: false, ready: false, models: [] });
+  }
+});
+
 // GET /keys/:id
 aiKeyRoutes.get("/:id", (c) => {
   const db = getDb();
-  const id = parseInt(c.req.param("id"));
+  const id = parseIdParam(c);
   const key = db.select().from(aiProviderKeys).where(eq(aiProviderKeys.id, id)).get();
   if (!key) throw new NotFoundError("AI Key");
 
@@ -71,6 +91,29 @@ aiKeyRoutes.get("/:id", (c) => {
   });
 });
 
+// GET /keys/:id/identity — resolve the *real* Anthropic account behind this key
+// by asking https://api.anthropic.com/api/oauth/profile under the OAuth token
+// Claude Code stored for the key's CLAUDE_CONFIG_DIR. Answers questions like
+// "is Personal actually a different account from Work?".
+aiKeyRoutes.get("/:id/identity", async (c) => {
+  const db = getDb();
+  const id = parseIdParam(c);
+  const key = db.select().from(aiProviderKeys).where(eq(aiProviderKeys.id, id)).get();
+  if (!key) throw new NotFoundError("AI Key");
+
+  if (key.provider !== "claude_cli") {
+    return c.json({
+      supported: false,
+      loggedIn: false,
+      reason: `identity lookup is only implemented for provider "claude_cli" (got "${key.provider}")`,
+    });
+  }
+
+  const { getClaudeIdentity } = await import("../services/claude/identity.js");
+  const identity = await getClaudeIdentity(key.configDir);
+  return c.json({ supported: true, ...identity });
+});
+
 // — create key
 aiKeyRoutes.post("/", async (c) => {
   const db = getDb();
@@ -78,6 +121,11 @@ aiKeyRoutes.post("/", async (c) => {
 
   if (!body.provider) throw new ValidationError("provider is required");
   if (!body.providerType) throw new ValidationError("providerType is required");
+  if (body.provider === "github_copilot") {
+    if (!body.keyValue || typeof body.keyValue !== "string" || body.keyValue.trim().length === 0) {
+      throw new ValidationError("keyValue (GitHub token) is required for github_copilot provider");
+    }
+  }
 
   const result = db.insert(aiProviderKeys).values({
     provider: body.provider,
@@ -97,7 +145,7 @@ aiKeyRoutes.post("/", async (c) => {
 // PATCH /keys/:id
 aiKeyRoutes.patch("/:id", async (c) => {
   const db = getDb();
-  const id = parseInt(c.req.param("id"));
+  const id = parseIdParam(c);
   const existing = db.select().from(aiProviderKeys).where(eq(aiProviderKeys.id, id)).get();
   if (!existing) throw new NotFoundError("AI Key");
 
@@ -130,7 +178,7 @@ aiKeyRoutes.patch("/:id", async (c) => {
 // DELETE /keys/:id
 aiKeyRoutes.delete("/:id", (c) => {
   const db = getDb();
-  const id = parseInt(c.req.param("id"));
+  const id = parseIdParam(c);
   const existing = db.select().from(aiProviderKeys).where(eq(aiProviderKeys.id, id)).get();
   if (!existing) throw new NotFoundError("AI Key");
 

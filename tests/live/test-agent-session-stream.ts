@@ -16,7 +16,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AgentSession } from "../../src/services/agent-session.js";
+import { AgentSession } from "../../src/services/agent-session/index.js";
 
 try {
   execFileSync("claude", ["--version"], { timeout: 5_000, stdio: "pipe" });

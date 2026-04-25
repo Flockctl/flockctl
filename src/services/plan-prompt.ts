@@ -1,5 +1,5 @@
 import { buildCodebaseContext } from "./git-context.js";
-import { getPlanDir } from "./plan-store.js";
+import { getPlanDir } from "./plan-store/index.js";
 
 /**
  * Build a prompt for plan generation. The agent has the `planning` skill

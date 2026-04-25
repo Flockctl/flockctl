@@ -1,11 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-vi.mock("../../services/ai-client", () => ({
+vi.mock("../../services/ai/client", () => ({
   createAIClient: vi.fn(() => ({ chat: vi.fn() })),
 }));
 
-import { AgentSession } from "../../services/agent-session.js";
-import { createAIClient } from "../../services/ai-client.js";
+import { AgentSession } from "../../services/agent-session/index.js";
+import { createAIClient } from "../../services/ai/client.js";
 
 const mockCreateAIClient = createAIClient as any;
 
@@ -427,5 +427,263 @@ describe("AgentSession — abortMessage defaults", () => {
     // reason but the switch has a defensive default.
     const msg = (session as any).abortMessage();
     expect(msg).toBe("Task cancelled");
+  });
+});
+
+// Variant B — live permission-mode switching mid-session.
+//
+// The scenario: a chat starts with a restrictive mode (`default` or `auto`),
+// the agent asks to run a tool, the user wants to unblock the blocker by
+// switching to `bypassPermissions` / `acceptEdits` without cancelling the
+// turn. `updatePermissionMode()` mutates the in-memory mode, auto-resolves
+// any pending permission entry that the new mode would have allowed, and
+// leaves the rest pending. Subsequent `canUseTool` invocations during the
+// same turn observe the new mode.
+describe("AgentSession — updatePermissionMode (live)", () => {
+  let mockChat: any;
+  beforeEach(() => {
+    mockChat = vi.fn();
+    mockCreateAIClient.mockReturnValue({ chat: mockChat });
+  });
+
+  it("exposes current mode via getter and emits permission_mode_changed on update", async () => {
+    mockChat.mockResolvedValueOnce({ text: "", rawContent: "", toolCalls: [], usage: {} });
+    const session = makeSession({ permissionMode: "default" });
+    await session.run();
+
+    const events: Array<{ previous: string; current: string }> = [];
+    session.on("permission_mode_changed", (e: any) => events.push(e));
+
+    expect(session.permissionMode).toBe("default");
+    session.updatePermissionMode("bypassPermissions");
+    expect(session.permissionMode).toBe("bypassPermissions");
+    expect(events).toEqual([{ previous: "default", current: "bypassPermissions" }]);
+
+    // no-op when mode is unchanged — avoids spurious UI refreshes
+    session.updatePermissionMode("bypassPermissions");
+    expect(events.length).toBe(1);
+  });
+
+  it("switching to bypassPermissions auto-resolves every pending request as allow", async () => {
+    let capturedCanUseTool: any;
+    mockChat.mockImplementationOnce(async (args: any) => {
+      capturedCanUseTool = args.canUseTool;
+      return { text: "", rawContent: "", toolCalls: [], usage: {} };
+    });
+
+    const session = makeSession({ permissionMode: "default" });
+    await session.run();
+
+    const p1 = capturedCanUseTool("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      toolUseID: "u1",
+    });
+    const p2 = capturedCanUseTool("Write", { file_path: "/etc/passwd" }, {
+      signal: new AbortController().signal,
+      toolUseID: "u2",
+    });
+
+    await new Promise((r) => setImmediate(r));
+    expect(session.pendingPermissionCount).toBe(2);
+
+    session.updatePermissionMode("bypassPermissions");
+
+    const r1 = await p1;
+    const r2 = await p2;
+    expect(r1.behavior).toBe("allow");
+    expect(r2.behavior).toBe("allow");
+    expect(session.pendingPermissionCount).toBe(0);
+  });
+
+  it("switching to acceptEdits auto-resolves only file-write pending requests", async () => {
+    let capturedCanUseTool: any;
+    mockChat.mockImplementationOnce(async (args: any) => {
+      capturedCanUseTool = args.canUseTool;
+      return { text: "", rawContent: "", toolCalls: [], usage: {} };
+    });
+
+    const session = makeSession({ permissionMode: "default" });
+    await session.run();
+
+    const pBash = capturedCanUseTool("Bash", { command: "rm -rf /" }, {
+      signal: new AbortController().signal,
+      toolUseID: "u-bash",
+    });
+    const pWrite = capturedCanUseTool("Write", { file_path: "/tmp/x.txt" }, {
+      signal: new AbortController().signal,
+      toolUseID: "u-write",
+    });
+
+    await new Promise((r) => setImmediate(r));
+    expect(session.pendingPermissionCount).toBe(2);
+
+    session.updatePermissionMode("acceptEdits");
+
+    // Write auto-allowed; Bash still pending (needs user decision).
+    const rWrite = await pWrite;
+    expect(rWrite.behavior).toBe("allow");
+    expect(session.pendingPermissionCount).toBe(1);
+
+    // Resolve bash manually so the test promise doesn't dangle.
+    const pending = session.pendingPermissionRequests();
+    session.resolvePermission(pending[0].requestId, { behavior: "deny", message: "no" });
+    const rBash = await pBash;
+    expect(rBash.behavior).toBe("deny");
+  });
+
+  it("after switching to bypassPermissions, subsequent canUseTool calls auto-allow (live)", async () => {
+    let capturedCanUseTool: any;
+    mockChat.mockImplementationOnce(async (args: any) => {
+      capturedCanUseTool = args.canUseTool;
+      return { text: "", rawContent: "", toolCalls: [], usage: {} };
+    });
+
+    const session = makeSession({ permissionMode: "default" });
+    await session.run();
+
+    session.updatePermissionMode("bypassPermissions");
+
+    // New canUseTool call after the switch should not prompt — it should
+    // allow synchronously based on the new mode.
+    const res = await capturedCanUseTool("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      toolUseID: "u-after",
+    });
+    expect(res.behavior).toBe("allow");
+    expect(session.pendingPermissionCount).toBe(0);
+  });
+
+  it("switching to auto re-runs decideAuto on pending entries and allows matches", async () => {
+    let capturedCanUseTool: any;
+    mockChat.mockImplementationOnce(async (args: any) => {
+      capturedCanUseTool = args.canUseTool;
+      return { text: "", rawContent: "", toolCalls: [], usage: {} };
+    });
+
+    const session = makeSession({
+      permissionMode: "default",
+      allowedRoots: ["/tmp"],
+    });
+    await session.run();
+
+    const pRead = capturedCanUseTool("Read", { file_path: "/tmp/foo.txt" }, {
+      signal: new AbortController().signal,
+      toolUseID: "u-read",
+    });
+    const pBash = capturedCanUseTool("Bash", { command: "ls" }, {
+      signal: new AbortController().signal,
+      toolUseID: "u-bash2",
+    });
+
+    await new Promise((r) => setImmediate(r));
+    expect(session.pendingPermissionCount).toBe(2);
+
+    session.updatePermissionMode("auto");
+
+    // Read is read-only → auto-allowed; Bash still needs user decision.
+    const rRead = await pRead;
+    expect(rRead.behavior).toBe("allow");
+    expect(session.pendingPermissionCount).toBe(1);
+
+    const pending = session.pendingPermissionRequests();
+    session.resolvePermission(pending[0].requestId, { behavior: "deny", message: "nope" });
+    await pBash;
+  });
+});
+
+describe("AgentSession — workspaceContext injection", () => {
+  let mockChat: any;
+  beforeEach(() => {
+    mockChat = vi.fn();
+    mockCreateAIClient.mockReturnValue({ chat: mockChat });
+  });
+
+  it("appends <workspace_projects> block listing sibling projects to the task system prompt", async () => {
+    let capturedSystem = "";
+    mockChat.mockImplementationOnce(async (args: any) => {
+      capturedSystem = args.system;
+      return { text: "", rawContent: "", toolCalls: [], usage: {} };
+    });
+
+    const session = makeSession({
+      workspaceContext: {
+        name: "WS",
+        path: "/tmp/ws",
+        projects: [
+          { name: "alpha", path: "/tmp/ws/alpha", description: "first" },
+          { name: "beta", path: "/tmp/ws/beta", description: null },
+          { name: "missing", path: null, description: "no path" },
+        ],
+      },
+    });
+    await session.run();
+
+    // Shape of the injected block
+    expect(capturedSystem).toContain(`<workspace_projects workspace="WS" path="/tmp/ws">`);
+    expect(capturedSystem).toContain("collection of 2 project(s)");
+    // Projects with paths rendered
+    expect(capturedSystem).toContain("- alpha (/tmp/ws/alpha) — first");
+    expect(capturedSystem).toContain("- beta (/tmp/ws/beta)");
+    // Project without a path skipped
+    expect(capturedSystem).not.toContain("missing");
+    // Scope rules pushed through
+    expect(capturedSystem).toContain("Do NOT run Grep/Glob/ListDir against the workspace root");
+    expect(capturedSystem).toMatch(/<\/workspace_projects>/);
+  });
+
+  it("skips injection when workspaceContext is absent", async () => {
+    let capturedSystem = "";
+    mockChat.mockImplementationOnce(async (args: any) => {
+      capturedSystem = args.system;
+      return { text: "", rawContent: "", toolCalls: [], usage: {} };
+    });
+
+    const session = makeSession();
+    await session.run();
+    expect(capturedSystem).not.toContain("<workspace_projects");
+  });
+
+  it("renders a clarifying note when the workspace has no projects with paths", async () => {
+    let capturedSystem = "";
+    mockChat.mockImplementationOnce(async (args: any) => {
+      capturedSystem = args.system;
+      return { text: "", rawContent: "", toolCalls: [], usage: {} };
+    });
+
+    const session = makeSession({
+      workspaceContext: {
+        name: "Empty",
+        path: "/tmp/empty",
+        projects: [{ name: "ghost", path: null }],
+      },
+    });
+    await session.run();
+    expect(capturedSystem).toContain("no projects with known paths");
+    expect(capturedSystem).toContain(`<workspace_projects workspace="Empty" path="/tmp/empty">`);
+  });
+
+  it("does not double-inject when systemPromptOverride already carries a workspace_projects tag", async () => {
+    let capturedSystem = "";
+    mockChat.mockImplementationOnce(async (args: any) => {
+      capturedSystem = args.system;
+      return { text: "", rawContent: "", toolCalls: [], usage: {} };
+    });
+
+    const override =
+      "caller prompt\n\n<workspace_projects workspace=\"WS\" path=\"/tmp/ws\">listed by caller</workspace_projects>";
+    const session = makeSession({
+      systemPromptOverride: override,
+      workspaceContext: {
+        name: "WS",
+        path: "/tmp/ws",
+        projects: [{ name: "alpha", path: "/tmp/ws/alpha" }],
+      },
+    });
+    await session.run();
+
+    // The pre-existing tag is kept; no second block appended.
+    const occurrences = capturedSystem.match(/<workspace_projects/g) ?? [];
+    expect(occurrences.length).toBe(1);
+    expect(capturedSystem).toContain("listed by caller");
   });
 });

@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // Tests own their fixture data; an out-of-range index is always a test
+    // bug, so forcing `!` or guards at every array access is pure noise.
+    // Production code keeps `noUncheckedIndexedAccess: true` via the base
+    // tsconfig.
+    "noUncheckedIndexedAccess": false,
+    "noEmit": true
+  },
+  "include": [
+    "src/__tests__/**/*",
+    "src/services/__tests__/**/*"
+  ],
+  "exclude": ["node_modules", "dist", "ui"]
+}

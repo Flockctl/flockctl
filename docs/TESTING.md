@@ -1,6 +1,6 @@
 # Testing
 
-Flockctl has six test tiers, ordered by cost. Run the lower tiers first; climb only as far as the change warrants.
+Flockctl has seven test tiers, ordered by cost. Run the lower tiers first; climb only as far as the change warrants.
 
 | Tier | Name | What it checks | Command | External deps |
 |---|---|---|---|---|
@@ -11,8 +11,9 @@ Flockctl has six test tiers, ordered by cost. Run the lower tiers first; climb o
 | 3 | Smoke | Real `server-entry.ts` boot on a free port with isolated `FLOCKCTL_HOME` | `npm run test:smoke` | none (migrations run, no AI calls) |
 | 4 | UI E2E | Playwright against real backend + Vite dev server | `npm run test:e2e` | Chromium (auto-installed) |
 | 5 | Live | Real Anthropic / OpenAI / Claude CLI roundtrips | `FLOCKCTL_LIVE_TESTS=1 npm run test:live` | API keys, `claude` CLI |
+| 6 | CLI-Docker | Every `flockctl` subcommand against a real daemon inside a disposable container | `npm run test:cli-docker` | Docker daemon, ~2 GB disk |
 
-Tiers 0–4 run in CI ([.github/workflows/ci.yml](../.github/workflows/ci.yml)). Tier 5 is local-only.
+Tiers 0–4 run in CI ([.github/workflows/ci.yml](../.github/workflows/ci.yml)). Tiers 5 and 6 are local-only.
 
 ## Tier 0: Sanity
 
@@ -186,6 +187,26 @@ Runner: [tests/live/run.ts](../tests/live/run.ts). Each live test:
 
 Live tests are **not** in CI because repository secrets aren't configured by default. Run them locally before shipping any AI-integration change.
 
+## Tier 6: CLI-Docker
+
+```bash
+npm run test:cli-docker
+```
+
+Runner: [tests/cli-docker/run.ts](../tests/cli-docker/run.ts). Dockerfile: [tests/cli-docker/Dockerfile](../tests/cli-docker/Dockerfile). The harness builds a disposable container image with Node + the locally-built `flockctl` CLI, launches a real daemon inside, and drives every `flockctl` subcommand (project, workspace, token, state-machines, lifecycle, …) against it. Each `tests/cli-docker/test-*.ts` spawns its own container so tests never share daemon state.
+
+**What it exercises.** Every command exposed by [src/cli.ts](../src/cli.ts) and [src/cli-commands/](../src/cli-commands/), end-to-end, against a live daemon — catches argv parsing regressions, output-format drift, and exit-code contract breaks that pure unit tests can't see. This is the *only* tier that covers the CLI against a real HTTP daemon.
+
+**Prerequisites.**
+
+- Docker daemon reachable (the runner exits non-zero if `docker info` fails).
+- ~2 GB of free disk for the base image.
+- No AI keys needed — the daemon is booted without any `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`.
+
+**When to run.** After any change to [src/cli.ts](../src/cli.ts) or anything under [src/cli-commands/](../src/cli-commands/). Optional otherwise. The tier is **not** part of the default `pretest` / `test:coverage` chain — it's heavy and Docker-gated, so it runs explicitly.
+
+**Coverage gate.** The container collects c8 coverage over the CLI entry files and enforces **100% line + branch** on `src/cli.ts` + `src/cli-commands/**`. A drop below 100% on those files exits `1` and fails the tier. Regular service/route coverage still lives in Tier 1–2.
+
 ## Coverage
 
 Current thresholds in [vitest.config.ts](../vitest.config.ts):
@@ -225,6 +246,7 @@ Live tests do not run in CI.
 - **If you touch UI:** `npm run test:e2e` too.
 - **If you touch AI integration** (`ai-client.ts`, `agent-session.ts`, `claude-cli.ts`, or any file in `src/services/agents/`): run `npm run test:live` locally before opening the PR.
 - **If you add or change a migration:** run `npm run test:smoke` against a fresh `FLOCKCTL_HOME`. Smoke catches missing `_journal.json` entries and unsplit multi-statement SQL.
+- **If you touch `src/cli.ts` or anything under `src/cli-commands/`:** run `npm run test:cli-docker` locally before opening the PR. Docker must be running.
 
 ## Troubleshooting
 

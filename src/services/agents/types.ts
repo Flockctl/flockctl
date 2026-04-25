@@ -24,9 +24,41 @@ export interface AgentStreamUsage extends AgentUsage {
 
 export type AgentStreamEvent =
   | { type: "text"; content: string }
-  | { type: "tool_call"; toolName: string; content: Record<string, unknown> }
+  | { type: "thinking"; content: string }
+  | {
+      type: "tool_call";
+      toolName: string;
+      content: Record<string, unknown>;
+      /**
+       * SDK-assigned id of THIS tool_use block (`toolu_…`). Forwarded so
+       * downstream layers can match a later `parentToolUseId` (which points
+       * AT this id) back to the spawning call — the
+       * `/chats/:id/todos/agents` route correlates sub-agent snapshots to
+       * the originating Task tool_call message via this id, and uses the
+       * Task call's `description` as the per-agent tab label.
+       */
+      toolUseId?: string | null;
+      /**
+       * Sub-agent attribution from the Claude Agent SDK. NULL on a top-
+       * level tool_use emitted by the main agent the user is conversing
+       * with. A `toolu_…` id when the call was emitted from inside a
+       * sub-agent spawned via the Task tool — in which case the value
+       * points back to the parent Task tool_use that created the sub-
+       * agent. Plumbed from the SDK through the provider layer to
+       * `chat_todos` so per-agent timelines stay separated.
+       */
+      parentToolUseId?: string | null;
+    }
   | { type: "tool_result"; toolName: string; content: string }
-  | { type: "usage"; usage: AgentStreamUsage };
+  | { type: "turn_end"; content?: string }
+  | { type: "usage"; usage: AgentStreamUsage }
+  // Eager session_id emit. Fired once per chat() call, from the first SDK
+  // message carrying a session_id — well before the terminal `result`.
+  // Lets AgentSession propagate the id up to chat-routes so it can be
+  // persisted as `chat.claudeSessionId` BEFORE the stream finishes, closing
+  // the "context lost after make reinstall" window where a mid-turn abort
+  // left the id unwritten and the next turn forked to a fresh SDK session.
+  | { type: "session_id"; content: string };
 
 export interface PermissionDecision {
   behavior: "allow" | "deny";
@@ -52,6 +84,16 @@ export type PermissionHandler = (
   options: PermissionQuery,
 ) => Promise<PermissionDecision>;
 
+/**
+ * MCP server spec passed to the agent SDK. The shape is pass-through to the
+ * Claude Agent SDK's `mcpServers` option (stdio/sse/http variants), so it is
+ * intentionally a loose record type — the provider layer doesn't interpret
+ * the fields, it just forwards them. Resolution from flockctl's global /
+ * workspace / project MCP directories happens in the caller (usually
+ * `AgentSession`) via `resolveMcpServersForProject`.
+ */
+export type AgentMcpServers = Record<string, Record<string, unknown>>;
+
 export interface ChatOptions {
   model: string;
   system: string;
@@ -68,6 +110,33 @@ export interface ChatOptions {
   sdkPermissionMode?: "default" | "acceptEdits" | "plan" | "bypassPermissions";
   /** Claude Code session ID to resume — SDK reloads prior conversation. */
   resumeSessionId?: string;
+  /**
+   * Provider-specific credential (`ai_provider_keys.keyValue`) supplied by the
+   * task / chat's assigned key. For `github_copilot`-backed keys this is the
+   * GitHub token; for Claude Code it is unused (auth lives in `configDir`).
+   */
+  providerKeyValue?: string;
+  /**
+   * MCP servers to make available to the agent. Forwarded to the Claude Agent
+   * SDK's `mcpServers` option. When omitted, the SDK sees no MCP servers
+   * (flockctl's on-disk `.mcp.json` is NOT auto-read by the SDK — only by the
+   * interactive `claude` CLI). Typically resolved upstream via
+   * `resolveMcpServersForProject(projectId)`.
+   */
+  mcpServers?: AgentMcpServers;
+  /**
+   * Adaptive extended thinking toggle. When `false`, the provider is
+   * expected to forward `thinking: { type: "disabled" }` to the Claude
+   * Agent SDK. When omitted, the SDK's own default applies (adaptive on
+   * supported models).
+   */
+  thinkingEnabled?: boolean;
+  /**
+   * Reasoning effort level (`low` | `medium` | `high` | `max`). Forwarded
+   * verbatim to the SDK. When omitted, providers default to `"high"` —
+   * byte-identical to the pre-toggle behavior.
+   */
+  effort?: "low" | "medium" | "high" | "max";
 }
 
 export interface ChatResult {
@@ -87,6 +156,12 @@ export interface StreamChatOptions {
   configDir?: string;
   resumeSessionId?: string;
   signal?: AbortSignal;
+  canUseTool?: PermissionHandler;
+  sdkPermissionMode?: "default" | "acceptEdits" | "plan" | "bypassPermissions";
+  /** See `ChatOptions.providerKeyValue`. */
+  providerKeyValue?: string;
+  /** See `ChatOptions.mcpServers`. */
+  mcpServers?: AgentMcpServers;
 }
 
 export interface StreamChatEvent {

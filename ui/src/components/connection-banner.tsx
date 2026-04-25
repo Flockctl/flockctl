@@ -16,15 +16,17 @@ export function ConnectionBanner() {
     );
   }
 
+  const hostSummary = activeServer.is_local ? null : activeServer.ssh?.host ?? null;
+
   return (
     <div className="flex items-center gap-2 border-b border-destructive/30 bg-destructive/10 px-4 py-2 text-xs text-destructive">
       <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
       <span className="flex-1">
         Cannot reach <strong>{activeServer.name}</strong>
-        {activeServer.url ? (
-          <span className="ml-1 font-mono text-[11px] opacity-70">({activeServer.url})</span>
+        {hostSummary ? (
+          <span className="ml-1 font-mono text-[11px] opacity-70">({hostSummary})</span>
         ) : null}
-        . Check that the server is running and the token is correct.
+        . Check that the server is running and the SSH tunnel is up.
       </span>
       <Button
         type="button"

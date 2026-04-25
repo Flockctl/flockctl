@@ -1,0 +1,19 @@
+# Payment with bounded retry: a processing attempt can succeed, fall into
+# a retry-backoff state for another attempt, or give up permanently.
+states:
+  - pending
+  - processing
+  - retry
+  - success
+  - failed
+initial: pending
+transitions:
+  - { from: pending,    to: processing, event: charge }
+  - { from: processing, to: success,    event: approved }
+  - { from: processing, to: retry,      event: transient_error }
+  - { from: processing, to: failed,     event: declined }
+  - { from: retry,      to: processing, event: reattempt }
+  - { from: retry,      to: failed,     event: give_up }
+final:
+  - success
+  - failed

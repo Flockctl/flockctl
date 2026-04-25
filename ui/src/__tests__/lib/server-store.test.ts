@@ -2,54 +2,34 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   LOCAL_SERVER,
   LOCAL_SERVER_ID,
-  cacheToken,
-  clearCachedToken,
-  getCachedToken,
-  clearTokenCache,
   setServerMap,
-  getServerUrl,
+  getServerTunnelPort,
   getActiveServerId,
   setActiveServerId,
 } from "@/lib/server-store";
 
-describe("token cache", () => {
-  beforeEach(() => clearTokenCache());
-
-  it("caches then retrieves a token", () => {
-    cacheToken("s1", "abc");
-    expect(getCachedToken("s1")).toBe("abc");
-  });
-
-  it("clears individual token", () => {
-    cacheToken("s1", "abc");
-    clearCachedToken("s1");
-    expect(getCachedToken("s1")).toBeUndefined();
-  });
-
-  it("clears all tokens", () => {
-    cacheToken("s1", "abc");
-    cacheToken("s2", "def");
-    clearTokenCache();
-    expect(getCachedToken("s1")).toBeUndefined();
-    expect(getCachedToken("s2")).toBeUndefined();
-  });
-
-  it("returns undefined for unknown id", () => {
-    expect(getCachedToken("never-cached")).toBeUndefined();
-  });
-});
-
-describe("server URL map", () => {
-  it("sets then retrieves a URL", () => {
-    setServerMap([{ id: "a", url: "http://x" }]);
-    expect(getServerUrl("a")).toBe("http://x");
+describe("server tunnel-port map", () => {
+  it("sets then retrieves a tunnel port", () => {
+    setServerMap([{ id: "a", tunnelPort: 48123 }]);
+    expect(getServerTunnelPort("a")).toBe(48123);
   });
 
   it("replaces the prior map on each set", () => {
-    setServerMap([{ id: "a", url: "http://x" }]);
-    setServerMap([{ id: "b", url: "http://y" }]);
-    expect(getServerUrl("a")).toBeUndefined();
-    expect(getServerUrl("b")).toBe("http://y");
+    setServerMap([{ id: "a", tunnelPort: 48123 }]);
+    setServerMap([{ id: "b", tunnelPort: 48200 }]);
+    expect(getServerTunnelPort("a")).toBeUndefined();
+    expect(getServerTunnelPort("b")).toBe(48200);
+  });
+
+  it("skips entries whose tunnelPort is null or undefined", () => {
+    setServerMap([
+      { id: "a", tunnelPort: null },
+      { id: "b", tunnelPort: undefined },
+      { id: "c", tunnelPort: 48300 },
+    ]);
+    expect(getServerTunnelPort("a")).toBeUndefined();
+    expect(getServerTunnelPort("b")).toBeUndefined();
+    expect(getServerTunnelPort("c")).toBe(48300);
   });
 });
 
@@ -109,6 +89,6 @@ describe("LOCAL_SERVER constant", () => {
   it("exposes expected shape", () => {
     expect(LOCAL_SERVER.id).toBe(LOCAL_SERVER_ID);
     expect(LOCAL_SERVER.is_local).toBe(true);
-    expect(LOCAL_SERVER.has_token).toBe(false);
+    expect(LOCAL_SERVER.name).toBe("Local");
   });
 });

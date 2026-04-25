@@ -1,5 +1,5 @@
-import { sqliteTable, text, integer, real, index, uniqueIndex } from "drizzle-orm/sqlite-core";
-import { sql } from "drizzle-orm";
+import { sqliteTable, text, integer, real, index, uniqueIndex, check } from "drizzle-orm/sqlite-core";
+import { sql, desc } from "drizzle-orm";
 
 // ─── AI Provider Keys ───
 export const aiProviderKeys = sqliteTable("ai_provider_keys", {
@@ -28,6 +28,15 @@ export const workspaces = sqliteTable("workspaces", {
   path: text("path").notNull().unique(),
   repoUrl: text("repo_url"),
   allowedKeyIds: text("allowed_key_ids"),
+  // ─── Gitignore toggles (migration 0038) ───
+  // Opt-in flags consumed by `ensureGitignore()` (src/services/claude/skills-sync.ts):
+  //   gitignoreFlockctl  → adds `.flockctl/` (and drops its granular sub-paths)
+  //   gitignoreTodo      → adds root-level `TODO.md`
+  //   gitignoreAgentsMd  → adds root-level `AGENTS.md` and `CLAUDE.md`
+  // All default false so existing repos keep their current .gitignore shape.
+  gitignoreFlockctl: integer("gitignore_flockctl", { mode: "boolean" }).default(false).notNull(),
+  gitignoreTodo: integer("gitignore_todo", { mode: "boolean" }).default(false).notNull(),
+  gitignoreAgentsMd: integer("gitignore_agents_md", { mode: "boolean" }).default(false).notNull(),
   createdAt: text("created_at").default(sql`(datetime('now'))`),
   updatedAt: text("updated_at").default(sql`(datetime('now'))`),
 });
@@ -48,6 +57,11 @@ export const projects = sqliteTable("projects", {
   backoffConfig: text("backoff_config"),
   allowedKeyIds: text("allowed_key_ids"),
   deniedKeyIds: text("denied_key_ids"),
+  // ─── Gitignore toggles (migration 0038) ───
+  // See workspaces.gitignore* for semantics; same defaults (all false).
+  gitignoreFlockctl: integer("gitignore_flockctl", { mode: "boolean" }).default(false).notNull(),
+  gitignoreTodo: integer("gitignore_todo", { mode: "boolean" }).default(false).notNull(),
+  gitignoreAgentsMd: integer("gitignore_agents_md", { mode: "boolean" }).default(false).notNull(),
   createdAt: text("created_at").default(sql`(datetime('now'))`),
   updatedAt: text("updated_at").default(sql`(datetime('now'))`),
 });
@@ -80,12 +94,28 @@ export const tasks = sqliteTable("tasks", {
   gitCommitBefore: text("git_commit_before"),
   gitCommitAfter: text("git_commit_after"),
   gitDiffSummary: text("git_diff_summary"),
+  /**
+   * Per-task file-edit journal — JSON `{ entries: [{ filePath, original,
+   * current }] }`. Populated directly from Edit/Write/MultiEdit tool-call
+   * inputs by `task-executor.ts`, rendered via `file-edit-journal.ts`.
+   * See migration 0036 and `docs/API.md` (`GET /tasks/:id/diff`) for
+   * why this replaces the former `git diff <before>..<after>` flow.
+   */
+  fileEdits: text("file_edits"),
   requiresApproval: integer("requires_approval", { mode: "boolean" }).default(false),
   approvalStatus: text("approval_status"),
   approvedAt: text("approved_at"),
   approvalNote: text("approval_note"),
   permissionMode: text("permission_mode"),
   claudeSessionId: text("claude_session_id"),
+  // ─── Spec fields ───
+  // Structured specification attached to a task. `acceptance_criteria` is a
+  // JSON-encoded string array and `decision_table` is a JSON-encoded object.
+  // Both are optional and default to NULL. Per-plan `spec_required` lives in
+  // plan YAML frontmatter (plan-store), not here, so the flag is not duplicated
+  // on every task row.
+  acceptanceCriteria: text("acceptance_criteria"),
+  decisionTable: text("decision_table"),
   createdAt: text("created_at").default(sql`(datetime('now'))`),
   startedAt: text("started_at"),
   completedAt: text("completed_at"),
@@ -105,28 +135,26 @@ export const taskLogs = sqliteTable("task_logs", {
 });
 
 // ─── Task Templates ───
-export const taskTemplates = sqliteTable("task_templates", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  projectId: integer("project_id").references(() => projects.id, { onDelete: "cascade" }),
-  name: text("name").notNull(),
-  description: text("description"),
-  prompt: text("prompt"),
-  agent: text("agent"),
-  model: text("model"),
-  image: text("image"),
-  workingDir: text("working_dir"),
-  envVars: text("env_vars"),
-  timeoutSeconds: integer("timeout_seconds"),
-  labelSelector: text("label_selector"),
-  assignedKeyId: integer("assigned_key_id"),
-  createdAt: text("created_at").default(sql`(datetime('now'))`),
-  updatedAt: text("updated_at").default(sql`(datetime('now'))`),
-});
+// Templates are file-backed (JSON on disk). See `src/services/templates.ts`.
+// Layout:
+//   ~/flockctl/templates/<name>.json                       — global
+//   <workspace>/.flockctl/templates/<name>.json            — workspace
+//   <project>/.flockctl/templates/<name>.json              — project
+// No DB table. Names are unique within a scope (enforced by filesystem).
 
 // ─── Schedules ───
+// Schedules live in the DB and reference a template by (scope, name, optional
+// workspaceId / projectId). The referenced template is resolved at fire time
+// via `templatesService.loadTemplate(...)`; if the file is missing the run
+// is skipped (logged). `assignedKeyId` was moved off the template onto the
+// schedule so a single template can be reused with different AI keys.
 export const schedules = sqliteTable("schedules", {
   id: integer("id").primaryKey({ autoIncrement: true }),
-  templateId: integer("template_id").references(() => taskTemplates.id, { onDelete: "cascade" }),
+  templateScope: text("template_scope").notNull(),
+  templateName: text("template_name").notNull(),
+  templateWorkspaceId: integer("template_workspace_id").references(() => workspaces.id, { onDelete: "cascade" }),
+  templateProjectId: integer("template_project_id").references(() => projects.id, { onDelete: "cascade" }),
+  assignedKeyId: integer("assigned_key_id").references(() => aiProviderKeys.id, { onDelete: "set null" }),
   scheduleType: text("schedule_type").notNull(),
   cronExpression: text("cron_expression"),
   runAt: text("run_at"),
@@ -137,9 +165,26 @@ export const schedules = sqliteTable("schedules", {
   misfireGraceSeconds: integer("misfire_grace_seconds"),
   createdAt: text("created_at").default(sql`(datetime('now'))`),
   updatedAt: text("updated_at").default(sql`(datetime('now'))`),
-});
+}, (table) => [
+  check(
+    "schedules_template_scope_check",
+    sql`template_scope IN ('global','workspace','project')`,
+  ),
+  check(
+    "schedules_template_ids_check",
+    sql`(template_scope = 'global'    AND template_workspace_id IS NULL     AND template_project_id IS NULL)
+     OR (template_scope = 'workspace' AND template_workspace_id IS NOT NULL AND template_project_id IS NULL)
+     OR (template_scope = 'project'   AND template_project_id   IS NOT NULL)`,
+  ),
+  index("idx_schedules_template").on(table.templateScope, table.templateName),
+]);
 
 // ─── Chats ───
+// `idx_chats_entity` backs the entity-aware lookup used by fetch-or-create:
+// GET /chats?project_id=…&entity_type=…&entity_id=… runs in O(log n) and the
+// POST /chats idempotent check reuses the same shape. Order of columns matches
+// the filter predicate (project → type → id) so the query planner can use it
+// even when only project_id is supplied.
 export const chats = sqliteTable("chats", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   workspaceId: integer("workspace_id").references(() => workspaces.id, { onDelete: "set null" }),
@@ -149,9 +194,62 @@ export const chats = sqliteTable("chats", {
   entityType: text("entity_type"),
   entityId: text("entity_id"),
   permissionMode: text("permission_mode"),
+  // `ai_provider_key_id` persists the user's key selection per chat. Provider
+  // is not stored separately — each key row already carries `.provider`, so
+  // the chat's provider is derived by join (no drift risk). SET NULL on key
+  // delete so chats fall back to the global default key on the next turn.
+  aiProviderKeyId: integer("ai_provider_key_id").references(() => aiProviderKeys.id, { onDelete: "set null" }),
+  // Selected model id (e.g. "claude-sonnet-4-20250514"). NULL means "fall back
+  // to project / workspace / global default" on the next turn.
+  model: text("model"),
+  // Approval flow — symmetric with tasks (see migration 0011). A chat with
+  // `requiresApproval=true` flips `approvalStatus` to 'pending' after each
+  // successful assistant turn, surfaces as a `chat_approval` blocker in the
+  // `/attention` inbox, and waits for the user to call
+  // `POST /chats/:id/{approve,reject}`. Approve clears the pending state so
+  // the next turn can run; reject also clears it but records the rejection
+  // for audit. No gating of incoming user messages — this is advisory
+  // tracking, not a hard lock.
+  requiresApproval: integer("requires_approval", { mode: "boolean" }).default(false),
+  approvalStatus: text("approval_status"),
+  approvedAt: text("approved_at"),
+  approvalNote: text("approval_note"),
+  /**
+   * Per-chat file-edit journal — JSON `{ entries: [{ filePath, original,
+   * current }] }`. Populated from Edit/Write/MultiEdit tool-call inputs
+   * by `chat-executor.ts`. Shares the `file-edit-journal.ts` module with
+   * tasks so rendering / summary logic is identical on both sides.
+   */
+  fileEdits: text("file_edits"),
+  /**
+   * Adaptive thinking toggle. `true` (default) lets the Claude Agent SDK
+   * decide when to emit thinking blocks — matches the prior behavior. `false`
+   * forces `thinking: { type: "disabled" }` for the next turn, skipping the
+   * extended-thinking step entirely. Persisted per chat so the UI restores
+   * the user's pick on reload.
+   */
+  thinkingEnabled: integer("thinking_enabled", { mode: "boolean" }).default(true).notNull(),
+  /**
+   * Reasoning effort level (`low` | `medium` | `high` | `max`). NULL means
+   * "use the hardcoded default" (`high`) — byte-identical to the pre-toggle
+   * behavior. The per-chat value overrides the default only when the user
+   * explicitly picks a level in the UI.
+   */
+  effort: text("effort"),
+  /**
+   * Per-chat pin toggle. When `true`, the chat floats to the top of
+   * `GET /chats` above every unpinned row — filters (project / workspace /
+   * entity) still apply first, so a pinned chat that doesn't match the
+   * active filter is hidden, and unpinned rows keep their newest-first
+   * order beneath the pinned ones. Default `false` so existing chats
+   * upgrade as unpinned without a backfill.
+   */
+  pinned: integer("pinned", { mode: "boolean" }).default(false).notNull(),
   createdAt: text("created_at").default(sql`(datetime('now'))`),
   updatedAt: text("updated_at").default(sql`(datetime('now'))`),
-});
+}, (table) => [
+  index("idx_chats_entity").on(table.projectId, table.entityType, table.entityId),
+]);
 
 // ─── Chat Messages ───
 export const chatMessages = sqliteTable("chat_messages", {
@@ -162,6 +260,60 @@ export const chatMessages = sqliteTable("chat_messages", {
   createdAt: text("created_at").default(sql`(datetime('now'))`),
 }, (table) => [
   index("idx_chat_messages_chat_created").on(table.chatId, table.createdAt),
+]);
+
+// ─── Chat Attachments ───
+// File blobs uploaded into a chat. `chat_id` is mandatory and cascades on
+// delete of the chat; `message_id` is optional and is set to NULL if the
+// originating message is deleted, so the blob row survives as an orphan for
+// audit rather than vanishing. `path` is the on-disk location inside
+// FLOCKCTL_HOME/attachments/ and is UNIQUE: retried uploads must regenerate
+// the UUID rather than reuse it, which prevents accidental duplicate rows.
+export const chatAttachments = sqliteTable("chat_attachments", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  chatId: integer("chat_id").notNull().references(() => chats.id, { onDelete: "cascade" }),
+  messageId: integer("message_id").references(() => chatMessages.id, { onDelete: "set null" }),
+  filename: text("filename").notNull(),
+  mimeType: text("mime_type").notNull(),
+  sizeBytes: integer("size_bytes").notNull(),
+  path: text("path").notNull().unique(),
+  createdAt: text("created_at").default(sql`(datetime('now'))`),
+}, (table) => [
+  index("idx_chat_attachments_chat_created").on(table.chatId, table.createdAt),
+  index("idx_chat_attachments_message").on(table.messageId),
+]);
+
+// ─── Chat Todos ───
+// Snapshots of a chat's TodoWrite state. Each row is an immutable snapshot;
+// dedup of identical snapshots is handled at the application layer (no
+// UNIQUE constraint). The partial index on task_id powers the task-scoped
+// history view, and the (chat_id, created_at DESC) index powers the
+// latest-snapshot / progress-bar query (LIMIT 1).
+//
+// `parentToolUseId` (added in migration 0041) attributes each snapshot to a
+// specific agent within the chat. NULL = the main agent the user is talking
+// to. A non-NULL `toolu_…` id identifies a sub-agent spawned via the Claude
+// Agent SDK's `Task` tool — the value points back to the `Task` tool_use
+// that created the sub-agent, so the route layer can join to the spawning
+// `chat_messages` row to recover the human-readable description for the
+// "Todo history" tab label. Dedup is keyed per (chatId, parentToolUseId)
+// so two agents emitting identical todos arrays both land in the table —
+// otherwise sub-agent A's `[step]` would silently mask sub-agent B's
+// independent `[step]`.
+export const chatTodos = sqliteTable("chat_todos", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  chatId: integer("chat_id").notNull().references(() => chats.id, { onDelete: "cascade" }),
+  taskId: integer("task_id").references(() => tasks.id, { onDelete: "cascade" }),
+  parentToolUseId: text("parent_tool_use_id"),
+  todosJson: text("todos_json").notNull(),
+  createdAt: text("created_at").default(sql`(datetime('now'))`).notNull(),
+}, (table) => [
+  index("idx_chat_todos_chat_created").on(table.chatId, desc(table.createdAt)),
+  index("idx_chat_todos_task_created")
+    .on(table.taskId, desc(table.createdAt))
+    .where(sql`task_id IS NOT NULL`),
+  index("idx_chat_todos_chat_parent_created")
+    .on(table.chatId, table.parentToolUseId, desc(table.createdAt)),
 ]);
 
 // ─── Usage Records ───
@@ -178,6 +330,9 @@ export const usageRecords = sqliteTable("usage_records", {
   cacheCreationInputTokens: integer("cache_creation_input_tokens").default(0),
   cacheReadInputTokens: integer("cache_read_input_tokens").default(0),
   totalCostUsd: real("total_cost_usd").default(0),
+  /** Optional marker for standalone LLM activities not attached to a task or
+   *  chat message (e.g. 'incident_extract'). NULL for legacy task/chat usage. */
+  activityType: text("activity_type"),
   createdAt: text("created_at").default(sql`(datetime('now'))`),
 }, (table) => [
   index("idx_usage_records_created").on(table.createdAt),
@@ -200,6 +355,29 @@ export const budgetLimits = sqliteTable("budget_limits", {
   index("idx_budget_limits_scope").on(table.scope, table.scopeId),
 ]);
 
+// ─── Incidents ───
+// Lightweight post-mortem / knowledge-base entries. `symptom`, `root_cause`,
+// and `resolution` are mirrored into an FTS5 virtual table (`incidents_fts`)
+// by raw-SQL triggers in migration 0025. The virtual table is not declared
+// here because drizzle-kit does not emit FTS5 DDL; it is created manually
+// in the migration and queried via raw SQL (`MATCH`) from services.
+// `tags` stores a JSON-encoded string array (e.g. '["auth","db"]').
+export const incidents = sqliteTable("incidents", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  title: text("title").notNull(),
+  symptom: text("symptom"),
+  rootCause: text("root_cause"),
+  resolution: text("resolution"),
+  tags: text("tags"),
+  projectId: integer("project_id").references(() => projects.id, { onDelete: "set null" }),
+  createdByChatId: integer("created_by_chat_id").references(() => chats.id, { onDelete: "set null" }),
+  createdAt: text("created_at").default(sql`(datetime('now'))`),
+  updatedAt: text("updated_at").default(sql`(datetime('now'))`),
+}, (table) => [
+  index("idx_incidents_project").on(table.projectId),
+  index("idx_incidents_created").on(table.createdAt),
+]);
+
 // ─── Secrets ───
 // Opaque KV store for sensitive values referenced from MCP/agent env via
 // ${secret:NAME} placeholders. Values are encrypted at rest with a master
@@ -217,4 +395,40 @@ export const secrets = sqliteTable("secrets", {
   updatedAt: text("updated_at").default(sql`(datetime('now'))`),
 }, (table) => [
   uniqueIndex("idx_secrets_scope_name").on(table.scope, table.scopeId, table.name),
+]);
+
+// ─── Agent Questions ───
+// In-flight prompts the agent has raised back to the user (e.g. ambiguous
+// instructions, missing context). Each row is bound to exactly one of a
+// `task_id` or `chat_id` — the CHECK constraint enforces that XOR so a
+// question can never orphan or double-fire across both contexts. `request_id`
+// is the externally visible idempotency token (UNIQUE) so retries from the
+// agent don't insert duplicate rows for the same prompt; `tool_use_id` is the
+// Anthropic SDK tool_use identifier the answer must be routed back to.
+// `status` is enum-checked at the DB layer to keep stale code from inserting
+// junk values. Indexes are tuned for the two hot lookups: "open questions for
+// task/chat X" and "all pending questions oldest-first" (for the work queue).
+export const agentQuestions = sqliteTable("agent_questions", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  requestId: text("request_id").notNull().unique(),
+  taskId: integer("task_id").references(() => tasks.id, { onDelete: "cascade" }),
+  chatId: integer("chat_id").references(() => chats.id, { onDelete: "cascade" }),
+  toolUseId: text("tool_use_id").notNull(),
+  question: text("question").notNull(),
+  answer: text("answer"),
+  status: text("status").notNull().default("pending"),
+  createdAt: text("created_at").default(sql`(datetime('now'))`),
+  answeredAt: text("answered_at"),
+}, (table) => [
+  check(
+    "agent_questions_status_check",
+    sql`status IN ('pending','answered','cancelled')`,
+  ),
+  check(
+    "agent_questions_target_check",
+    sql`(task_id IS NOT NULL AND chat_id IS NULL) OR (task_id IS NULL AND chat_id IS NOT NULL)`,
+  ),
+  index("idx_agent_questions_task_status").on(table.taskId, table.status),
+  index("idx_agent_questions_chat_status").on(table.chatId, table.status),
+  index("idx_agent_questions_status_created").on(table.status, table.createdAt),
 ]);

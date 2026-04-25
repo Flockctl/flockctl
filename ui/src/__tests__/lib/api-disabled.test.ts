@@ -49,7 +49,7 @@ describe("api — workspace skill disables", () => {
   it("POST /skills/workspaces/:id/disabled sends {name, level} body", async () => {
     const fetchMock = mockFetch({ disabledSkills: [{ name: "planning", level: "global" }] });
     await disableWorkspaceSkill("7", { name: "planning", level: "global" });
-    const [url, init] = fetchMock.mock.calls[0];
+    const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe("/skills/workspaces/7/disabled");
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body)).toEqual({ name: "planning", level: "global" });
@@ -58,7 +58,7 @@ describe("api — workspace skill disables", () => {
   it("DELETE /skills/workspaces/:id/disabled uses body — not path param", async () => {
     const fetchMock = mockFetch({ disabledSkills: [] });
     await enableWorkspaceSkill("7", { name: "planning", level: "global" });
-    const [url, init] = fetchMock.mock.calls[0];
+    const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe("/skills/workspaces/7/disabled");
     expect(init.method).toBe("DELETE");
     expect(JSON.parse(init.body)).toEqual({ name: "planning", level: "global" });
@@ -81,7 +81,7 @@ describe("api — project skill disables", () => {
   it("POST sends {name, level} body and handles workspace-level disable from project scope", async () => {
     const fetchMock = mockFetch({ disabledSkills: [{ name: "debug", level: "workspace" }] });
     await disableProjectSkill("42", { name: "debug", level: "workspace" });
-    const [url, init] = fetchMock.mock.calls[0];
+    const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe("/skills/projects/42/disabled");
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body)).toEqual({ name: "debug", level: "workspace" });
@@ -90,7 +90,7 @@ describe("api — project skill disables", () => {
   it("DELETE uses body with both name and level so unique (name, level) pair is removed", async () => {
     const fetchMock = mockFetch({ disabledSkills: [] });
     await enableProjectSkill("42", { name: "debug", level: "project" });
-    const [url, init] = fetchMock.mock.calls[0];
+    const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe("/skills/projects/42/disabled");
     expect(init.method).toBe("DELETE");
     expect(JSON.parse(init.body)).toEqual({ name: "debug", level: "project" });
@@ -113,7 +113,7 @@ describe("api — MCP disables use /disabled-mcp path", () => {
   it("POST /mcp/workspaces/:id/disabled-mcp sends {name, level}", async () => {
     const fetchMock = mockFetch({ disabledMcpServers: [{ name: "github", level: "global" }] });
     await disableWorkspaceMcpServer("7", { name: "github", level: "global" });
-    const [url, init] = fetchMock.mock.calls[0];
+    const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe("/mcp/workspaces/7/disabled-mcp");
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body)).toEqual({ name: "github", level: "global" });
@@ -122,7 +122,7 @@ describe("api — MCP disables use /disabled-mcp path", () => {
   it("DELETE /mcp/workspaces/:id/disabled-mcp uses body", async () => {
     const fetchMock = mockFetch({ disabledMcpServers: [] });
     await enableWorkspaceMcpServer("7", { name: "github", level: "global" });
-    const [url, init] = fetchMock.mock.calls[0];
+    const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe("/mcp/workspaces/7/disabled-mcp");
     expect(init.method).toBe("DELETE");
     expect(JSON.parse(init.body)).toEqual({ name: "github", level: "global" });
@@ -140,7 +140,7 @@ describe("api — MCP disables use /disabled-mcp path", () => {
   it("POST /mcp/projects/:pid/disabled-mcp with body", async () => {
     const fetchMock = mockFetch({ disabledMcpServers: [{ name: "srv", level: "project" }] });
     await disableProjectMcpServer("42", { name: "srv", level: "project" });
-    const [url, init] = fetchMock.mock.calls[0];
+    const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe("/mcp/projects/42/disabled-mcp");
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body)).toEqual({ name: "srv", level: "project" });
@@ -149,7 +149,7 @@ describe("api — MCP disables use /disabled-mcp path", () => {
   it("DELETE /mcp/projects/:pid/disabled-mcp with body", async () => {
     const fetchMock = mockFetch({ disabledMcpServers: [] });
     await enableProjectMcpServer("42", { name: "srv", level: "project" });
-    const [url, init] = fetchMock.mock.calls[0];
+    const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe("/mcp/projects/42/disabled-mcp");
     expect(init.method).toBe("DELETE");
     expect(JSON.parse(init.body)).toEqual({ name: "srv", level: "project" });

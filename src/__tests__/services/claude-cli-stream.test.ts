@@ -14,7 +14,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   renameSession: (...args: any[]) => mockRenameSession(...args),
 }));
 
-import { streamViaClaudeAgentSDK, renameClaudeSession } from "../../services/claude-cli.js";
+import { streamViaClaudeAgentSDK, renameClaudeSession } from "../../services/claude/cli.js";
 
 async function collect<T>(gen: AsyncGenerator<T>): Promise<T[]> {
   const out: T[] = [];
@@ -252,6 +252,59 @@ describe("streamViaClaudeAgentSDK", () => {
       }),
     );
     expect(events.find((e) => e.type === "done")).toBeUndefined();
+  });
+
+  it("forwards mcpServers to SDK options when provided", async () => {
+    mockQuery.mockReturnValue(
+      toAsync([{ type: "result", session_id: "r", usage: {}, total_cost_usd: 0 }]),
+    );
+
+    const mcpServers = {
+      albs: { command: "/bin/albs-mcp" },
+      "chrome-devtools": { command: "npx", args: ["-y", "chrome-devtools-mcp@latest"] },
+    };
+
+    await collect(
+      streamViaClaudeAgentSDK({
+        model: "m",
+        system: "",
+        messages: [{ role: "user", content: "hi" }],
+        mcpServers,
+      }),
+    );
+
+    const callArg = mockQuery.mock.calls[0][0];
+    expect(callArg.options.mcpServers).toEqual(mcpServers);
+  });
+
+  it("omits mcpServers from SDK options when unset or empty", async () => {
+    mockQuery.mockReturnValue(
+      toAsync([{ type: "result", session_id: "r", usage: {}, total_cost_usd: 0 }]),
+    );
+
+    await collect(
+      streamViaClaudeAgentSDK({
+        model: "m",
+        system: "",
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    );
+    expect(mockQuery.mock.calls[0][0].options.mcpServers).toBeUndefined();
+
+    mockQuery.mockClear();
+    mockQuery.mockReturnValue(
+      toAsync([{ type: "result", session_id: "r", usage: {}, total_cost_usd: 0 }]),
+    );
+
+    await collect(
+      streamViaClaudeAgentSDK({
+        model: "m",
+        system: "",
+        messages: [{ role: "user", content: "hi" }],
+        mcpServers: {},
+      }),
+    );
+    expect(mockQuery.mock.calls[0][0].options.mcpServers).toBeUndefined();
   });
 
   it("respects external AbortSignal", async () => {

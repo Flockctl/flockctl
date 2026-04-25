@@ -1,0 +1,10 @@
+{
+  "reporter": ["text", "json-summary", "html"],
+  "include": ["dist/cli.js", "dist/cli-commands/**/*.js"],
+  "exclude": ["**/*.d.ts"],
+  "check-coverage": true,
+  "lines": 100,
+  "branches": 100,
+  "functions": 100,
+  "statements": 100
+}

@@ -1,6 +1,9 @@
-import { useEffect, useRef, useCallback, useState } from "react";
+import { useEffect, useRef, useCallback, useState, useSyncExternalStore } from "react";
 import { getApiBaseUrl } from "./api";
-import { getActiveServerId, getCachedToken, LOCAL_SERVER_ID } from "./server-store";
+import {
+  getActiveServerId,
+  subscribeActiveServerId,
+} from "./server-store";
 
 // --- Message types mirroring shared/flockctl_shared/protocol.py ---
 
@@ -19,6 +22,20 @@ export const MessageType = {
   PERMISSION_RESOLVED: "permission_resolved",
   SESSION_STARTED: "session_started",
   SESSION_ENDED: "session_ended",
+  TODO_UPDATED: "todo_updated",
+  AGENT_QUESTION: "agent_question",
+  AGENT_QUESTION_RESOLVED: "agent_question_resolved",
+  // Chat-only: emitted by chat-executor.ts whenever a file-modifying tool
+  // call appends entries to the chat's file_edits journal. Drives the
+  // "Changes" card at the bottom of <ChatConversation>.
+  CHAT_DIFF_UPDATED: "chat_diff_updated",
+  // Chat-only: emitted when `PATCH /chats/:id` mutates the permission mode
+  // of an in-flight session. Payload `{ chat_id, previous, current }`. The
+  // UI updates the cached chat's `permission_mode` in-place so the selector
+  // reflects the new value without a follow-up GET. Pending-permission
+  // cards auto-resolved by the swap disappear via the `permission_resolved`
+  // frames emitted one-per-request by the backend.
+  CHAT_PERMISSION_MODE_CHANGED: "chat_permission_mode_changed",
 } as const;
 export type MessageType = (typeof MessageType)[keyof typeof MessageType];
 
@@ -52,20 +69,6 @@ export function getWsBaseUrl(): string {
   // Relative path (e.g. "/api" or "") — resolve against current origin
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${protocol}//${window.location.host}${base}`;
-}
-
-/**
- * Append the remote server token as `?token=...` when targeting a non-local
- * server. WebSocket APIs don't support custom headers at handshake, so query
- * auth is the standard pattern. Returns the URL unchanged for the local server.
- */
-function withWsAuth(url: string): string {
-  const id = getActiveServerId();
-  if (id === LOCAL_SERVER_ID) return url;
-  const token = getCachedToken(id);
-  if (!token) return url;
-  const sep = url.includes("?") ? "&" : "?";
-  return `${url}${sep}token=${encodeURIComponent(token)}`;
 }
 
 // --- Reconnecting WebSocket client ---
@@ -234,6 +237,14 @@ export function useWebSocket(
   const onMessageRef = useRef(onMessage);
   onMessageRef.current = onMessage;
 
+  // Subscribe to active-server changes so a server switch tears down the
+  // current socket (pointed at the old server) and reconnects to the new URL.
+  const activeServerId = useSyncExternalStore(
+    subscribeActiveServerId,
+    getActiveServerId,
+    getActiveServerId,
+  );
+
   useEffect(() => {
     if (!enabled) {
       clientRef.current?.close();
@@ -242,7 +253,7 @@ export function useWebSocket(
       return;
     }
 
-    const url = withWsAuth(`${getWsBaseUrl()}${path}`);
+    const url = `${getWsBaseUrl()}${path}`;
     const client = new WebSocketClient({
       url,
       reconnect,
@@ -258,7 +269,8 @@ export function useWebSocket(
       client.close();
       clientRef.current = null;
     };
-  }, [path, enabled, reconnect]);
+    // activeServerId intentionally in deps: re-run to reconnect on server switch.
+  }, [path, enabled, reconnect, activeServerId]);
 
   const send = useCallback((msg: WSMessage) => {
     clientRef.current?.send(msg);

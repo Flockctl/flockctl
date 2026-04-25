@@ -7,7 +7,7 @@ import Database from "better-sqlite3";
 
 const createdSessions: any[] = [];
 
-vi.mock("../../services/agent-session", () => {
+vi.mock("../../services/agent-session/index", () => {
   const EventEmitter = require("events").EventEmitter;
   class MockAgentSession extends EventEmitter {
     private opts: any;
@@ -37,10 +37,10 @@ vi.mock("../../services/agent-session", () => {
 vi.mock("../../services/ws-manager", () => ({
   wsManager: { broadcast: vi.fn(), broadcastAll: vi.fn() },
 }));
-vi.mock("../../services/claude-skills-sync", () => ({
+vi.mock("../../services/claude/skills-sync", () => ({
   reconcileClaudeSkillsForProject: vi.fn(),
 }));
-vi.mock("../../services/claude-mcp-sync", () => ({
+vi.mock("../../services/claude/mcp-sync", () => ({
   reconcileMcpForProject: vi.fn(),
 }));
 vi.mock("../../services/git-context", () => ({
@@ -71,11 +71,11 @@ vi.mock("child_process", () => ({
 
 // selectKeyForTask can throw to exercise failure branch
 const selectKeyMock = vi.fn();
-vi.mock("../../services/key-selection", () => ({
+vi.mock("../../services/ai/key-selection", () => ({
   selectKeyForTask: (...args: any[]) => selectKeyMock(...args),
 }));
 
-import { taskExecutor } from "../../services/task-executor.js";
+import { taskExecutor } from "../../services/task-executor/index.js";
 
 let db: FlockctlDb;
 let sqlite: Database.Database;
@@ -126,47 +126,72 @@ beforeEach(() => {
   projectId = p.id;
 });
 
-describe("task-executor — git capture paths", () => {
-  it("records gitCommitBefore and gitDiffSummary when repo has commits", async () => {
+describe("task-executor — file-edit journal + git capture", () => {
+  it("persists file_edits journal and derives gitDiffSummary from it", async () => {
+    // Task contains an Edit tool call; we want the journal to capture it and
+    // gitDiffSummary to be the journal's human-readable one-liner.
     execFileSyncMock
-      .mockReturnValueOnce("sha-before\n") // rev-parse HEAD pre
-      .mockReturnValueOnce("sha-after\n")  // rev-parse HEAD post
-      .mockReturnValueOnce(" 1 file changed\n"); // git diff --stat
+      .mockReturnValueOnce("sha-before\n")
+      .mockReturnValueOnce("sha-after\n");
+
+    // Wire the mocked agent session to emit one Edit call during run().
+    const agentMod = await import("../../services/agent-session/index.js");
+    const orig = (agentMod as any).AgentSession.prototype.run;
+    (agentMod as any).AgentSession.prototype.run = async function () {
+      this.emit("session_id", "claude-session-edit");
+      this.emit("tool_call", "Edit", {
+        file_path: "/tmp/px/foo.ts",
+        old_string: "old\nline",
+        new_string: "new\nline\nadded",
+      });
+      return {
+        inputTokens: 1, outputTokens: 1,
+        cacheCreationInputTokens: 0, cacheReadInputTokens: 0,
+        totalCostUsd: 0, turns: 1, durationMs: 1,
+      };
+    };
 
     const task = db.insert(tasks).values({
       projectId,
-      prompt: "git-change",
+      prompt: "edit-task",
       status: "queued",
     }).returning().get()!;
 
-    await taskExecutor.execute(task.id);
+    try {
+      await taskExecutor.execute(task.id);
+    } finally {
+      (agentMod as any).AgentSession.prototype.run = orig;
+    }
 
     const u = db.select().from(tasks).where(eq(tasks.id, task.id)).get()!;
     expect(u.gitCommitBefore).toBe("sha-before");
     expect(u.gitCommitAfter).toBe("sha-after");
-    expect(u.gitDiffSummary).toContain("file changed");
+    expect(u.fileEdits).not.toBeNull();
+    const journal = JSON.parse(u.fileEdits as string);
+    expect(journal.entries).toHaveLength(1);
+    expect(journal.entries[0].filePath).toBe("/tmp/px/foo.ts");
+    expect(u.gitDiffSummary).toMatch(/1 file changed/);
   });
 
-  it("falls back to working-tree diff when no new commits were made", async () => {
+  it("leaves fileEdits NULL and gitDiffSummary NULL when the agent made no edits", async () => {
     execFileSyncMock
-      .mockReturnValueOnce("sha-same\n")   // rev-parse HEAD pre
-      .mockReturnValueOnce("sha-same\n")   // rev-parse HEAD post
-      .mockReturnValueOnce("")             // git diff --stat sha..sha (empty)
-      .mockReturnValueOnce(" M foo.ts\n"); // git diff --stat (working tree)
+      .mockReturnValueOnce("sha-before\n")
+      .mockReturnValueOnce("sha-after\n");
 
     const task = db.insert(tasks).values({
       projectId,
-      prompt: "working-tree",
+      prompt: "no-edits",
       status: "queued",
     }).returning().get()!;
 
     await taskExecutor.execute(task.id);
 
     const u = db.select().from(tasks).where(eq(tasks.id, task.id)).get()!;
-    expect(u.gitDiffSummary).toContain("M foo.ts");
+    expect(u.fileEdits).toBeNull();
+    expect(u.gitDiffSummary).toBeNull();
   });
 
-  it("tolerates git errors during both pre- and post-execution capture", async () => {
+  it("tolerates git errors during pre-execution capture", async () => {
     execFileSyncMock.mockImplementation(() => { throw new Error("not a git repo"); });
 
     const task = db.insert(tasks).values({
@@ -291,5 +316,31 @@ describe("task-executor — workspace config", () => {
     // Session options should receive a permission mode resolved from workspace config
     const opts = createdSessions.at(-1)!.opts;
     expect(opts.permissionMode).toBeDefined();
+  });
+
+  it("threads workspaceContext (name + path + sibling projects) to the session", async () => {
+    // Seed a second project under the same workspace so the list is non-trivial.
+    db.insert(projects).values({
+      name: "tx-sibling",
+      workspaceId,
+      path: "/tmp/sibling",
+      description: "a sibling",
+    }).run();
+
+    const task = db.insert(tasks).values({
+      projectId,
+      prompt: "ws-ctx",
+      status: "queued",
+    }).returning().get()!;
+
+    await taskExecutor.execute(task.id);
+
+    const opts = createdSessions.at(-1)!.opts;
+    expect(opts.workspaceContext).toBeDefined();
+    expect(opts.workspaceContext.name).toBe("wsx");
+    expect(opts.workspaceContext.path).toBe("/tmp/wsx");
+    const names = opts.workspaceContext.projects.map((p: { name: string }) => p.name).sort();
+    expect(names).toContain("tx-px");
+    expect(names).toContain("tx-sibling");
   });
 });

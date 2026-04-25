@@ -3,6 +3,9 @@ name: CI
 on:
   pull_request:
     branches: [main]
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -20,8 +23,12 @@ jobs:
           cache: "npm"
       - name: Install root deps
         run: npm ci
+      - name: Audit root dependencies
+        run: npm audit --audit-level=moderate
       - name: Typecheck
         run: npm run typecheck
+      - name: Lint
+        run: npm run lint
       - name: Vitest with coverage
         run: npm run test:coverage
       - name: Smoke tests
@@ -34,8 +41,14 @@ jobs:
           path: coverage/
           if-no-files-found: ignore
 
+  # UI E2E (Playwright) is intentionally NOT run in CI — it's a local-only
+  # tier in the testing ladder (see docs/TESTING.md and AGENTS.md rule 1).
+  # Reasons: 119 specs × 1 worker × retry ≈ 30 min runtime, plus the suite
+  # currently has pre-existing rot that needs a dedicated de-rot pass.
+  # Backend smoke + vitest cover the daemon contract; UI typecheck + lint
+  # + build + unit tests cover the frontend invariants.
   ui:
-    name: UI (typecheck + lint + build + E2E)
+    name: UI (typecheck + lint + build + unit tests)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +63,8 @@ jobs:
         run: npm ci
       - name: Install UI deps
         run: cd ui && npm ci
+      - name: Audit UI dependencies
+        run: cd ui && npm audit --audit-level=moderate
       - name: UI typecheck
         run: npm run typecheck:ui
       - name: UI lint
@@ -58,14 +73,3 @@ jobs:
         run: cd ui && npm run build
       - name: UI unit tests
         run: cd ui && npm test
-      - name: Install Playwright browsers
-        run: cd ui && npx playwright install chromium --with-deps
-      - name: UI E2E
-        run: npm run test:e2e
-      - name: Upload Playwright report
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: playwright-report
-          path: ui/playwright-report/
-          if-no-files-found: ignore

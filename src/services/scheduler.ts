@@ -1,9 +1,10 @@
 import cron, { type ScheduledTask } from "node-cron";
 import { CronExpressionParser } from "cron-parser";
 import { getDb } from "../db/index.js";
-import { schedules, taskTemplates, tasks } from "../db/schema.js";
+import { schedules, tasks } from "../db/schema.js";
 import { eq } from "drizzle-orm";
-import { taskExecutor } from "./task-executor.js";
+import { taskExecutor } from "./task-executor/index.js";
+import { getTemplate, type TemplateScope } from "./templates.js";
 
 interface ScheduledJob {
   task: ScheduledTask;
@@ -51,6 +52,8 @@ export class SchedulerService {
 
     // Compute and persist next fire time
     const nextFire = this.computeNextFireTime(expression, tz);
+    /* v8 ignore next — defensive: cron.validate accepted expression above, so
+     * computeNextFireTime's catch path is unreachable here. */
     if (nextFire) {
       const db = getDb();
       db.update(schedules)
@@ -103,45 +106,72 @@ export class SchedulerService {
 
   /** Stop all cron jobs */
   stopAll(): void {
-    for (const [id, job] of this.jobs) {
+    for (const [, job] of this.jobs) {
       job.task.stop();
     }
     this.jobs.clear();
   }
 
-  /** Execute a schedule: read template from DB and create a task */
+  /**
+   * Execute a schedule: resolve its template on disk and spawn a task. If the
+   * referenced template file is missing (deleted, renamed, or the scope's
+   * project/workspace path no longer exists) we skip the run — schedules
+   * survive template churn and the next fire will re-check.
+   */
   private executeSchedule(scheduleId: number): void {
     const db = getDb();
     const schedule = db.select().from(schedules).where(eq(schedules.id, scheduleId)).get();
     if (!schedule || schedule.status !== "active") return;
 
-    // Read current template parameters (not cached at schedule creation)
-    const template = schedule.templateId
-      ? db.select().from(taskTemplates).where(eq(taskTemplates.id, schedule.templateId)).get()
-      : null;
-
-    if (!template) return;
-
-    // Create task from template
+    let template = null;
     try {
-      const newTask = db.insert(tasks).values({
-        projectId: template.projectId,
-        prompt: template.prompt,
-        agent: template.agent ?? "claude-code",
-        model: template.model,
-        taskType: "execution",
-        label: `scheduled-${template.name}-${Date.now()}`,
-        workingDir: template.workingDir,
-        envVars: template.envVars,
-        timeoutSeconds: template.timeoutSeconds,
-      }).returning().get();
-
-      // Queue for execution
-      if (newTask) {
-        taskExecutor.execute(newTask.id);
-      }
+      template = getTemplate(
+        schedule.templateScope as TemplateScope,
+        schedule.templateName,
+        {
+          workspaceId: schedule.templateWorkspaceId ?? undefined,
+          projectId: schedule.templateProjectId ?? undefined,
+        },
+      );
     } catch (err) {
-      console.error("Failed to create scheduled task:", err);
+      console.error(`[scheduler] failed to load template for schedule ${scheduleId}:`, err);
+    }
+
+    if (!template) {
+      console.warn(
+        `[scheduler] schedule ${scheduleId} points to missing template ` +
+        `${schedule.templateScope}:${schedule.templateName} — skipping this fire`,
+      );
+    } else {
+      try {
+        const newTask = db.insert(tasks).values({
+          // For project-scoped templates we carry the project id onto the task
+          // so executor/permissions work the same as manually created tasks.
+          // Workspace and global templates produce tasks with no projectId —
+          // the executor falls back to the template's workingDir (if any).
+          projectId: schedule.templateProjectId ?? null,
+          prompt: template.prompt,
+          agent: template.agent ?? "claude-code",
+          model: template.model,
+          taskType: "execution",
+          label: `scheduled-${template.name}-${Date.now()}`,
+          workingDir: template.workingDir,
+          envVars: template.envVars ? JSON.stringify(template.envVars) : null,
+          timeoutSeconds: template.timeoutSeconds,
+          // assignedKeyId moved off the template onto the schedule — one
+          // template can now be reused with different keys per schedule.
+          assignedKeyId: schedule.assignedKeyId ?? null,
+        }).returning().get();
+
+        /* v8 ignore next — defensive: Drizzle's .returning().get() after a
+         * successful INSERT always yields the row; the catch block covers
+         * the failure path. */
+        if (newTask) {
+          taskExecutor.execute(newTask.id);
+        }
+      } catch (err) {
+        console.error("Failed to create scheduled task:", err);
+      }
     }
 
     // Update last fire time and compute next fire time

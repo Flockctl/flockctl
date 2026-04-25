@@ -5,7 +5,9 @@ import {
   DEFAULT_PERMISSION_MODE,
   allowedRoots,
   decideAuto,
+  denyIfTouchesSensitivePath,
   extractToolPaths,
+  isPathDenied,
   isPathWithinRoots,
   isPermissionMode,
   modeToSdkOptions,
@@ -256,24 +258,26 @@ describe("decideAuto", () => {
 });
 
 describe("modeToSdkOptions", () => {
-  it("bypassPermissions sets the flag and skips canUseTool", () => {
+  it("bypassPermissions downgrades SDK mode to default so canUseTool runs the denylist", () => {
     const o = modeToSdkOptions("bypassPermissions");
-    expect(o.permissionMode).toBe("bypassPermissions");
-    expect(o.allowDangerouslySkipPermissions).toBe(true);
-    expect(o.useCanUseTool).toBe(false);
+    expect(o.permissionMode).toBe("default");
+    expect(o.useCanUseTool).toBe(true);
+    // The dangerous skip flag is intentionally not set — it would bypass
+    // canUseTool entirely and defeat the path denylist.
+    expect(o.allowDangerouslySkipPermissions).toBeUndefined();
   });
 
-  it("acceptEdits passes through, no canUseTool", () => {
+  it("acceptEdits wires canUseTool (handler emulates read+write auto-approval)", () => {
     expect(modeToSdkOptions("acceptEdits")).toMatchObject({
       permissionMode: "acceptEdits",
-      useCanUseTool: false,
+      useCanUseTool: true,
     });
   });
 
-  it("plan passes through, no canUseTool", () => {
+  it("plan wires canUseTool (SDK still enforces no-writes)", () => {
     expect(modeToSdkOptions("plan")).toMatchObject({
       permissionMode: "plan",
-      useCanUseTool: false,
+      useCanUseTool: true,
     });
   });
 
@@ -289,6 +293,128 @@ describe("modeToSdkOptions", () => {
       permissionMode: "default",
       useCanUseTool: true,
     });
+  });
+});
+
+describe("isPathDenied", () => {
+  const projectRoot = "/tmp/ws/proj";
+  const roots = [flockctlRoot(), projectRoot];
+
+  it("denies <flockctlRoot>/secret.key", () => {
+    const d = isPathDenied(join(flockctlRoot(), "secret.key"), roots);
+    expect(d.denied).toBe(true);
+    expect(d.reason).toMatch(/secret\.key/);
+  });
+
+  it("denies <flockctlRoot>/flockctl.db and WAL/SHM sidecars", () => {
+    for (const name of ["flockctl.db", "flockctl.db-wal", "flockctl.db-shm"]) {
+      const d = isPathDenied(join(flockctlRoot(), name), roots);
+      expect(d.denied).toBe(true);
+      expect(d.reason).toMatch(/flockctl\.db/);
+    }
+  });
+
+  it("denies <projectRoot>/.mcp.json", () => {
+    const d = isPathDenied(join(projectRoot, ".mcp.json"), roots);
+    expect(d.denied).toBe(true);
+    expect(d.reason).toMatch(/\.mcp\.json/);
+  });
+
+  it("does NOT deny nested `.mcp.json` that isn't a direct child of an allowed root", () => {
+    // The reconciler only writes `.mcp.json` at the top level of the project
+    // root, so a file with the same name somewhere deeper is not a Flockctl
+    // artifact and must remain readable.
+    const d = isPathDenied(join(projectRoot, "node_modules", "pkg", ".mcp.json"), roots);
+    expect(d.denied).toBe(false);
+  });
+
+  it("does NOT deny unrelated files inside flockctlRoot", () => {
+    expect(isPathDenied(join(flockctlRoot(), "skills", "x", "SKILL.md"), roots).denied).toBe(false);
+    expect(isPathDenied(join(flockctlRoot(), "mcp", "server.json"), roots).denied).toBe(false);
+  });
+
+  it("does NOT deny unrelated files in project root", () => {
+    expect(isPathDenied(join(projectRoot, "src", "index.ts"), roots).denied).toBe(false);
+    expect(isPathDenied(join(projectRoot, "package.json"), roots).denied).toBe(false);
+  });
+
+  it("tolerates empty / invalid input", () => {
+    expect(isPathDenied("", roots).denied).toBe(false);
+  });
+
+  it("resolves relative paths before matching", () => {
+    // `.mcp.json` inside cwd should NOT match an arbitrary project root —
+    // denial requires the path resolve to exactly `<root>/.mcp.json`.
+    // Using a known flockctlRoot-relative case:
+    const key = join(flockctlRoot(), "secret.key");
+    // Both absolute and normalized-equivalent paths must deny.
+    expect(isPathDenied(key, roots).denied).toBe(true);
+    expect(isPathDenied(key + "/../secret.key", roots).denied).toBe(true);
+  });
+});
+
+describe("denyIfTouchesSensitivePath", () => {
+  const projectRoot = "/tmp/ws/proj";
+  const roots = [flockctlRoot(), projectRoot];
+
+  it("denies Read on .mcp.json", () => {
+    const d = denyIfTouchesSensitivePath(
+      "Read",
+      { file_path: join(projectRoot, ".mcp.json") },
+      roots,
+    );
+    expect(d.denied).toBe(true);
+  });
+
+  it("denies Grep with path pointing at .mcp.json", () => {
+    const d = denyIfTouchesSensitivePath(
+      "Grep",
+      { path: join(projectRoot, ".mcp.json") },
+      roots,
+    );
+    expect(d.denied).toBe(true);
+  });
+
+  it("denies Write to secret.key", () => {
+    const d = denyIfTouchesSensitivePath(
+      "Write",
+      { file_path: join(flockctlRoot(), "secret.key") },
+      roots,
+    );
+    expect(d.denied).toBe(true);
+  });
+
+  it("denies MultiEdit on flockctl.db", () => {
+    const d = denyIfTouchesSensitivePath(
+      "MultiEdit",
+      { file_path: join(flockctlRoot(), "flockctl.db") },
+      roots,
+    );
+    expect(d.denied).toBe(true);
+  });
+
+  it("passes through Read on a normal file", () => {
+    const d = denyIfTouchesSensitivePath(
+      "Read",
+      { file_path: join(projectRoot, "src", "x.ts") },
+      roots,
+    );
+    expect(d.denied).toBe(false);
+  });
+
+  it("passes through Bash (denylist doesn't parse shell commands)", () => {
+    // Bash is NOT covered by the path extractor — documented gap. This test
+    // pins the current behavior so any future Bash coverage is intentional.
+    const d = denyIfTouchesSensitivePath(
+      "Bash",
+      { command: `cat ${projectRoot}/.mcp.json` },
+      roots,
+    );
+    expect(d.denied).toBe(false);
+  });
+
+  it("passes through tools with no path argument", () => {
+    expect(denyIfTouchesSensitivePath("Glob", {}, roots).denied).toBe(false);
   });
 });
 

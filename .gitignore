@@ -26,6 +26,7 @@ target/
 vendor/
 *.log
 coverage/
+.nyc_output/
 .cache/
 tmp/
 *.egg-info/
@@ -33,6 +34,15 @@ tmp/
 htmlcov/
 .mypy_cache/
 .ruff_cache/
+docs/prototypes/
+
+# Tooling caches & build artefacts that should never be committed
+.eslintcache
+.prettiercache
+.parcel-cache/
+.turbo/
+*.tsbuildinfo
+*.tgz
 
 # Playwright / E2E runtime state
 .e2e-data/
@@ -48,4 +58,5 @@ ui/playwright-report/
 .flockctl/.mcp-reconcile
 .flockctl/.agents-reconcile
 .flockctl/import-backup/
+.flockctl/plan/
 # ─── /Flockctl ───

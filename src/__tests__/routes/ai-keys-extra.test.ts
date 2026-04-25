@@ -4,8 +4,8 @@ import { setDb, type FlockctlDb } from "../../db/index.js";
 import Database from "better-sqlite3";
 
 // Mock claude-cli before app is imported
-vi.mock("../../services/claude-cli", async () => {
-  const actual = await vi.importActual<any>("../../services/claude-cli");
+vi.mock("../../services/claude/cli", async () => {
+  const actual = await vi.importActual<any>("../../services/claude/cli");
   return {
     ...actual,
     isClaudeBinaryPresent: vi.fn(() => true),

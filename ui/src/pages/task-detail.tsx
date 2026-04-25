@@ -12,8 +12,12 @@ import {
   useUpdateProject,
   useUpdateWorkspace,
   useProject,
+  useAgentQuestions,
+  useAnswerAgentQuestion,
 } from "@/lib/hooks";
 import { fetchTaskDiff, respondToPermission } from "@/lib/api";
+import { formatTimestamp, formatLogTime } from "@/lib/format";
+import { AgentQuestionPrompt } from "@/components/AgentQuestionPrompt";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -27,6 +31,8 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { PermissionModeSelect } from "@/components/permission-mode-select";
+import { TaskStatusBadge } from "@/components/task-status-badge";
+import { InlineDiff } from "@/components/InlineDiff";
 import { ConnectionState } from "@/lib/ws";
 import type { TaskStatus, PermissionMode } from "@/lib/types";
 import { ArrowLeft, ChevronDown } from "lucide-react";
@@ -51,14 +57,6 @@ function statusVariant(
   }
 }
 
-function formatTimestamp(iso: string | null): string {
-  if (!iso) return "-";
-  return new Date(iso).toLocaleString();
-}
-
-function formatLogTime(iso: string): string {
-  return new Date(iso).toLocaleTimeString("en-US", { hour12: false });
-}
 
 function extractUserPrompt(prompt: string): string {
   const marker = "## User Description";
@@ -97,6 +95,8 @@ export default function TaskDetailPage() {
     },
   });
   const { logs, metrics, permissionRequests, dismissPermissionRequest, isLoading: logsLoading, connectionState } = useTaskLogStream(taskId ?? "");
+  const { question: agentQuestion } = useAgentQuestions({ kind: "task", id: taskId ?? null });
+  const answerAgentQuestionMutation = useAnswerAgentQuestion();
   const cancelTaskMutation = useCancelTask();
   const rerunTaskMutation = useRerunTask();
   const approveTaskMutation = useApproveTask();
@@ -105,7 +105,7 @@ export default function TaskDetailPage() {
   const updateProjectMutation = useUpdateProject();
   const updateWorkspaceMutation = useUpdateWorkspace();
   const { data: project } = useProject(task?.project_id ?? "");
-  const [diffData, setDiffData] = useState<{ diff: string; summary: string | null } | null>(null);
+  const [diffData, setDiffData] = useState<{ diff: string; summary: string | null; truncated: boolean } | null>(null);
   const [showDiff, setShowDiff] = useState(false);
   const [diffLoading, setDiffLoading] = useState(false);
 
@@ -147,7 +147,7 @@ export default function TaskDetailPage() {
     setDiffLoading(true);
     try {
       const data = await fetchTaskDiff(taskId);
-      setDiffData({ diff: data.diff, summary: data.summary ?? null });
+      setDiffData({ diff: data.diff, summary: data.summary ?? null, truncated: !!data.truncated });
       setShowDiff(true);
     } catch { /* failed to load diff */ }
     setDiffLoading(false);
@@ -161,6 +161,12 @@ export default function TaskDetailPage() {
     if (!task?.assigned_key_id) return "Auto";
     if (task.assigned_key_label) return task.assigned_key_label;
     return `Key #${task.assigned_key_id}`;
+  })();
+  const modelDisplay = (() => {
+    const usedModels = usage?.by_model ? Object.keys(usage.by_model) : [];
+    if (usedModels.length > 0) return usedModels.join(", ");
+    if (task?.model) return task.model;
+    return "Default";
   })();
 
   // Auto-scroll: scroll to bottom on new logs unless user has scrolled up
@@ -235,7 +241,7 @@ export default function TaskDetailPage() {
                     {cancelTaskMutation.isPending ? "Cancelling..." : "Cancel"}
                   </Button>
                 )}
-                {(task.status === "done" || task.status === "failed" || task.status === "timed_out") && (
+                {(task.status === "failed" || task.status === "timed_out") && (
                   <Button
                     variant="outline"
                     size="sm"
@@ -253,6 +259,10 @@ export default function TaskDetailPage() {
               <div>
                 <span className="text-muted-foreground">AI Key</span>
                 <p>{task.assigned_key_id ? keyName : "Auto"}</p>
+              </div>
+              <div>
+                <span className="text-muted-foreground">Model</span>
+                <p className="font-mono text-xs">{modelDisplay}</p>
               </div>
               <div>
                 <span className="text-muted-foreground">Timeout</span>
@@ -293,6 +303,53 @@ export default function TaskDetailPage() {
         </Card>
       )}
 
+      {/* Rerun chain: parent + children, so the relationship between a failed
+          task and its rerun attempts is visible without cross-referencing the
+          list. Shown only when there's at least one link to display. */}
+      {task && (task.parent_task_id || (task.children && task.children.length > 0)) && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Rerun chain</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3 text-sm">
+            {task.parent_task_id && (
+              <div>
+                <span className="text-muted-foreground">Rerun of </span>
+                <Link
+                  to={`/tasks/${task.parent_task_id}`}
+                  className="font-mono text-xs underline-offset-2 hover:underline"
+                >
+                  #{String(task.parent_task_id).slice(0, 8)}
+                </Link>
+              </div>
+            )}
+            {task.children && task.children.length > 0 && (
+              <div>
+                <span className="text-muted-foreground">Re-runs</span>
+                <ul className="mt-1 space-y-1">
+                  {task.children.map((child) => (
+                    <li key={child.id} className="flex items-center gap-2">
+                      <Link
+                        to={`/tasks/${child.id}`}
+                        className="font-mono text-xs underline-offset-2 hover:underline"
+                      >
+                        #{String(child.id).slice(0, 8)}
+                      </Link>
+                      <TaskStatusBadge status={child.status} />
+                      {child.label && (
+                        <span className="truncate text-xs text-muted-foreground">
+                          {child.label}
+                        </span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
       {/* Prompt */}
       {task?.prompt && (
         <Card>
@@ -302,6 +359,23 @@ export default function TaskDetailPage() {
           <CardContent>
             <pre className="max-h-64 overflow-y-auto overflow-x-hidden whitespace-pre-wrap break-words rounded border bg-muted/30 p-3 text-sm">
               {extractUserPrompt(task.prompt)}
+            </pre>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Prompt file (plan-driven execution tasks have no inline prompt) */}
+      {!task?.prompt && task?.prompt_file && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Prompt source</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="text-sm text-muted-foreground">
+              This task reads its prompt from a plan spec file:
+            </p>
+            <pre className="mt-2 whitespace-pre-wrap break-all rounded border bg-muted/30 p-3 font-mono text-xs">
+              {task.prompt_file}
             </pre>
           </CardContent>
         </Card>
@@ -444,24 +518,7 @@ export default function TaskDetailPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <pre className="max-h-96 overflow-auto rounded border bg-muted/30 p-3 font-mono text-xs">
-              {diffData.diff.split("\n").map((line, i) => (
-                <div
-                  key={i}
-                  className={
-                    line.startsWith("+") && !line.startsWith("+++")
-                      ? "text-green-600 dark:text-green-400"
-                      : line.startsWith("-") && !line.startsWith("---")
-                        ? "text-red-600 dark:text-red-400"
-                        : line.startsWith("@@")
-                          ? "text-blue-600 dark:text-blue-400"
-                          : ""
-                  }
-                >
-                  {line}
-                </div>
-              ))}
-            </pre>
+            <InlineDiff diff={diffData.diff} truncated={diffData.truncated} />
           </CardContent>
         </Card>
       )}
@@ -528,6 +585,24 @@ export default function TaskDetailPage() {
             </div>
           </CardContent>
         </Card>
+      )}
+
+      {/* Agent-raised clarification question (AskUserQuestion tool).
+          Mounts above the log stream so it's the first thing a user sees
+          when the task transitions to `waiting_for_input`. */}
+      {agentQuestion && taskId && (
+        <AgentQuestionPrompt
+          question={agentQuestion.question}
+          requestId={agentQuestion.requestId}
+          onAnswer={async (answer) => {
+            await answerAgentQuestionMutation.mutateAsync({
+              kind: "task",
+              id: taskId,
+              requestId: agentQuestion.requestId,
+              answer,
+            });
+          }}
+        />
       )}
 
       {/* Log viewer */}
