@@ -73,3 +73,34 @@ jobs:
         run: cd ui && npm run build
       - name: UI unit tests
         run: cd ui && npm test
+
+  # Validates the artefact we actually publish to npm: builds dist/, packs
+  # the tarball, installs it into a fresh tmp project, boots the daemon
+  # from the tmp project's cwd (NOT the repo), and asserts /health = 200.
+  # This is the only tier that catches:
+  #   - cwd-relative path bugs (rc.2 shipped one because smoke harness
+  #     spawned with cwd=repoRoot and accidentally hid it),
+  #   - files dropped from the npm `files` allowlist in package.json,
+  #   - tsc-only breakage (works under tsx, fails after a real build).
+  # Cost: ~1.5–3 min (UI build + npm install). Worth it — every previous
+  # release-blocker we've hit would have been caught here before publish.
+  install-tarball:
+    name: Install-tarball (build + pack + boot from non-repo cwd)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: |
+            package-lock.json
+            ui/package-lock.json
+      - name: Install root deps
+        run: npm ci
+      - name: Install UI deps
+        run: cd ui && npm ci
+      - name: Build (dist + UI bundle)
+        run: npm run build
+      - name: Run install-tarball test
+        run: npm run test:install-tarball:nobuild

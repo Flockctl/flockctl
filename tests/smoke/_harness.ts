@@ -56,7 +56,15 @@ export async function startFlockctl(extraEnv: NodeJS.ProcessEnv = {}): Promise<S
         FLOCKCTL_MOCK_AI: "1",
         ...extraEnv,
       },
-      cwd: repoRoot,
+      // Spawn from an arbitrary cwd (the isolated FLOCKCTL_HOME, which is
+      // never the package root). This is load-bearing: the daemon resolves
+      // bundled assets (drizzle migrations, skill manifests, …) relative to
+      // their own module URL, NOT relative to process.cwd(). When that
+      // contract was ever broken, smoke tests that ran with cwd=repoRoot
+      // happened to pass because "./migrations" coincidentally resolved
+      // against the repo. Spawning from `home` guarantees that any future
+      // cwd-relative regression fails CI before it ships to npm.
+      cwd: home,
     },
   );
 

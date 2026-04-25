@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.1-rc.3] - 2026-04-25
+
+### Fixed
+- Daemon crashed on startup with `Error: Can't find meta/_journal.json file` whenever `flockctl` was launched from any directory other than the package root (i.e. essentially always after `npm install -g flockctl`). The drizzle migrator was being passed a literal `"./migrations"`, which it resolved against `process.cwd()` instead of the package root. `src/db/migrate.ts` now resolves `migrations/` relative to its own module URL, so it works in both the dev source layout (`src/db/migrate.ts → ../../migrations`) and the published `dist/` layout (`dist/db/migrate.js → ../../migrations`). The smoke-test harness (`tests/smoke/_harness.ts`) was hiding this regression because it spawned the daemon with `cwd=repoRoot`; it now spawns from the isolated `FLOCKCTL_HOME` so any future cwd-relative path bug fails the smoke tier before it ships.
+
 ## [0.0.1-rc.2] - 2026-04-25
 
 ### Breaking

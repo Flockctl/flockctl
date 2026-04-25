@@ -1,6 +1,6 @@
 {
   "name": "flockctl",
-  "version": "0.0.1-rc.2",
+  "version": "0.0.1-rc.3",
   "description": "AI task orchestration tool — local-first, single-user",
   "author": "Eduard Abdullin",
   "type": "module",
@@ -27,6 +27,8 @@
     "test:coverage": "vitest run --coverage",
     "test:all": "vitest run && cd ui && tsc -b --noEmit",
     "test:smoke": "tsx tests/smoke/run.ts",
+    "test:install-tarball": "npm run build && tsx tests/install-tarball/run.ts",
+    "test:install-tarball:nobuild": "tsx tests/install-tarball/run.ts",
     "test:cli-docker": "tsx tests/cli-docker/run.ts",
     "test:e2e": "cd ui && npx playwright test",
     "test:live": "tsx tests/live/run.ts",
