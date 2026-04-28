@@ -247,6 +247,47 @@ Three public hooks keep Mission Control open for extension without re-opening th
 
 Shared types for the board layout live in `ui/src/pages/project-detail-components/slice-board-types.ts`. See [CONCEPTS.md §View mode](CONCEPTS.md) for the user-facing model behind Board / Tree / Swimlane.
 
+## Missions subsystem
+
+A **mission** is a long-running, supervised goal layered on top of the existing planning hierarchy. Where a slice or task captures "one PR's worth of work", a mission captures "the agent should keep watching this objective and propose the next move whenever something changes". Missions are introduced and specified in detail in [MISSIONS.md](MISSIONS.md); this section names the components so other architecture readers can locate them.
+
+```
+┌─ event-subscriber ──┐    ┌─ heartbeat ─────┐    ┌─ stalled-detector ─┐
+│ task / chat events  │    │ periodic ticks  │    │ no-progress timer  │
+└──────────┬──────────┘    └────────┬────────┘    └──────────┬─────────┘
+           │                        │                        │
+           └────────────────────────▼────────────────────────┘
+                          guardedEvaluate
+              BudgetEnforcer.check ─► MaxDepthGuard.check
+                          │
+                          ▼
+                  SupervisorService.evaluate
+            (read-only, prompt vX.Y.Z, JSON-only output)
+                          │
+                          ▼
+              BudgetEnforcer.increment ─► INSERT mission_events
+                          │
+                          ▼
+                /missions router  (approval queue, REST + SSE)
+```
+
+Components (all under `src/services/missions/` unless noted):
+
+| Component | File | Role |
+|-----------|------|------|
+| **SupervisorService** | `supervisor.ts` | Read-only LLM proposer. Builds a trusted-context envelope, runs an agent session under the supervisor prompt (`supervisor-prompt.ts`), parses the reply against `proposal-schema.ts`, and returns `propose` / `no_action`. Imports nothing from `routes/planning.ts` or `plan-store/{milestones,slices,tasks}.ts` — enforced by a static-import test. |
+| **guardedEvaluate** | `guarded-evaluate.ts` | The single entry point every supervisor invocation flows through. Sequences `BudgetEnforcer.check` → `MaxDepthGuard.check` → evaluator → `BudgetEnforcer.increment` → `INSERT mission_events`. Failures at any stage downgrade to a `no_action` event with the cause captured. |
+| **BudgetEnforcer** | `budget-enforcer.ts` | Per-mission token + USD budget. Refuses evaluation once a cap is hit; increments on every successful round-trip. |
+| **MaxDepthGuard** | `max-depth-guard.ts` | Caps recursion depth (supervisor proposing actions that re-trigger the supervisor). Refuses evaluation past the configured ceiling. |
+| **proposal-schema** | `proposal-schema.ts` | Zod schema for the supervisor's JSON output. The `notDestructiveVerb` refinement on `candidate.action` rejects `delete` / `drop` / `remove` / `destroy` / `truncate` / `rm ` at parse time. |
+| **event-subscriber** | `event-subscriber.ts` | Bridges task / chat terminal events into mission triggers (`trigger_kind: "task_observed"`). |
+| **heartbeat** | `heartbeat.ts` | Periodic supervisor wake-up (`trigger_kind: "heartbeat"`) so a mission keeps progressing even when no other event fires. |
+| **stalled-detector** | `stalled-detector.ts` | Marks missions as stalled when no new events arrive within a configured window; surfaces them in the approval queue. |
+| **missions router** | `src/routes/missions.ts` | REST + SSE surface — list missions, fetch the event timeline, list pending proposals, approve / reject. |
+| **mission events table** | `src/db/schema.ts` (migration `0043_add_missions.sql`) | Append-only audit log: every supervisor decision, every approval, every budget reject is one row. |
+
+Autonomy is gated. Even when a supervisor proposes an action, nothing is applied until a human approves it from the approval queue. The `auto` autonomy level (apply-without-approval) is wired at the schema level but disabled in v1 — every proposal lands in the queue.
+
 ## Key Design Decisions
 
 - **Local-only by default, remote-capable by configuration** — no middle ground. The same binary serves both modes; remote mode is opt-in via `~/.flockctlrc`.

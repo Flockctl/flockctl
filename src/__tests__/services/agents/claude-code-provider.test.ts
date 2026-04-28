@@ -127,4 +127,41 @@ describe("ClaudeCodeProvider", () => {
     await provider.renameSession("sess-1", "New Title");
     expect(renameClaudeSession).toHaveBeenCalledWith("sess-1", "New Title");
   });
+
+  it("clearReadinessCache delegates to claude-cli's clearReadinessCache", async () => {
+    // Refreshes the cached install/auth probe so the next checkReadiness()
+    // call re-runs the underlying detection. The provider just forwards —
+    // covered for the M05 coverage push.
+    const cliModule = await import("../../../services/claude/cli.js");
+    provider.clearReadinessCache();
+    expect(cliModule.clearReadinessCache).toHaveBeenCalledTimes(1);
+  });
+
+  it("forwards askUserQuestionHandler down to ai client.chat", async () => {
+    // Bridge wiring (M05 slice 02 follow-up): without this forward, the
+    // streaming Claude Code path silently falls back to the SDK's stubbed-
+    // headless built-in and AskUserQuestion auto-resolves with empty
+    // answers. The forward is the single boundary the AgentSession crosses
+    // to plumb its `awaitUserAnswer` into the SDK; if it ever drops the
+    // field again the bug behind task 432 returns.
+    const chatMock = vi.fn(
+      async (_opts: Record<string, unknown>) => ({ text: "ok", usage: { inputTokens: 0, outputTokens: 0 } }),
+    );
+    (createAIClient as unknown as { mockReturnValueOnce: (v: unknown) => void }).mockReturnValueOnce({
+      chat: chatMock,
+    });
+
+    const handler = async () => "answer";
+    await provider.chat({
+      model: "claude-sonnet-4-6",
+      system: "",
+      messages: [{ role: "user", content: "hi" }],
+      askUserQuestionHandler: handler,
+    });
+
+    expect(chatMock).toHaveBeenCalledTimes(1);
+    const captured = chatMock.mock.calls[0]?.[0];
+    if (!captured) throw new Error("expected chat to have been called once");
+    expect(captured.askUserQuestionHandler).toBe(handler);
+  });
 });

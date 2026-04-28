@@ -16,7 +16,7 @@ import { setDb, type FlockctlDb } from "../../db/index.js";
 import Database from "better-sqlite3";
 
 vi.mock("../../services/ws-manager", () => ({
-  wsManager: { broadcast: vi.fn(), broadcastAll: vi.fn() },
+  wsManager: { broadcast: vi.fn(), broadcastAll: vi.fn(), broadcastTaskStatus: vi.fn(), broadcastChatStatus: vi.fn() },
 }));
 
 // Keep the real executor but stub the KeyPool so reserveForTask always forces

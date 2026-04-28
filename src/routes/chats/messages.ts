@@ -16,6 +16,7 @@ import { getDefaultModel } from "../../config/index.js";
 import { resolvePermissionMode, allowedRoots as computeAllowedRoots } from "../../services/permission-resolver.js";
 import { AgentSession, type AgentSessionMetrics } from "../../services/agent-session/index.js";
 import { chatExecutor } from "../../services/chat-executor.js";
+import { wsManager } from "../../services/ws-manager.js";
 import { formatToolCall, formatToolResult } from "../../services/tool-format.js";
 import { calculateCost } from "../../services/ai/cost.js";
 import { reconcileClaudeSkillsForProject } from "../../services/claude/skills-sync.js";
@@ -36,14 +37,16 @@ import {
   parseEffortBody,
   parseThinkingEnabledBody,
 } from "./helpers.js";
+import { getChatOrThrow } from "../../lib/db-helpers.js";
+import { classifyLimit } from "../../services/agents/rate-limit-classifier.js";
+import { parkChatForRateLimit } from "../../services/chat-rate-limit.js";
 
 export function registerChatMessages(router: Hono): void {
   // POST /chats/:id/messages — send user message, get AI response
   router.post("/:id/messages", async (c) => {
     const db = getDb();
     const id = parseIdParam(c);
-    const chat = db.select().from(chats).where(eq(chats.id, id)).get();
-    if (!chat) throw new NotFoundError("Chat");
+    const chat = getChatOrThrow(id);
 
     const body = await c.req.json();
     if (!body.content) throw new ValidationError("content is required");
@@ -216,9 +219,40 @@ export function registerChatMessages(router: Hono): void {
 
     chatExecutor.register(id, session);
     try {
-      // Swallow run errors so we can still persist whatever partial text streamed
-      // before the abort — prevents aborted chats from leaving a dangling user msg.
-      await session.run().catch(() => { /* partial text already captured via events */ });
+      // Capture the run error too so we can branch on rate-limit before
+      // returning the response. Symmetric with the SSE handler.
+      let nonStreamRunError: unknown = null;
+      await session.run().catch((err: unknown) => {
+        // Partial text already captured via events; remember the error for
+        // rate-limit classification below.
+        nonStreamRunError = err;
+      });
+
+      // If the failure was a provider rate-limit, park the chat exactly the
+      // same way the SSE handler does and return a typed body so the client
+      // can render its countdown card. We don't auto-retry inline because
+      // that would tie up an HTTP connection for up to an hour — the
+      // background scheduler resumes the turn later via WS.
+      if (nonStreamRunError) {
+        const limit = classifyLimit(nonStreamRunError);
+        if (limit) {
+          parkChatForRateLimit({
+            chatId: id,
+            resumeAtMs: limit.resumeAtMs,
+            errorMessage: limit.rawMessage,
+          });
+          return c.json({
+            userMessage: { ...userMsg, attachments: linkedAttachments },
+            rate_limited: {
+              resume_at: limit.resumeAtMs,
+              kind: limit.kind,
+              provider: limit.provider,
+              confidence: limit.confidence,
+              message: limit.rawMessage,
+            },
+          }, 202);
+        }
+      }
 
       // Persist Claude Code session ID for future resume
       if (sessionId && sessionId !== chat.claudeSessionId) {
@@ -288,8 +322,7 @@ export function registerChatMessages(router: Hono): void {
   router.post("/:id/messages/stream", async (c) => {
     const db = getDb();
     const id = parseIdParam(c);
-    const chat = db.select().from(chats).where(eq(chats.id, id)).get();
-    if (!chat) throw new NotFoundError("Chat");
+    const chat = getChatOrThrow(id);
 
     const body = await c.req.json();
     if (!body.content) throw new ValidationError("content is required");
@@ -523,7 +556,8 @@ export function registerChatMessages(router: Hono): void {
       // SDK stream ended without a trailing turn_end event). Net effect: one
       // persisted row per assistant SDK message, matching Claude Code's
       // per-message rendering.
-      const flushPending = (boundary: "tool_call" | "turn_end" | "stream_end") => {
+      const flushPending = (boundary: "tool_call" | "turn_end" | "stream_end"): number | null => {
+        let newAssistantRowId: number | null = null;
         try {
           /* v8 ignore next — `pendingThinking` is only populated by real SDK thinking deltas; live streaming tests don't emit them */
           if (pendingThinking) {
@@ -541,11 +575,13 @@ export function registerChatMessages(router: Hono): void {
               content: pendingText,
             }).returning().get();
             lastAssistantRowId = row.id;
+            newAssistantRowId = row.id;
             pendingText = "";
           }
         } catch (err) {
           console.error(`[chats.stream] failed to flush pending text at ${boundary} boundary (chat ${id}):`, err);
         }
+        return newAssistantRowId;
       };
 
       // MUST be registered before chatExecutor.register so EventEmitter invokes
@@ -578,8 +614,14 @@ export function registerChatMessages(router: Hono): void {
 
       chatExecutor.register(id, session);
       let runFinished = false;
+      // Capture the raw error object too — `classifyLimit` needs the structured
+      // shape (status, headers, .type) to distinguish a 429 from a generic
+      // failure. Without preserving the object we'd be stuck pattern-matching
+      // strings, which loses the precise `retry-after-ms` from Anthropic.
+      let runError: unknown = null;
       const runPromise = session.run().catch((err: unknown) => {
         /* v8 ignore next — `session.run()` rejection path fires only when the live SDK throws; unit tests mock a successful resolve */
+        runError = err;
         errorMsg = err instanceof Error ? err.message : String(err);
       }).finally(() => {
         runFinished = true;
@@ -615,6 +657,53 @@ export function registerChatMessages(router: Hono): void {
         errorMsg = err instanceof Error ? err.message : String(err);
       }
 
+      // Rate-limit branch — runs BEFORE the silent-empty-response guard so a
+      // 429 / usage_limit doesn't get reclassified as "empty response" when
+      // it happens before the first token. If the captured error matches the
+      // classifier (Anthropic 429, Pro/Max usage cap, Copilot quota), park
+      // the chat in `rate_limited`, schedule the wake-up, and emit a typed
+      // SSE frame so the UI can render the countdown card before the stream
+      // closes. The wake-up handler in `services/chat-rate-limit.ts` re-runs
+      // the same user turn through a fresh AgentSession when the timer fires.
+      let rateLimitInfo: ReturnType<typeof classifyLimit> = null;
+      if (runError) {
+        rateLimitInfo = classifyLimit(runError);
+      }
+      if (rateLimitInfo) {
+        // Persist any text already streamed before the limit hit, so the user
+        // doesn't lose partial output. Same boundary the regular `turn_end`
+        // path uses — flushPending is idempotent on empty buffers.
+        flushPending("stream_end");
+        parkChatForRateLimit({
+          chatId: id,
+          resumeAtMs: rateLimitInfo.resumeAtMs,
+          errorMessage: rateLimitInfo.rawMessage,
+        });
+        if (!clientDisconnected) {
+          try {
+            await stream.writeSSE({
+              data: JSON.stringify({
+                rate_limited: {
+                  resume_at: rateLimitInfo.resumeAtMs,
+                  kind: rateLimitInfo.kind,
+                  provider: rateLimitInfo.provider,
+                  confidence: rateLimitInfo.confidence,
+                  message: rateLimitInfo.rawMessage,
+                },
+              }),
+            });
+            await stream.writeSSE({
+              data: JSON.stringify({ done: true, rate_limited: true }),
+            });
+          } catch {
+            clientDisconnected = true;
+          }
+        }
+        // Suppress the generic error frame below — the SSE consumer already
+        // got a typed `rate_limited` frame and the chat row is parked.
+        errorMsg = null;
+      }
+
       // Silent-empty-response guard. If the session finished without emitting
       // a single meaningful event AND without reporting an error, the SDK
       // swallowed the request — often due to a provider-side issue that
@@ -624,7 +713,7 @@ export function registerChatMessages(router: Hono): void {
       // back to the ambiguous "Response was not received" bubble with no
       // explanation. Promoting this to an explicit SSE error makes the cause
       // legible and the retry actionable.
-      if (!errorMsg && meaningfulEventCount === 0) {
+      if (!errorMsg && !rateLimitInfo && meaningfulEventCount === 0) {
         errorMsg =
           "AI returned an empty response — no text, thinking, or tool calls were produced. Retry, or check the provider key / model selection.";
       }
@@ -650,7 +739,18 @@ export function registerChatMessages(router: Hono): void {
         // `tool_call` boundary (e.g. aborted run, legacy providers that don't
         // emit turn_end, or shutdown mid-stream). `fullText`/`fullThinking`
         // remain intact for the title slice and session rename below.
-        flushPending("stream_end");
+        const finalAssistantMessageId = flushPending("stream_end");
+        // Broadcast the chat_assistant_final envelope to global chat-list
+        // clients ONLY when stream_end actually wrote a row. The guard avoids
+        // a phantom event in the race where pendingText was already drained
+        // by an earlier turn_end / tool_call flush. Lives inside the same
+        // try-block as the flush (and BEFORE the `done` SSE frame) so a
+        // thrown error after the flush still skips emission, and stays out
+        // of `chatExecutor`'s `finally` block — which fires on every
+        // termination and would break the clean-only invariant.
+        if (finalAssistantMessageId !== null) {
+          wsManager.broadcastChatAssistantFinal(id, finalAssistantMessageId);
+        }
 
         // Usage rows need a `chat_message_id` anchor. Prefer the last flushed
         // assistant row; if the run produced zero assistant content (rare —
@@ -709,12 +809,18 @@ export function registerChatMessages(router: Hono): void {
         // Surface the finished turn as a pending-approval blocker in /attention
         // when the chat opted in via `requires_approval=true`. Mirror of the
         // task-side `TaskStatus.PENDING_APPROVAL` transition in task-executor.
-        if (!errorMsg) {
+        // Rate-limited turns are NOT yet "finished" — the resume path will
+        // call `markPendingApprovalIfRequired` once the resumed turn lands.
+        if (!errorMsg && !rateLimitInfo) {
           chatExecutor.markPendingApprovalIfRequired(id);
         }
 
+        // Skip the standard `done` frame when we already emitted a typed
+        // `rate_limited` + `done` pair above. Without this the wire ends with
+        // two `done` events and the UI's stream consumer gets confused about
+        // which one is authoritative.
         /* v8 ignore next 5 — trailing writeSSE path requires the client to have disconnected mid-stream; live-only */
-        if (!clientDisconnected) {
+        if (!clientDisconnected && !rateLimitInfo) {
           try {
             await stream.writeSSE({ data: JSON.stringify({ done: true, usage: { inputTokens, outputTokens, costUsd: cost } }) });
           } catch { /* client already gone */ }

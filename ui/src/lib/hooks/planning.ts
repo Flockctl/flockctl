@@ -17,6 +17,7 @@ import {
   activateSlice,
   startAutoExecute,
   stopAutoExecute,
+  rerunFailedMilestone,
   generatePlan,
   fetchGeneratePlanStatus,
 } from "../api";
@@ -267,6 +268,33 @@ export function useStopAutoExecute(projectId: string) {
     mutationFn: (milestoneId: string) =>
       stopAutoExecute(projectId, milestoneId),
     onSuccess: (_result, milestoneId) => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.projectTree(projectId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.autoExecStatus(projectId, milestoneId),
+      });
+    },
+  });
+}
+
+/**
+ * Bulk re-run every failed task in a milestone in one call. Mirrors the
+ * `useStartAutoExecute` invalidation contract so the rail and tree both
+ * refresh once the backend has cloned + queued the rerun children. See
+ * `rerunFailedMilestone()` in the api layer for the wire shape.
+ */
+export function useRerunFailedMilestone(projectId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      milestoneId,
+      resume,
+    }: {
+      milestoneId: string;
+      resume?: boolean;
+    }) => rerunFailedMilestone(projectId, milestoneId, { resume }),
+    onSuccess: (_result, { milestoneId }) => {
       queryClient.invalidateQueries({
         queryKey: queryKeys.projectTree(projectId),
       });

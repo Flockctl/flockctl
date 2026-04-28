@@ -7,6 +7,7 @@ import { NotFoundError, ValidationError } from "../lib/errors.js";
 import { parseIdParam } from "../lib/route-params.js";
 import { schedulerService } from "../services/scheduler.js";
 import { getTemplate, type TemplateScope } from "../services/templates.js";
+import { getScheduleOrThrow } from "../lib/db-helpers.js";
 
 export const scheduleRoutes = new Hono();
 
@@ -94,8 +95,7 @@ scheduleRoutes.get("/", (c) => {
 scheduleRoutes.get("/:id", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const schedule = db.select().from(schedules).where(eq(schedules.id, id)).get();
-  if (!schedule) throw new NotFoundError("Schedule");
+  const schedule = getScheduleOrThrow(id);
 
   // Resolve the referenced template from disk (may be null if the file has
   // been deleted out-of-band).
@@ -169,8 +169,7 @@ scheduleRoutes.post("/", async (c) => {
 scheduleRoutes.patch("/:id", async (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const existing = db.select().from(schedules).where(eq(schedules.id, id)).get();
-  if (!existing) throw new NotFoundError("Schedule");
+  const existing = getScheduleOrThrow(id);
 
   const body = await c.req.json();
 
@@ -227,8 +226,7 @@ scheduleRoutes.patch("/:id", async (c) => {
 scheduleRoutes.delete("/:id", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const existing = db.select().from(schedules).where(eq(schedules.id, id)).get();
-  if (!existing) throw new NotFoundError("Schedule");
+  const existing = getScheduleOrThrow(id);
 
   schedulerService.remove(id);
   db.delete(schedules).where(eq(schedules.id, id)).run();
@@ -239,8 +237,7 @@ scheduleRoutes.delete("/:id", (c) => {
 scheduleRoutes.post("/:id/pause", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const existing = db.select().from(schedules).where(eq(schedules.id, id)).get();
-  if (!existing) throw new NotFoundError("Schedule");
+  const existing = getScheduleOrThrow(id);
   if (existing.status !== "active") throw new ValidationError("Schedule is not active");
 
   schedulerService.pause(id);
@@ -253,8 +250,7 @@ scheduleRoutes.post("/:id/pause", (c) => {
 scheduleRoutes.post("/:id/resume", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const existing = db.select().from(schedules).where(eq(schedules.id, id)).get();
-  if (!existing) throw new NotFoundError("Schedule");
+  const existing = getScheduleOrThrow(id);
   if (existing.status !== "paused") throw new ValidationError("Schedule is not paused");
 
   schedulerService.resume(id);
@@ -269,8 +265,7 @@ scheduleRoutes.get("/:id/tasks", (c) => {
   const id = parseIdParam(c);
   const { page, perPage, offset } = paginationParams(c);
 
-  const schedule = db.select().from(schedules).where(eq(schedules.id, id)).get();
-  if (!schedule) throw new NotFoundError("Schedule");
+  const schedule = getScheduleOrThrow(id);
 
   // Task label prefix is `scheduled-<templateName>-…` (see scheduler.ts).
   // We look up by the template name recorded on the schedule itself so
@@ -288,8 +283,7 @@ scheduleRoutes.get("/:id/tasks", (c) => {
 scheduleRoutes.post("/:id/trigger", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const existing = db.select().from(schedules).where(eq(schedules.id, id)).get();
-  if (!existing) throw new NotFoundError("Schedule");
+  const existing = getScheduleOrThrow(id);
 
   schedulerService.triggerNow(id);
 

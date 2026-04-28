@@ -24,6 +24,10 @@ export interface MilestoneData {
   // frontmatter; `milestoneFromFile` resolves that to `false` so historical
   // plans keep working without a forced spec rewrite.
   specRequired?: boolean;
+  // Optional opaque id linking this milestone to an external mission record.
+  // When absent (older plans), reader returns `undefined`. When present, the
+  // value is validated against `MISSION_ID_REGEX` on read — see schema.ts.
+  missionId?: string;
   createdAt?: string;
   updatedAt?: string;
 }

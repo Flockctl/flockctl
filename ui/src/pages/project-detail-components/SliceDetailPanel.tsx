@@ -23,6 +23,7 @@ import { statusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
+import { formatDurationMs, formatCostPrecise, formatTimestamp } from "@/lib/format";
 import {
   usePlanEditor,
   type PlanEditorController,
@@ -145,33 +146,6 @@ function computeLastRunStats(tasks: PlanTask[]): LastRunStats {
   }
 
   return { timestampIso: latest, durationMs, costUsd };
-}
-
-function formatDuration(ms: number | null): string {
-  if (ms == null) return "—";
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  const s = ms / 1000;
-  if (s < 60) return `${s.toFixed(1)}s`;
-  const m = Math.floor(s / 60);
-  const rem = Math.round(s - m * 60);
-  return `${m}m ${rem}s`;
-}
-
-function formatCost(usd: number | null): string {
-  if (usd == null) return "—";
-  if (usd < 0.01) return `$${usd.toFixed(4)}`;
-  return `$${usd.toFixed(2)}`;
-}
-
-function formatTimestamp(iso: string | null): string {
-  if (!iso) return "—";
-  try {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return iso;
-    return d.toLocaleString();
-  } catch {
-    return iso;
-  }
 }
 
 // --- Panel ------------------------------------------------------------------
@@ -301,9 +275,13 @@ export function SliceDetailPanel({
     : undefined;
 
   // A slice that has never been kicked off ("pending" / "planning") reads as
-  // a first-time "Run", not a "Re-run". Any other status — active, verifying,
-  // merging, completed, failed, skipped — implies the slice has already been
-  // touched at least once, so the retry affordance is accurate.
+  // a first-time "Run", not a "Re-run". Active / verifying / merging / failed
+  // / skipped slices imply at least one prior attempt, so the retry affordance
+  // is accurate. **Completed** slices hide the button entirely — restarting a
+  // green slice would re-spend tokens on work that already passed, and the
+  // milestone-level "Re-run" + per-task "Re-run" affordances cover the
+  // legitimate repair cases without an ambiguous slice-level button.
+  const sliceCompleted = slice.status === "completed";
   const isFirstRun = slice.status === "pending" || slice.status === "planning";
   const runLabel = startAutoExecute.isPending
     ? "Starting…"
@@ -345,17 +323,19 @@ export function SliceDetailPanel({
 
       {/* --- Action buttons --- */}
       <div className="flex flex-wrap items-center gap-2">
-        <Button
-          size="sm"
-          variant="default"
-          onClick={onRerun}
-          disabled={rerunDisabled}
-          title={rerunTitle}
-          data-testid="slice-detail-panel-rerun"
-        >
-          <RunIcon className="mr-1 h-4 w-4" />
-          {runLabel}
-        </Button>
+        {!sliceCompleted && (
+          <Button
+            size="sm"
+            variant="default"
+            onClick={onRerun}
+            disabled={rerunDisabled}
+            title={rerunTitle}
+            data-testid="slice-detail-panel-rerun"
+          >
+            <RunIcon className="mr-1 h-4 w-4" />
+            {runLabel}
+          </Button>
+        )}
         <Button
           size="sm"
           variant="outline"
@@ -410,7 +390,7 @@ export function SliceDetailPanel({
         <StatCell
           icon={<Timer className="h-3.5 w-3.5" aria-hidden />}
           label="Duration"
-          value={formatDuration(stats.durationMs)}
+          value={formatDurationMs(stats.durationMs)}
           testId="slice-detail-panel-stat-duration"
         />
         <StatCell
@@ -422,7 +402,7 @@ export function SliceDetailPanel({
         <StatCell
           icon={<DollarSign className="h-3.5 w-3.5" aria-hidden />}
           label="Cost"
-          value={formatCost(stats.costUsd)}
+          value={formatCostPrecise(stats.costUsd)}
           testId="slice-detail-panel-stat-cost"
         />
       </section>

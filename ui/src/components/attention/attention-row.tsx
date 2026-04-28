@@ -4,6 +4,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
+  answerQuestion,
   approveChat,
   approveTask,
   rejectChat,
@@ -12,6 +13,7 @@ import {
   respondToChatPermission,
   type AttentionItem,
 } from "@/lib/api";
+import { AgentQuestionPrompt } from "@/components/AgentQuestionPrompt";
 import { useQueryClient } from "@tanstack/react-query";
 import { queryKeys } from "@/lib/hooks";
 import { getActiveServerId } from "@/lib/server-store";
@@ -53,6 +55,10 @@ export const AttentionRow = memo(function AttentionRow({ item, projectsById }: A
       return <TaskPermissionRow item={item} projectsById={projectsById} />;
     case "chat_permission":
       return <ChatPermissionRow item={item} projectsById={projectsById} />;
+    case "task_question":
+      return <TaskQuestionRow item={item} projectsById={projectsById} />;
+    case "chat_question":
+      return <ChatQuestionRow item={item} projectsById={projectsById} />;
   }
 });
 
@@ -297,6 +303,164 @@ function ChatPermissionRow({
         </>
       }
     />
+  );
+}
+
+/* --- Question rows ------------------------------------------------------- */
+
+/**
+ * Inbox row for a `task_question` / `chat_question` item — an `AskUserQuestion`
+ * tool call from the agent that's currently waiting on the user. We embed the
+ * shared `<AgentQuestionPrompt>` (the same component task-detail / chat panes
+ * render) so the picker behaves identically wherever it appears, then wrap it
+ * in the row's project + identifier chrome.
+ *
+ * Dispatch contract — symmetric across both surfaces:
+ *
+ *   POST /tasks/<task_id>/question/<request_id>/answer  { answer: string }
+ *   POST /chats/<chat_id>/question/<request_id>/answer  { answer: string }
+ *
+ * The row stays mounted while the POST is in flight (`AgentQuestionPrompt`
+ * surfaces its own pending/error UI). On success we set `hidden = true` —
+ * matching the no-optimistic-dismissal pattern the approve/reject siblings
+ * use, so a list-scale refresh from `attention_changed` can't briefly flash a
+ * row back in. On failure we let the prompt re-render with its own error
+ * banner; the row is never removed.
+ */
+function TaskQuestionRow({
+  item,
+  projectsById,
+}: {
+  item: Extract<AttentionItem, { kind: "task_question" }>;
+  projectsById: Map<string, Project>;
+}) {
+  const invalidateAttention = useInvalidateAttention();
+  const [hidden, setHidden] = useState(false);
+  if (hidden) return null;
+
+  const projectName = resolveProjectName(item.project_id, projectsById);
+
+  async function handleAnswer(answer: string) {
+    try {
+      await answerQuestion("task", item.task_id, item.request_id, answer);
+      setHidden(true);
+    } finally {
+      invalidateAttention();
+    }
+  }
+
+  return (
+    <QuestionRowShell
+      projectName={projectName}
+      kindBadge="Task question"
+      linkTo={`/tasks/${item.task_id}`}
+      title={`Task #${item.task_id}`}
+      since={item.created_at}
+    >
+      <AgentQuestionPrompt
+        question={item.question}
+        requestId={item.request_id}
+        header={item.header}
+        options={item.options}
+        multiSelect={item.multi_select}
+        onAnswer={handleAnswer}
+      />
+    </QuestionRowShell>
+  );
+}
+
+function ChatQuestionRow({
+  item,
+  projectsById,
+}: {
+  item: Extract<AttentionItem, { kind: "chat_question" }>;
+  projectsById: Map<string, Project>;
+}) {
+  const invalidateAttention = useInvalidateAttention();
+  const [hidden, setHidden] = useState(false);
+  if (hidden) return null;
+
+  const projectName = resolveProjectName(item.project_id, projectsById);
+
+  async function handleAnswer(answer: string) {
+    try {
+      await answerQuestion("chat", item.chat_id, item.request_id, answer);
+      setHidden(true);
+    } finally {
+      invalidateAttention();
+    }
+  }
+
+  return (
+    <QuestionRowShell
+      projectName={projectName}
+      kindBadge="Chat question"
+      linkTo={`/chats/${item.chat_id}`}
+      title={`Chat #${item.chat_id}`}
+      since={item.created_at}
+    >
+      <AgentQuestionPrompt
+        question={item.question}
+        requestId={item.request_id}
+        header={item.header}
+        options={item.options}
+        multiSelect={item.multi_select}
+        onAnswer={handleAnswer}
+      />
+    </QuestionRowShell>
+  );
+}
+
+/**
+ * Wrapper that mirrors the visual chrome of `RowShell` (badge + project name +
+ * title + relative timestamp) but reserves the body for an arbitrary child
+ * (i.e. the `<AgentQuestionPrompt>`) instead of an action-button row. Kept
+ * separate from `RowShell` because the picker is interactive and would clash
+ * with `RowShell`'s outer `<Link>` wrapper that turns the whole left half
+ * into a single navigation target.
+ */
+function QuestionRowShell({
+  projectName,
+  kindBadge,
+  linkTo,
+  title,
+  since,
+  children,
+}: {
+  projectName: string | null;
+  kindBadge: string;
+  linkTo: string;
+  title: string;
+  since: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <Card>
+      <CardContent className="flex flex-col gap-3 py-4">
+        <div className="flex items-start justify-between gap-4">
+          <Link to={linkTo} className="min-w-0 flex-1 group">
+            <div className="mb-1 flex items-center gap-2">
+              <Badge variant="secondary">{kindBadge}</Badge>
+              {projectName && (
+                <span className="truncate text-xs text-muted-foreground">
+                  {projectName}
+                </span>
+              )}
+            </div>
+            <p className="truncate text-sm font-medium group-hover:underline">
+              {title}
+            </p>
+          </Link>
+          <time
+            className="shrink-0 text-xs text-muted-foreground"
+            dateTime={since}
+          >
+            {formatRelativeTime(since)}
+          </time>
+        </div>
+        {children}
+      </CardContent>
+    </Card>
   );
 }
 

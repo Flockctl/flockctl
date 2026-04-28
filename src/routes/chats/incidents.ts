@@ -6,6 +6,7 @@ import { eq, sql } from "drizzle-orm";
 import { NotFoundError, ValidationError } from "../../lib/errors.js";
 import { parseIdParam } from "../../lib/route-params.js";
 import { extractIncidentFromMessages } from "../../services/incidents/extractor.js";
+import { getChatOrThrow } from "../../lib/db-helpers.js";
 
 export function registerChatIncidents(router: Hono): void {
   // POST /chats/:id/extract-incident — run the incident-extractor LLM pass over
@@ -26,8 +27,7 @@ export function registerChatIncidents(router: Hono): void {
   router.post("/:id/extract-incident", async (c) => {
     const db = getDb();
     const id = parseIdParam(c);
-    const chat = db.select().from(chats).where(eq(chats.id, id)).get();
-    if (!chat) throw new NotFoundError("Chat");
+    const chat = getChatOrThrow(id);
 
     const body = await c.req.json().catch(() => ({} as Record<string, unknown>));
     const bodySchema = z.object({

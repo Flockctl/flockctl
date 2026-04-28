@@ -10,9 +10,9 @@ import {
 } from "@/components/ui/select";
 import { Wand2, Server } from "lucide-react";
 
-import type { Tab } from "./skills-mcp-components/shared";
-import { SkillsTab } from "./skills-mcp-components/SkillsTab";
-import { McpTab } from "./skills-mcp-components/McpTab";
+import type { Tab } from "@/components/skills-mcp/shared";
+import { SkillsTab } from "@/components/skills-mcp/SkillsTab";
+import { McpTab } from "@/components/skills-mcp/McpTab";
 
 // --- Main Page ---
 

@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSy
 import { join, resolve, dirname, relative } from "path";
 import { execSync, execFileSync } from "child_process";
 import { globSync } from "glob";
+import { z } from "zod";
 import { getFlockctlHome } from "../config/index.js";
 
 // Dangerous commands that could escape sandbox or damage the system
@@ -27,15 +28,113 @@ function isCommandBlocked(command: string): string | null {
   return null;
 }
 
-// Input schema for the AskUserQuestion tool. Exported so the session
-// interception layer can reuse it for validation.
-export const askUserQuestionInputSchema = {
+// Input schema for the AskUserQuestion tool. Exported as a Zod schema so the
+// session interception layer can reuse it for runtime validation.
+//
+// Divergence from the upstream Claude Code harness: the harness accepts up to
+// 4 options per question and supports a `questions[]` outer array (multiple
+// questions in one call). Flockctl's M05 model is "one question at a time,
+// oldest first" — so we collapse to a flat single-question shape with up to
+// 20 options, and tolerate harness-style payloads on the way in:
+//   - if `{ questions: [...] }` is present, we use the first element
+//   - both `multi_select` (snake_case) and `multiSelect` (camelCase) are accepted
+const askUserQuestionOptionSchema = z.object({
+  label: z.string().min(1).max(200),
+  description: z.string().max(500).optional(),
+  preview: z.string().max(2000).optional(),
+});
+
+export const askUserQuestionInputSchema = z.object({
+  question: z.string().min(1).max(2000),
+  header: z.string().max(40).optional(),
+  multi_select: z.boolean().optional().default(false),
+  options: z.array(askUserQuestionOptionSchema).max(20).optional(),
+});
+
+export type ParsedAskUserQuestion = z.infer<typeof askUserQuestionInputSchema>;
+
+// JSON schema sent to Anthropic's tool API — must mirror the Zod shape above.
+// Kept as a separate value because the Anthropic SDK expects a plain JSON
+// schema object, not a Zod schema instance.
+const askUserQuestionJsonSchema = {
   type: "object" as const,
   properties: {
-    question: { type: "string" as const, maxLength: 2000 },
+    question: { type: "string" as const, minLength: 1, maxLength: 2000 },
+    header: { type: "string" as const, maxLength: 40 },
+    multi_select: { type: "boolean" as const },
+    options: {
+      type: "array" as const,
+      maxItems: 20,
+      items: {
+        type: "object" as const,
+        properties: {
+          label: { type: "string" as const, minLength: 1, maxLength: 200 },
+          description: { type: "string" as const, maxLength: 500 },
+          preview: { type: "string" as const, maxLength: 2000 },
+        },
+        required: ["label"],
+      },
+    },
   },
   required: ["question"],
 };
+
+/**
+ * Parse + validate an AskUserQuestion tool input payload.
+ *
+ * - Strips unknown top-level fields (Zod default `.strip()` mode).
+ * - If the payload is a harness-style `{ questions: [...] }`, uses the first
+ *   element.
+ * - Normalizes `multiSelect` (camelCase) → `multi_select` (snake_case).
+ * - Drops empty `options: []` so callers can treat absence and emptiness the
+ *   same (free-form text answer).
+ *
+ * Returns a discriminated union so callers can handle the failure path
+ * without throwing.
+ */
+export function parseAskUserQuestionInput(
+  raw: unknown
+):
+  | { ok: true; value: ParsedAskUserQuestion }
+  | { ok: false; error: z.ZodError } {
+  let payload: unknown = raw;
+
+  // Harness sometimes wraps as { questions: [{...}] } — collapse to the first.
+  if (
+    payload &&
+    typeof payload === "object" &&
+    !Array.isArray(payload) &&
+    Array.isArray((payload as { questions?: unknown }).questions) &&
+    (payload as { questions: unknown[] }).questions.length > 0
+  ) {
+    payload = (payload as { questions: unknown[] }).questions[0];
+  }
+
+  // Normalize camelCase `multiSelect` → snake_case `multi_select`. Only
+  // promote when the snake_case key isn't already present.
+  if (
+    payload &&
+    typeof payload === "object" &&
+    !Array.isArray(payload) &&
+    "multiSelect" in (payload as Record<string, unknown>) &&
+    !("multi_select" in (payload as Record<string, unknown>))
+  ) {
+    const src = payload as Record<string, unknown>;
+    payload = { ...src, multi_select: src.multiSelect };
+  }
+
+  const result = askUserQuestionInputSchema.safeParse(payload);
+  if (!result.success) return { ok: false, error: result.error };
+
+  // Drop empty options entirely — callers should not need to distinguish
+  // "no options field" from "empty options array".
+  const value = result.data;
+  if (value.options && value.options.length === 0) {
+    const { options: _drop, ...rest } = value;
+    return { ok: true, value: rest as ParsedAskUserQuestion };
+  }
+  return { ok: true, value };
+}
 
 // Tool definitions for Anthropic API (tool_use)
 export function getAgentTools(workingDir?: string) {
@@ -164,7 +263,7 @@ export function getAgentTools(workingDir?: string) {
     {
       name: "AskUserQuestion",
       description: "Ask the user an open-ended clarification question that cannot be answered by calling another tool. Use sparingly — only when progress is blocked on information only the user can provide.",
-      input_schema: askUserQuestionInputSchema,
+      input_schema: askUserQuestionJsonSchema,
     },
   ];
 }

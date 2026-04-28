@@ -42,6 +42,17 @@ vi.mock("@/lib/hooks", async () => {
     useAutoExecStatus: (...args: unknown[]) => useAutoExecStatusMock(...args),
     useStartAutoExecute: (...args: unknown[]) => useStartAutoExecuteMock(...args),
     useCreateChat: (...args: unknown[]) => useCreateChatMock(...args),
+    // Slice 11/04: ProjectTreePanel now also calls `useMissions(projectId)`.
+    // No QueryClient is wired up in these tests, so we shadow the real hook
+    // with an idle stub returning an empty list — the panel falls back to
+    // its pre-mission flat layout, exactly what these rail tests assert.
+    useMissions: () => ({
+      data: { items: [] },
+      isLoading: false,
+      error: null,
+      isSuccess: true,
+      isError: false,
+    }),
   };
 });
 

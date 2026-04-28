@@ -1,6 +1,12 @@
-
-- [ ] Interactive agent questions (AskUserQuestion-style): let the AI pause mid-execution and ask the user a free-form clarifying question, not only tool-permission prompts. Scope: new `askUser` tool in `agent-tools.ts`, WS event `agent_question` + REST resume endpoint `POST /tasks|chats/:id/question/:requestId`, task status `waiting_for_input`, UI prompt in task/chat view. Today only permission requests are handled via `POST /{tasks,chats}/:id/permission/:requestId`.
-
 - [ ] Adopt `.claude/commands/*` during existing-directory import — introduce a project-level commands concept (like skills/agents), detect in scan preview, register in DB, reconcile via symlinks. For now imports leave the folder untouched.
 
-- [ ] Нужен какой-то механизм для того чтобы хранить secrets так чтобы у агента к ним не было доступа. МБ через вебхук ограничивать доспут агента к базе? И то же самое надо делать с mcp 
+## Nice to have — not currently planned
+
+- [ ] **P2P file sync between Flockctl daemons.** Selective, manual sync of skills, MCP configs, and workspace/project configs between two daemons over the existing SSH-tunnel transport (see `docs/REMOTE-ACCESS.md`). Sketch:
+  - **Scope:** `~/.flockctl/skills/`, `~/.flockctl/mcp/`, `~/.flockctl/workspaces/<id>/{config,skills,mcp}/`, `<project>/.flockctl/{config,skills,mcp}/`. Never: SQLite DB, logs, PIDs, `.claude/skills/` symlink farm, `*-state.json` (regenerated).
+  - **Secrets stay local.** MCP configs sync as-is including `${secret:NAME}` placeholders; raw tokens rejected with `400 raw_secret_in_config`. Pulling a config that references an undefined secret leaves the MCP disabled with a `mcp.secret_missing` event.
+  - **Manual triggers only** — no watchers, no polling. CLI: `flockctl sync diff|push|pull <remote> [<glob>…]` with `--dry-run`, `--profile`, `--all`. Profiles in `~/.flockctl/sync-profiles/`.
+  - **API:** `GET /sync/manifest?scope=…`, `GET/PUT/DELETE /sync/file?scope=…&path=…` with `If-Match`. Conflicts return 409; displaced bytes go to `import-backup/<ts>/`. Workspace identity via `sync_workspace_mappings(local_id, remote_label, remote_id)`.
+  - **UI is first-class** — Sync workbench page (filters + checkbox table + bulk push/pull), per-entity quick-sync dropdowns on skill/MCP/workspace pages, top-bar `↑3 ↓1 !1` badge, profile manager, remote-workspace mapping picker, secret-missing banners on MCP cards, sync-history view.
+  - **Conflict resolution = agent task.** Add `last_synced_hash` baseline column so the agent gets a real three-way merge. Conflict spawns a Flockctl task with inputs in `.flockctl/sync-conflicts/<id>/{base,local,remote,PROMPT}.md`; agent writes `resolved.*` + `resolution-notes.md`; UI shows three-column review (local / resolved / remote) with Apply / Edit / Reject / Re-run. File-type policy in `~/.flockctl/sync-conflict-policy.json` (agent / agent-proposal / manual). Default = human approval required, no auto-apply.
+  - **Open questions if revisited:** batching multiple conflicts into one agent run vs one-per-file; provider selection per merge; baseline backfill strategy on upgrade; whether `resolution-notes.md` should be persisted to `.flockctl/sync-history/`.

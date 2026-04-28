@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import type { Database as BetterSqlite3Database } from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
+import { vi } from "vitest";
 import * as schema from "../db/schema.js";
 import type { FlockctlDb } from "../db/index.js";
 import {
@@ -178,11 +179,13 @@ export function createTestDb(): {
       acceptance_criteria TEXT,
       decision_table TEXT,
       file_edits TEXT,
+      resume_at INTEGER,
       created_at TEXT DEFAULT (datetime('now')),
       started_at TEXT,
       completed_at TEXT,
       updated_at TEXT DEFAULT (datetime('now'))
     );
+    CREATE INDEX idx_tasks_resume_at ON tasks (resume_at) WHERE resume_at IS NOT NULL;
 
     CREATE TABLE task_logs (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -242,10 +245,13 @@ export function createTestDb(): {
       thinking_enabled INTEGER DEFAULT 1 NOT NULL,
       effort TEXT,
       pinned INTEGER DEFAULT 0 NOT NULL,
+      status TEXT NOT NULL DEFAULT 'idle',
+      resume_at INTEGER,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );
     CREATE INDEX idx_chats_entity ON chats (project_id, entity_type, entity_id);
+    CREATE INDEX idx_chats_resume_at ON chats (resume_at) WHERE resume_at IS NOT NULL;
 
     CREATE TABLE chat_messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -380,6 +386,9 @@ export function createTestDb(): {
       tool_use_id TEXT NOT NULL,
       question TEXT NOT NULL,
       answer TEXT,
+      options TEXT,
+      multi_select INTEGER NOT NULL DEFAULT 0,
+      header TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
       created_at TEXT DEFAULT (datetime('now')),
       answered_at TEXT,
@@ -407,17 +416,85 @@ export function createTestDb(): {
  */
 export function seedActiveKey(
   sqlite: BetterSqlite3Database,
-  overrides: { provider?: string; providerType?: string; label?: string } = {},
+  overrides: {
+    provider?: string;
+    providerType?: string;
+    label?: string;
+    keyValue?: string;
+    priority?: number;
+    isActive?: boolean;
+  } = {},
 ): number {
   const stmt = sqlite.prepare(
-    `INSERT INTO ai_provider_keys (provider, provider_type, label, key_value, is_active)
-     VALUES (?, ?, ?, ?, 1)`,
+    `INSERT INTO ai_provider_keys (provider, provider_type, label, key_value, priority, is_active)
+     VALUES (?, ?, ?, ?, ?, ?)`,
   );
   const res = stmt.run(
     overrides.provider ?? "anthropic",
     overrides.providerType ?? "api-key",
     overrides.label ?? "test-key",
-    "sk-ant-api-test",
+    overrides.keyValue ?? "sk-ant-api-test",
+    overrides.priority ?? 0,
+    overrides.isActive === false ? 0 : 1,
+  );
+  return Number(res.lastInsertRowid);
+}
+
+/**
+ * Seed a single project row and return its id. Replaces the
+ * `db.insert(projects).values({ name }).returning().get()!.id` ritual that
+ * appears 47 files / 182× across the test suite.
+ *
+ * `name` defaults to a timestamp-suffixed unique label so concurrent calls
+ * inside the same `beforeEach` don't collide on the unique-name index.
+ */
+export function seedProject(
+  sqlite: BetterSqlite3Database,
+  overrides: {
+    name?: string;
+    description?: string;
+    path?: string;
+    workspaceId?: number | null;
+  } = {},
+): number {
+  const stmt = sqlite.prepare(
+    `INSERT INTO projects (name, description, path, workspace_id)
+     VALUES (?, ?, ?, ?)`,
+  );
+  const res = stmt.run(
+    overrides.name ?? `proj-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
+    overrides.description ?? null,
+    overrides.path ?? null,
+    overrides.workspaceId ?? null,
+  );
+  return Number(res.lastInsertRowid);
+}
+
+/**
+ * Seed a single workspace row and return its id. Replaces the
+ * `db.insert(workspaces).values({ name, path }).returning().get()!.id`
+ * ritual that appears 18 files / 89× across the test suite.
+ *
+ * `name` and `path` default to unique values so back-to-back calls inside
+ * the same test don't collide on the unique-name / unique-path indices.
+ */
+export function seedWorkspace(
+  sqlite: BetterSqlite3Database,
+  overrides: {
+    name?: string;
+    description?: string;
+    path?: string;
+  } = {},
+): number {
+  const suffix = `${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+  const stmt = sqlite.prepare(
+    `INSERT INTO workspaces (name, description, path)
+     VALUES (?, ?, ?)`,
+  );
+  const res = stmt.run(
+    overrides.name ?? `ws-${suffix}`,
+    overrides.description ?? null,
+    overrides.path ?? `/tmp/test-ws-${suffix}`,
   );
   return Number(res.lastInsertRowid);
 }
@@ -461,5 +538,72 @@ export function createTestTemplate(
     templateName: tpl.name,
     templateWorkspaceId: scope === "workspace" ? input.workspaceId ?? null : null,
     templateProjectId: scope === "project" ? input.projectId ?? null : null,
+  };
+}
+
+// ─── Mock factory helpers ─────────────────────────────────────────────────
+// These return plain objects that match the shape of the real services so
+// tests can pass them straight into `vi.mock("...path...", () => ({ ... }))`
+// without hand-rolling the same `vi.fn()` collection in every file.
+//
+// Usage pattern (the factory call MUST live inside vi.mock's factory closure
+// so hoisting picks it up correctly):
+//
+//   vi.mock("../../services/ws-manager", () => ({ wsManager: wsManagerMock() }));
+//   vi.mock("../../services/agents/registry", () => agentRegistryMock());
+
+/**
+ * Mock shape for `wsManager` covering every broadcast surface a test might
+ * exercise. Replaces the 11+ inline copies of
+ * `{ broadcast: vi.fn(), broadcastAll: vi.fn(), broadcastChat: vi.fn(), … }`.
+ */
+export function wsManagerMock() {
+  return {
+    broadcast: vi.fn(),
+    broadcastAll: vi.fn(),
+    broadcastChat: vi.fn(),
+    broadcastTaskStatus: vi.fn(),
+    broadcastChatStatus: vi.fn(),
+    addTaskClient: vi.fn(),
+    addChatClient: vi.fn(),
+    addGlobalChatClient: vi.fn(),
+    removeClient: vi.fn(),
+    closeAll: vi.fn(),
+    clientCount: 0,
+    connections: new Map(),
+  };
+}
+
+/**
+ * Mock shape for `services/agents/registry` — covers `getAgent` returning the
+ * minimal stub used by chats route tests (`renameSession`, `estimateCost`).
+ * Replaces 8+ identical copies across `chats-*.test.ts`.
+ */
+export function agentRegistryMock() {
+  return {
+    getAgent: vi.fn().mockReturnValue({
+      renameSession: vi.fn().mockResolvedValue(undefined),
+      estimateCost: vi.fn().mockReturnValue(0),
+    }),
+  };
+}
+
+/**
+ * Mock shapes for the side-effect modules that task-executor + chat-executor
+ * tests routinely stub out (claude reconcilers, codebase-context, fs writes).
+ * Returns a tuple of `vi.mock()` body objects so the test can spread them
+ * into the matching mock declarations.
+ *
+ * Example:
+ *   const m = executorSideEffectMocks();
+ *   vi.mock("../../services/claude/skills-sync", () => m.skillsSync);
+ *   vi.mock("../../services/claude/mcp-sync", () => m.mcpSync);
+ *   vi.mock("../../services/git-context", () => m.gitContext);
+ */
+export function executorSideEffectMocks() {
+  return {
+    skillsSync: { reconcileClaudeSkillsForProject: vi.fn() },
+    mcpSync: { reconcileMcpForProject: vi.fn() },
+    gitContext: { buildCodebaseContext: vi.fn(async () => "") },
   };
 }

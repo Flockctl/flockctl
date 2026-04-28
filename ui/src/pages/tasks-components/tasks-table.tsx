@@ -394,7 +394,10 @@ export function TasksTableView() {
                     onClick={() => navigate(`/tasks/${task.id}`)}
                   >
                     <TableCell>
-                      <TaskStatusBadge status={task.status} />
+                      <TaskStatusBadge
+                        status={task.status}
+                        resumeAt={task.resume_at}
+                      />
                     </TableCell>
                     <TableCell className="font-mono text-xs">
                       {String(task.id).slice(0, 8)}

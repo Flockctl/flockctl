@@ -26,6 +26,8 @@ import SkillsMcpPage from "./pages/skills-mcp";
 import AnalyticsPage from "./pages/analytics";
 import AttentionPage from "./pages/attention";
 import IncidentDetailPage from "./pages/incident-detail";
+import { FaviconBadgeRunner } from "./lib/hooks/use-favicon-badge";
+import { NotificationDispatcherProvider } from "./lib/contexts/notification-dispatcher-context";
 
 /**
  * Redirect helper for the retired `/projects/:projectId/settings` route.
@@ -94,7 +96,38 @@ createRoot(document.getElementById("root")!).render(
     <ThemeProvider>
       <QueryClientProvider client={queryClient}>
         <ServerProvider>
-          <RouterProvider router={router} />
+          <NotificationDispatcherProvider>
+            {/*
+              FaviconBadgeRunner mounts the useAttention-driven favicon-badge
+              hook. It must sit inside QueryClientProvider + ServerProvider so
+              useAttention has both a QueryClient and an active server id; it
+              renders nothing, so its position relative to RouterProvider is
+              inert from a layout standpoint.
+
+              NotificationDispatcherProvider wraps both so the singleton
+              Dispatcher's LeaderElection is shared across the whole app —
+              `useLeaderStatus()` inside Settings must see the same election
+              instance the dispatcher gates on.
+            */}
+            <FaviconBadgeRunner />
+            {/*
+              The attention → notification pipeline runs from inside
+              <Layout /> (mounted by RouterProvider) because its hook
+              calls `useLocation()` for the self-poke suppression rule —
+              that hook only resolves under the RouterProvider tree.
+              Mounting here as a sibling of RouterProvider would crash
+              with "useLocation must be used within Router".
+
+              The task-terminal → notification pipeline rides alongside
+              it inside <Layout />. It does not strictly need
+              `useLocation()` (terminal events fire regardless of which
+              route the user is on), but co-locating both runners keeps
+              the per-tab baseline + WS subscription lifecycle symmetric
+              and avoids opening a second global-WS connection just for
+              this one consumer.
+            */}
+            <RouterProvider router={router} />
+          </NotificationDispatcherProvider>
         </ServerProvider>
       </QueryClientProvider>
     </ThemeProvider>

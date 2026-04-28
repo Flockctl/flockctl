@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-04-28
+
+### Added
+- Agent questions support structured options (radio/checkbox + Other) and surface in the inbox alongside permission requests.
+- Missions entity and supervisor agent. A mission is a long-running, supervised goal attached to a project: you give it an objective and a budget, and a read-only supervisor agent wakes up on task / chat events, heartbeats, and stall detection to propose the next concrete action. Proposals are JSON-only, destructive verbs are rejected at parse time, and every supervisor decision lands as an event on the mission timeline. A new "Missions" node in the project tree lists missions; the mission detail page shows objective, budget burn-down, supervisor log, and pending proposals.
+- Approval queue UI and API. Every supervisor proposal lands in a per-mission approval queue surfaced in the global Inbox alongside task approvals and permission requests. Approve or reject from the Inbox or the mission detail page; rejection is a first-class outcome, recorded on the timeline. Backed by `GET /missions`, `GET /missions/:id`, `GET /missions/:id/events`, `GET /missions/:id/proposals`, `POST /missions/:id/proposals/:pid/approve`, and `POST /missions/:id/proposals/:pid/reject`, with live updates over the missions WebSocket / SSE channel.
+
+### Security
+- Budget enforcement (tokens + USD) on every mission. Each supervisor round-trip is metered before and after the LLM call: the daemon refuses to evaluate when the per-mission token or dollar ceiling is reached, and a max-depth guard caps recursion so a supervisor proposal that re-triggers the supervisor cannot loop unbounded. Budget rejects and depth rejects are recorded as `no_action` events with the reason captured for forensics.
+- Autonomy gating: `auto` disabled in v1. Mission autonomy has two settings on paper — `proposal` (queue everything for human approval) and `auto` (apply without approval). In v1, only `proposal` is active; the `auto` path is wired at the schema level but refused at runtime, so every proposal lands in the approval queue regardless of how a mission was created.
+- Prompt injection jailbreak regression coverage. The supervisor receives the triggering event's `task_output` inside a length-padded fenced ` ```data ` block whose fence width is computed from the content so a payload that opens with ``` cannot escape. A jailbreak corpus and a regression test exercise the most common injection shapes (role hijack, "ignore previous instructions", smuggled tool-call directives, fence-escape attempts) against the live supervisor pipeline; every reply must still parse to either a `no_action` or a non-destructive `propose`, never a destructive action and never a tool call outside the read-only set.
+
 ## [0.0.1] - 2026-04-25
 
 First stable release. Promotes `0.0.1-rc.3` to `latest` on npm and brings the dependency stack up to date.

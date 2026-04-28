@@ -286,14 +286,13 @@ export function MissionControlKpiBarView({
         label={slicesLabel}
       />
 
-      <div data-testid="kpi-active-tasks">
-        <StatCard
-          icon={Play}
-          label="Active tasks"
-          value={activeTasks === null ? KPI_NULL_PLACEHOLDER : activeTasks}
-          isLoading={!!isLoading?.activeTasks}
-        />
-      </div>
+      <StatCard
+        testId="kpi-active-tasks"
+        icon={Play}
+        label="Active tasks"
+        value={activeTasks === null ? KPI_NULL_PLACEHOLDER : activeTasks}
+        isLoading={!!isLoading?.activeTasks}
+      />
 
       <ToneStatCard
         testId="kpi-pending-approval"
@@ -313,17 +312,16 @@ export function MissionControlKpiBarView({
         tone={failedTone}
       />
 
-      <div data-testid="kpi-tokens-cost">
-        <StatCard
-          icon={DollarSign}
-          label="Tokens / $ (24h)"
-          value={tokenLabel}
-          subtitle={costLabel}
-          isLoading={
-            !!(isLoading?.tokens24h || isLoading?.costCents24h)
-          }
-        />
-      </div>
+      <StatCard
+        testId="kpi-tokens-cost"
+        icon={DollarSign}
+        label="Tokens / $ (24h)"
+        value={tokenLabel}
+        subtitle={costLabel}
+        isLoading={
+          !!(isLoading?.tokens24h || isLoading?.costCents24h)
+        }
+      />
     </div>
   );
 }

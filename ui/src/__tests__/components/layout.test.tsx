@@ -28,6 +28,23 @@ vi.mock("@/lib/hooks", () => ({
   useAttention: () => ({ total: attentionMock.total }),
 }));
 
+// AttentionNotificationsRunner is mounted inside <Layout /> at runtime —
+// it pulls `useAttention` directly (relative path, bypassing the mock
+// above) and `useNotificationDispatcher` from a context that this test
+// doesn't provide. Replace the runner with a no-op so the sidebar
+// accordion suite doesn't have to set up QueryClient + dispatcher
+// plumbing it doesn't care about.
+vi.mock("@/lib/hooks/use-attention-notifications", () => ({
+  AttentionNotificationsRunner: () => null,
+}));
+
+// Same rationale as the attention runner mock: the task-terminal runner
+// opens a global WebSocket and pulls a NotificationDispatcher from
+// context. The sidebar test doesn't care about either; stub it out.
+vi.mock("@/lib/hooks/use-task-terminal-notifications", () => ({
+  TaskTerminalNotificationsRunner: () => null,
+}));
+
 import Layout from "@/components/layout";
 
 function renderLayout() {

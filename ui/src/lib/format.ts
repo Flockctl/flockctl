@@ -42,6 +42,23 @@ export function formatDuration(seconds: number): string {
 }
 
 /**
+ * Millisecond-input variant of {@link formatDuration} that also handles null:
+ * `null → "—"`, `<1s → "123ms"`, otherwise delegates to seconds-based formatter.
+ *
+ * Used by milestone/slice panels where the data layer reports `durationMs`
+ * directly. Kept separate from `formatDuration` so the seconds variant doesn't
+ * have to choose between Math.round-ing away sub-second precision and
+ * returning bare ints.
+ */
+export function formatDurationMs(ms: number | null | undefined): string {
+  if (ms == null) return "—";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(1)}s`;
+  return formatDuration(s);
+}
+
+/**
  * Coarse seconds-duration: `42s`, `5m`, `1h 30m`. Use for high-level analytics
  * summaries where sub-minute precision is noise.
  */
@@ -61,5 +78,18 @@ export function formatPercent(rate: number | null): string {
 
 /** `0.4239` → `"$0.42"`. */
 export function formatCost(usd: number): string {
+  return `$${usd.toFixed(2)}`;
+}
+
+/**
+ * Cost variant for null-safe display with sub-cent precision: `null → "—"`,
+ * `< $0.01 → $0.0042` (4 decimals), otherwise `$0.42`.
+ *
+ * Used by milestone / slice / KPI panels that surface tiny per-task costs
+ * where the canonical `formatCost` would round to "$0.00".
+ */
+export function formatCostPrecise(usd: number | null | undefined): string {
+  if (usd == null) return "—";
+  if (usd < 0.01) return `$${usd.toFixed(4)}`;
   return `$${usd.toFixed(2)}`;
 }

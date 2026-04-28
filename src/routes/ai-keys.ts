@@ -5,6 +5,7 @@ import { eq, sql, desc } from "drizzle-orm";
 import { paginationParams } from "../lib/pagination.js";
 import { NotFoundError, ValidationError } from "../lib/errors.js";
 import { parseIdParam } from "../lib/route-params.js";
+import { getAiKeyOrThrow } from "../lib/db-helpers.js";
 const PROVIDERS: Record<string, { name: string; apiType: string }> = {
   claude_cli: { name: "Claude Code CLI", apiType: "claude-agent-sdk" },
   github_copilot: { name: "GitHub Copilot", apiType: "copilot-sdk" },
@@ -78,8 +79,7 @@ aiKeyRoutes.get("/copilot/status", async (c) => {
 aiKeyRoutes.get("/:id", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const key = db.select().from(aiProviderKeys).where(eq(aiProviderKeys.id, id)).get();
-  if (!key) throw new NotFoundError("AI Key");
+  const key = getAiKeyOrThrow(id);
 
   return c.json({
     ...key,
@@ -98,8 +98,7 @@ aiKeyRoutes.get("/:id", (c) => {
 aiKeyRoutes.get("/:id/identity", async (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const key = db.select().from(aiProviderKeys).where(eq(aiProviderKeys.id, id)).get();
-  if (!key) throw new NotFoundError("AI Key");
+  const key = getAiKeyOrThrow(id);
 
   if (key.provider !== "claude_cli") {
     return c.json({
@@ -146,8 +145,7 @@ aiKeyRoutes.post("/", async (c) => {
 aiKeyRoutes.patch("/:id", async (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const existing = db.select().from(aiProviderKeys).where(eq(aiProviderKeys.id, id)).get();
-  if (!existing) throw new NotFoundError("AI Key");
+  const existing = getAiKeyOrThrow(id);
 
   const body = await c.req.json();
   db.update(aiProviderKeys)
@@ -179,8 +177,7 @@ aiKeyRoutes.patch("/:id", async (c) => {
 aiKeyRoutes.delete("/:id", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const existing = db.select().from(aiProviderKeys).where(eq(aiProviderKeys.id, id)).get();
-  if (!existing) throw new NotFoundError("AI Key");
+  const existing = getAiKeyOrThrow(id);
 
   db.delete(aiProviderKeys).where(eq(aiProviderKeys.id, id)).run();
   return c.json({ deleted: true });

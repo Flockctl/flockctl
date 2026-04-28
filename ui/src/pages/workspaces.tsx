@@ -9,7 +9,7 @@ import {
   useAttention,
 } from "@/lib/hooks";
 import type { WorkspaceCreate } from "@/lib/types";
-import { slugify } from "@/lib/utils";
+import { slugify, timeAgo } from "@/lib/utils";
 import {
   Table,
   TableHeader,
@@ -48,18 +48,6 @@ import { FolderOpen } from "lucide-react";
 // reused across both flows — pick a folder when creating a project, then the
 // next workspace create lands in the same neighbourhood (and vice versa).
 const LAST_PICKED_PATH_KEY = "flockctl.lastPickedPath";
-
-function timeAgo(iso: string): string {
-  const diff = Date.now() - new Date(iso).getTime();
-  const seconds = Math.floor(diff / 1000);
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
-}
 
 type WsSourceMode = "local" | "git";
 

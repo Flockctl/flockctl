@@ -17,6 +17,7 @@ import {
   parseJsonOrNull,
   serializeSpec,
 } from "./helpers.js";
+import { getTaskOrThrow } from "../../lib/db-helpers.js";
 
 export function registerTaskList(router: Hono): void {
   // GET /tasks — list with filters
@@ -297,8 +298,7 @@ export function registerTaskPatch(router: Hono): void {
   router.patch("/:id", async (c) => {
     const db = getDb();
     const id = parseIdParam(c);
-    const existing = db.select().from(tasks).where(eq(tasks.id, id)).get();
-    if (!existing) throw new NotFoundError("Task");
+    const existing = getTaskOrThrow(id);
 
     const body = await c.req.json();
     const permissionMode = parsePermissionModeBody(body);
@@ -329,8 +329,7 @@ export function registerTaskPut(router: Hono): void {
   router.put("/:id", async (c) => {
     const db = getDb();
     const id = parseIdParam(c);
-    const existing = db.select().from(tasks).where(eq(tasks.id, id)).get();
-    if (!existing) throw new NotFoundError("Task");
+    const existing = getTaskOrThrow(id);
 
     const body = await c.req.json().catch(() => ({}));
     const spec = parseSpecFieldsOrThrow({
@@ -388,8 +387,7 @@ export function registerTaskCancel(router: Hono): void {
   router.post("/:id/cancel", (c) => {
     const db = getDb();
     const id = parseIdParam(c);
-    const task = db.select().from(tasks).where(eq(tasks.id, id)).get();
-    if (!task) throw new NotFoundError("Task");
+    const task = getTaskOrThrow(id);
 
     /* v8 ignore next — tasks.status has DB default 'queued', so `?? "queued"` is unreachable */
     if (!validateTaskTransition(task.status ?? "queued", "cancelled")) {
@@ -397,12 +395,16 @@ export function registerTaskCancel(router: Hono): void {
     }
 
     taskExecutor.cancel(id);
-    // Always update DB — abort is async and may not have completed yet
+    // Always update DB — abort is async and may not have completed yet.
+    // `resumeAt` is cleared too so a stale wake-up timestamp can't leak into a
+    // future re-queue (e.g. via the failed→queued retry path); the scheduler
+    // entry was just torn down by `taskExecutor.cancel` above, but the column
+    // is what survives a daemon restart.
     db.update(tasks)
-      .set({ status: "cancelled", completedAt: new Date().toISOString() })
+      .set({ status: "cancelled", resumeAt: null, completedAt: new Date().toISOString() })
       .where(eq(tasks.id, id))
       .run();
-    wsManager.broadcastAll({ type: "task_status", taskId: id, status: "cancelled" });
+    wsManager.broadcastTaskStatus(id, "cancelled");
 
     return c.json({ status: "cancelled" });
   });
@@ -413,8 +415,7 @@ export function registerTaskRerun(router: Hono): void {
   router.post("/:id/rerun", async (c) => {
     const db = getDb();
     const id = parseIdParam(c);
-    const original = db.select().from(tasks).where(eq(tasks.id, id)).get();
-    if (!original) throw new NotFoundError("Task");
+    const original = getTaskOrThrow(id);
 
     const newTask = db.insert(tasks).values({
       projectId: original.projectId,
@@ -456,8 +457,7 @@ export function registerTaskApproval(router: Hono): void {
     const body = await c.req.json().catch(() => ({}));
     const note = body.note ?? null;
 
-    const task = db.select().from(tasks).where(eq(tasks.id, id)).get();
-    if (!task) throw new NotFoundError("Task");
+    const task = getTaskOrThrow(id);
     /* v8 ignore next — tasks.status has DB default 'queued', so `?? QUEUED` is unreachable */
     if (!validateTaskTransition(task.status ?? TaskStatus.QUEUED, TaskStatus.DONE)) {
       throw new ValidationError(`Cannot approve task in status '${task.status}'`);
@@ -474,7 +474,7 @@ export function registerTaskApproval(router: Hono): void {
       .where(eq(tasks.id, id))
       .run();
 
-    wsManager.broadcastAll({ type: "task_status", taskId: id, status: TaskStatus.DONE });
+    wsManager.broadcastTaskStatus(id, TaskStatus.DONE);
     // Task left pending_approval, so any cached attention list is stale.
     emitAttentionChanged(wsManager);
     return c.json({ ok: true });
@@ -487,8 +487,7 @@ export function registerTaskApproval(router: Hono): void {
     const body = await c.req.json().catch(() => ({}));
     const note = body.note ?? null;
 
-    const task = db.select().from(tasks).where(eq(tasks.id, id)).get();
-    if (!task) throw new NotFoundError("Task");
+    const task = getTaskOrThrow(id);
     /* v8 ignore next — tasks.status has DB default 'queued', so `?? QUEUED` is unreachable */
     if (!validateTaskTransition(task.status ?? TaskStatus.QUEUED, TaskStatus.CANCELLED)) {
       throw new ValidationError(`Cannot reject task in status '${task.status}'`);
@@ -514,7 +513,7 @@ export function registerTaskApproval(router: Hono): void {
       .where(eq(tasks.id, id))
       .run();
 
-    wsManager.broadcastAll({ type: "task_status", taskId: id, status: TaskStatus.CANCELLED });
+    wsManager.broadcastTaskStatus(id, TaskStatus.CANCELLED);
     // Rejecting also clears the pending_approval blocker from /attention.
     emitAttentionChanged(wsManager);
     return c.json({ ok: true });

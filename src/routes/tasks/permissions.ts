@@ -6,16 +6,15 @@ import { eq } from "drizzle-orm";
 import { AppError, NotFoundError, ValidationError } from "../../lib/errors.js";
 import { parseIdParam } from "../../lib/route-params.js";
 import { taskExecutor } from "../../services/task-executor/index.js";
+import { getTaskOrThrow } from "../../lib/db-helpers.js";
 
 export function registerTaskPendingPermissions(router: Hono): void {
   // GET /tasks/:id/pending-permissions — full pending permission requests for a
   // running task. Used by the task detail UI to re-hydrate the permission card
   // after a page reload (WS events are not replayed on reconnect).
   router.get("/:id/pending-permissions", (c) => {
-    const db = getDb();
     const id = parseIdParam(c);
-    const task = db.select().from(tasks).where(eq(tasks.id, id)).get();
-    if (!task) throw new NotFoundError("Task");
+    getTaskOrThrow(id);
 
     const requests = taskExecutor.pendingPermissions(id).map((r) => ({
       request_id: r.requestId,
@@ -38,10 +37,8 @@ export function registerTaskQuestions(router: Hono): void {
   // restart too — a task parked in `waiting_for_input` must stay answerable
   // across process boundaries.
   router.get("/:id/pending-questions", (c) => {
-    const db = getDb();
     const id = parseIdParam(c);
-    const task = db.select().from(tasks).where(eq(tasks.id, id)).get();
-    if (!task) throw new NotFoundError("Task");
+    getTaskOrThrow(id);
     return c.json({ items: taskExecutor.pendingQuestions(id) });
   });
 
@@ -51,7 +48,6 @@ export function registerTaskQuestions(router: Hono): void {
   // the task, letting the resumeSessionId flow continue the Claude Code
   // session where it left off.
   router.post("/:id/question/:requestId", async (c) => {
-    const db = getDb();
     const id = parseIdParam(c);
     const requestId = c.req.param("requestId");
     const body = await c.req.json().catch(() => ({}));
@@ -64,8 +60,7 @@ export function registerTaskQuestions(router: Hono): void {
       throw new ValidationError("answer must be ≤ 10000 characters");
     }
 
-    const task = db.select().from(tasks).where(eq(tasks.id, id)).get();
-    if (!task) throw new NotFoundError("Task");
+    getTaskOrThrow(id);
 
     const ok = taskExecutor.answerQuestion(id, requestId, answer);
     if (!ok) throw new NotFoundError("Agent question");
@@ -97,9 +92,7 @@ export function registerTaskQuestions(router: Hono): void {
     if (!params.success) throw new AppError(400, "invalid task id");
     const id = params.data.id;
 
-    const db = getDb();
-    const task = db.select().from(tasks).where(eq(tasks.id, id)).get();
-    if (!task) throw new NotFoundError("Task");
+    getTaskOrThrow(id);
 
     return c.json({ items: taskExecutor.pendingQuestions(id) });
   });
@@ -131,8 +124,7 @@ export function registerTaskQuestions(router: Hono): void {
     }
 
     const db = getDb();
-    const task = db.select().from(tasks).where(eq(tasks.id, id)).get();
-    if (!task) throw new NotFoundError("Task");
+    getTaskOrThrow(id);
 
     // Look up the question by requestId alone so we can tell "unknown" apart
     // from "wrong task" apart from "already answered". Both of the first two

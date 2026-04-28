@@ -189,7 +189,13 @@ describe("collectAttentionItems", () => {
     const { db, sqlite } = createTestDb();
     const registry = new FakeRegistry();
     seedAttentionFixture(db, registry);
-    const items = collectAttentionItems(db, registry);
+    // The fixture only seeds approval/permission rows (no question rows yet),
+    // so narrowing to those kinds is sound and lets the assertion read
+    // `since` directly. The new `task_question` / `chat_question` variants
+    // expose `createdAt` instead and are covered by their own slice tests.
+    const items = collectAttentionItems(db, registry).filter(
+      (i) => i.kind !== "task_question" && i.kind !== "chat_question",
+    );
     expect(items.length).toBeGreaterThan(1);
     for (let i = 1; i < items.length; i++) {
       expect(items[i - 1].since >= items[i].since).toBe(true);

@@ -497,7 +497,15 @@ describe("AgentSession — tool-call branches", () => {
     mockCreateAIClient.mockReturnValue({ chat: mockChat });
   });
 
-  it("AskUserQuestion with non-string question input passes empty string", async () => {
+  it("AskUserQuestion with non-string question input is rejected — error tool_result, no pending question", async () => {
+    // Slice 03 contract: malformed AskUserQuestion inputs are rejected by
+    // the shared Zod parser (`parseAskUserQuestionInput`). The interceptor
+    // returns an `Error: invalid AskUserQuestion input — …` string as the
+    // tool_result content (mirroring the convention in executeToolCall)
+    // and DOES NOT emit a question_request event, so no DB row or WS
+    // pending block is created — the agent gets the error back and can
+    // re-issue with valid input.
+    let secondCallMessages: any[] | undefined;
     mockChat
       .mockImplementationOnce(async () => ({
         text: "",
@@ -507,23 +515,28 @@ describe("AgentSession — tool-call branches", () => {
         ],
         usage: {},
       }))
-      .mockImplementationOnce(async () => ({
-        text: "",
-        rawContent: "",
-        toolCalls: [],
-        usage: {},
-      }));
+      .mockImplementationOnce(async (args: any) => {
+        secondCallMessages = JSON.parse(JSON.stringify(args.messages));
+        return { text: "", rawContent: "", toolCalls: [], usage: {} };
+      });
     const session = makeSession();
-    const run = session.run();
-    // Wait for the question to register
-    for (let i = 0; i < 20; i++) {
-      if (session.pendingQuestionRequests().length > 0) break;
-      await new Promise((r) => setImmediate(r));
-    }
-    const q = session.pendingQuestionRequests()[0];
-    expect(q?.question).toBe(""); // non-string → fallback to empty string
-    session.resolveQuestion(q!.requestId, "my answer");
-    await run;
+    const toolResults: Array<[string, string]> = [];
+    session.on("tool_result", (n: string, out: string) => toolResults.push([n, out]));
+    await session.run();
+
+    // No pending question ever registered.
+    expect(session.pendingQuestionRequests()).toEqual([]);
+
+    // The agent saw an Error tool_result against the original tool_use_id.
+    const askResult = toolResults.find(([n]) => n === "AskUserQuestion");
+    expect(askResult?.[1]).toMatch(/^Error: invalid AskUserQuestion input/);
+
+    // Second turn's messages include that error string as a tool_result.
+    expect(secondCallMessages).toBeDefined();
+    const last = secondCallMessages![secondCallMessages!.length - 1];
+    expect(last.role).toBe("user");
+    expect(last.content[0]).toMatchObject({ type: "tool_result", tool_use_id: "ask-1" });
+    expect(String(last.content[0].content)).toMatch(/^Error: invalid AskUserQuestion input/);
   });
 
   it("awaitUserAnswer: abort before promise wires returns cancellation immediately", async () => {

@@ -1,4 +1,14 @@
 {
   "baseBranch": "main",
-  "disabledSkills": []
+  "disabledSkills": [],
+  "disabledMcpServers": [
+    {
+      "name": "chrome-devtools",
+      "level": "global"
+    },
+    {
+      "name": "albs",
+      "level": "global"
+    }
+  ]
 }

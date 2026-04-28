@@ -6,6 +6,7 @@ import { eq } from "drizzle-orm";
 import { AppError, NotFoundError, ValidationError } from "../../lib/errors.js";
 import { parseIdParam } from "../../lib/route-params.js";
 import { chatExecutor } from "../../services/chat-executor.js";
+import { getChatOrThrow } from "../../lib/db-helpers.js";
 
 // ─── Question /answer endpoints (slice 02 HTTP surface) ────────────────────
 // Mirrors the task route of the same name. 404 means the requestId is
@@ -29,10 +30,8 @@ export function registerChatQuestions(router: Hono): void {
   // agent_question), and the UI uses this endpoint to re-hydrate the question
   // card on page reload.
   router.get("/:id/pending-questions", (c) => {
-    const db = getDb();
     const id = parseIdParam(c);
-    const chat = db.select().from(chats).where(eq(chats.id, id)).get();
-    if (!chat) throw new NotFoundError("Chat");
+    getChatOrThrow(id);
     return c.json({ items: chatExecutor.pendingQuestions(id) });
   });
 
@@ -52,9 +51,7 @@ export function registerChatQuestions(router: Hono): void {
       throw new ValidationError("answer must be at most 10000 characters");
     }
 
-    const db = getDb();
-    const chat = db.select().from(chats).where(eq(chats.id, id)).get();
-    if (!chat) throw new NotFoundError("Chat");
+    getChatOrThrow(id);
 
     if (!chatExecutor.isRunning(id)) {
       throw new ValidationError("Chat session is not running");
@@ -74,9 +71,7 @@ export function registerChatQuestions(router: Hono): void {
     if (!params.success) throw new AppError(400, "invalid chat id");
     const id = params.data.id;
 
-    const db = getDb();
-    const chat = db.select().from(chats).where(eq(chats.id, id)).get();
-    if (!chat) throw new NotFoundError("Chat");
+    getChatOrThrow(id);
 
     return c.json({ items: chatExecutor.pendingQuestions(id) });
   });
@@ -104,8 +99,7 @@ export function registerChatQuestions(router: Hono): void {
     }
 
     const db = getDb();
-    const chat = db.select().from(chats).where(eq(chats.id, id)).get();
-    if (!chat) throw new NotFoundError("Chat");
+    getChatOrThrow(id);
 
     const row = db.select().from(agentQuestions).where(eq(agentQuestions.requestId, requestId)).get();
     if (!row || row.chatId !== id) throw new NotFoundError("Agent question");
@@ -120,6 +114,10 @@ export function registerChatQuestions(router: Hono): void {
       throw new AppError(409, "Agent question already resolved");
     }
 
-    return c.json({ ok: true });
+    // Symmetric with the task variant's `taskStatus`: chats have no `.status`
+    // column (the closest field is `approval_status`), so we surface that so
+    // the UI can update without waiting for the WS broadcast.
+    const updated = db.select({ approvalStatus: chats.approvalStatus }).from(chats).where(eq(chats.id, id)).get();
+    return c.json({ ok: true, chatStatus: updated?.approvalStatus ?? null });
   });
 }

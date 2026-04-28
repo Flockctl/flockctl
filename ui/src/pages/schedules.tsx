@@ -17,7 +17,6 @@ import {
   TableHead,
   TableCell,
 } from "@/components/ui/table";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -29,6 +28,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { ConfirmDialog, useConfirmDialog } from "@/components/confirm-dialog";
+import { ScheduleStatusBadge } from "@/components/schedule-status-badge";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import {
   CreateScheduleDialog,
@@ -49,19 +49,6 @@ const SCHEDULE_STATUS_VALUES: ScheduleStatus[] = [
   ScheduleStatus.expired,
 ];
 
-function ScheduleStatusBadge({ status }: { status: Schedule["status"] }) {
-  const variants: Record<string, string> = {
-    [ScheduleStatus.active]:
-      "bg-green-500/15 text-green-700 dark:text-green-400 dark:bg-green-500/20",
-    [ScheduleStatus.paused]:
-      "bg-orange-500/15 text-orange-700 dark:text-orange-400 dark:bg-orange-500/20",
-  };
-  const className = variants[status];
-  if (className) {
-    return <Badge className={className}>{status}</Badge>;
-  }
-  return <Badge variant="outline">{status}</Badge>;
-}
 
 /**
  * /schedules landing page. Renders the filter bar + paginated table. Row

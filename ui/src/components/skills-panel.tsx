@@ -3,8 +3,6 @@ import {
   useGlobalSkills,
   useWorkspaceSkills,
   useProjectSkills,
-  useCreateWorkspaceSkill,
-  useCreateProjectSkill,
   useDeleteWorkspaceSkill,
   useDeleteProjectSkill,
   useWorkspaceDisabledSkills,
@@ -15,9 +13,6 @@ import {
 import type { Skill } from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Card,
@@ -25,130 +20,15 @@ import {
   CardTitle,
   CardContent,
 } from "@/components/ui/card";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { Wand2, Plus, Trash2, Pencil, ChevronDown, ChevronRight, Eye, EyeOff } from "lucide-react";
+import { Wand2, Plus, Trash2, Pencil, ChevronDown, ChevronRight } from "lucide-react";
+import { DisableToggle } from "@/components/skills-mcp/DisableToggle";
+import { SkillDialog } from "@/components/skills-mcp/SkillDialog";
+import { levelColors } from "@/components/skills-mcp/shared";
 import { ConfirmDialog, useConfirmDialog } from "@/components/confirm-dialog";
 
-const levelColors: Record<string, string> = {
-  global: "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-300",
-  workspace: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300",
-  project: "bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-300",
-};
-
-// --- Skill Dialog (create + edit) ---
-
-function SkillDialog({
-  open,
-  onOpenChange,
-  level,
-  workspaceId,
-  projectId,
-  editSkill,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  level: "workspace" | "project";
-  workspaceId: string;
-  projectId?: string;
-  editSkill?: Skill | null;
-}) {
-  const createWorkspace = useCreateWorkspaceSkill(workspaceId);
-  const createProject = useCreateProjectSkill(workspaceId, projectId ?? "");
-
-  const [name, setName] = useState(editSkill?.name ?? "");
-  const [content, setContent] = useState(editSkill?.content ?? "");
-  const [error, setError] = useState("");
-
-  // Sync when editSkill changes (dialog opens with different skill)
-  const [prevEdit, setPrevEdit] = useState<Skill | null | undefined>(undefined);
-  if (editSkill !== prevEdit) {
-    setPrevEdit(editSkill);
-    setName(editSkill?.name ?? "");
-    setContent(editSkill?.content ?? "");
-    setError("");
-  }
-
-  function reset() {
-    setName("");
-    setContent("");
-    setError("");
-  }
-
-  function handleClose(v: boolean) {
-    if (!v) reset();
-    onOpenChange(v);
-  }
-
-  async function handleSave() {
-    if (!name.trim() || !content.trim()) {
-      setError("Name and content are required");
-      return;
-    }
-    setError("");
-    try {
-      const data = { name: name.trim(), content: content.trim() };
-      if (level === "workspace") await createWorkspace.mutateAsync(data);
-      else await createProject.mutateAsync(data);
-      handleClose(false);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to save");
-    }
-  }
-
-  const isPending = createWorkspace.isPending || createProject.isPending;
-  const isEditing = !!editSkill;
-
-  return (
-    <Dialog open={open} onOpenChange={handleClose}>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>{isEditing ? "Edit Skill" : "Add Skill"}</DialogTitle>
-          <DialogDescription>
-            {isEditing
-              ? `Edit the "${editSkill.name}" skill at ${level} level.`
-              : `Create a new SKILL.md at the ${level} level.`}
-          </DialogDescription>
-        </DialogHeader>
-        <div className="space-y-4">
-          <div className="space-y-2">
-            <Label htmlFor="skill-name">Name</Label>
-            <Input
-              id="skill-name"
-              placeholder="e.g. api-design"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              disabled={isEditing}
-            />
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="skill-content">Content (Markdown)</Label>
-            <Textarea
-              id="skill-content"
-              placeholder={"# Skill Name\n\nDescription and instructions..."}
-              value={content}
-              onChange={(e) => setContent(e.target.value)}
-              className="min-h-[200px] font-mono text-sm"
-            />
-          </div>
-          {error && <p className="text-sm text-destructive">{error}</p>}
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={() => handleClose(false)}>Cancel</Button>
-          <Button onClick={handleSave} disabled={isPending}>
-            {isPending ? "Saving…" : "Save"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
+// SkillDialog lives in @/components/skills-mcp/SkillDialog (shared with the
+// full-page Skills tab). It supports global scope too — the panel never
+// invokes that, but the tab does.
 
 // --- SkillsPanel ---
 
@@ -201,7 +81,20 @@ export function SkillsPanel({
   function isSkillDisabled(skill: Skill): boolean {
     const key = `${skill.level}:${skill.name}`;
     if (level === "workspace") return wsDisabledSet.has(key);
-    return projDisabledSet.has(key);
+    // In the project view a skill is effectively disabled if EITHER the
+    // workspace OR the project itself disables it. Workspace disables
+    // cascade to all child projects (see resolveSkillsForProject) so the
+    // UI must mirror that — otherwise the skill looks "enabled" here while
+    // the daemon has already filtered it out of the project's effective set.
+    return wsDisabledSet.has(key) || projDisabledSet.has(key);
+  }
+
+  // True only when the disable comes from the workspace (so the user can't
+  // toggle it off from the project view — it must be re-enabled at the
+  // workspace level).
+  function isDisabledByWorkspace(skill: Skill): boolean {
+    if (level !== "project") return false;
+    return wsDisabledSet.has(`${skill.level}:${skill.name}`);
   }
 
   function toggleDisable(skill: Skill) {
@@ -269,6 +162,7 @@ export function SkillsPanel({
                 const key = `${skill.level}:${skill.name}`;
                 const isExpanded = expandedSkill === key;
                 const disabled = isSkillDisabled(skill);
+                const inheritedDisable = isDisabledByWorkspace(skill);
                 const isPending = toggleDisabledPending;
                 return (
                   <div key={key}>
@@ -288,21 +182,22 @@ export function SkillsPanel({
                         {skill.level}
                       </Badge>
                       {disabled && (
-                        <Badge variant="outline" className="text-xs">disabled</Badge>
+                        <Badge variant="outline" className="text-xs">
+                          {inheritedDisable ? "disabled by workspace" : "disabled"}
+                        </Badge>
                       )}
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-7 w-7"
-                        title={disabled ? `Enable at ${level}` : `Disable at ${level}`}
-                        disabled={isPending}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          toggleDisable(skill);
-                        }}
-                      >
-                        {disabled ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />}
-                      </Button>
+                      <DisableToggle
+                        disabled={disabled}
+                        title={
+                          inheritedDisable
+                            ? "Disabled at workspace level — re-enable in workspace settings"
+                            : disabled
+                              ? `Enable at ${level}`
+                              : `Disable at ${level}`
+                        }
+                        pending={isPending || inheritedDisable}
+                        onToggle={() => toggleDisable(skill)}
+                      />
                     </div>
                     {isExpanded && (
                       <div className="px-3 pb-3">
@@ -352,19 +247,12 @@ export function SkillsPanel({
                     {disabled && (
                       <Badge variant="outline" className="text-xs">disabled</Badge>
                     )}
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="h-7 w-7"
+                    <DisableToggle
+                      disabled={disabled}
                       title={disabled ? "Enable skill" : "Disable skill"}
-                      disabled={toggleDisabledPending}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        toggleDisable(skill);
-                      }}
-                    >
-                      {disabled ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />}
-                    </Button>
+                      pending={toggleDisabledPending}
+                      onToggle={() => toggleDisable(skill)}
+                    />
                     <Button
                       variant="ghost"
                       size="icon"
@@ -407,9 +295,9 @@ export function SkillsPanel({
       <SkillDialog
         open={dialogOpen}
         onOpenChange={setDialogOpen}
-        level={level}
+        scope={level}
         workspaceId={workspaceId}
-        projectId={projectId}
+        projectId={projectId ?? ""}
         editSkill={editSkill}
       />
       <ConfirmDialog

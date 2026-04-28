@@ -174,6 +174,75 @@ describe("SkillsPanel — project scope", () => {
   });
 });
 
+describe("SkillsPanel — workspace disable cascades to project view", () => {
+  // Bug fix: when a skill is disabled at the workspace level, the project
+  // view must show it as disabled (UI used to only check the project's own
+  // disabled list, so the skill looked enabled even though the daemon had
+  // already filtered it out of `.claude/skills/`).
+
+  it("global skill disabled at workspace shows as 'disabled by workspace' in project view", async () => {
+    const { mock } = makeRouter({
+      "/skills/global": [{ name: "planning", level: "global", content: "# plan" }],
+      "/skills/workspaces/7/skills": [],
+      "/skills/workspaces/7/projects/42/skills": [],
+      "/skills/workspaces/7/disabled": {
+        disabledSkills: [{ name: "planning", level: "global" }],
+      },
+      "/skills/projects/42/disabled": { disabledSkills: [] },
+    });
+    (globalThis as any).fetch = mock;
+
+    renderPanel({ level: "project", workspaceId: "7", projectId: "42" });
+    await waitFor(() => expect(screen.getByText("planning")).toBeInTheDocument());
+
+    // The skill must render with the cascade-aware "disabled by workspace" badge.
+    expect(screen.getByText("disabled by workspace")).toBeInTheDocument();
+  });
+
+  it("workspace-disabled skill cannot be toggled from project view (button disabled)", async () => {
+    const { mock, calls } = makeRouter({
+      "/skills/global": [{ name: "planning", level: "global", content: "# plan" }],
+      "/skills/workspaces/7/skills": [],
+      "/skills/workspaces/7/projects/42/skills": [],
+      "/skills/workspaces/7/disabled": {
+        disabledSkills: [{ name: "planning", level: "global" }],
+      },
+      "/skills/projects/42/disabled": { disabledSkills: [] },
+    });
+    (globalThis as any).fetch = mock;
+
+    renderPanel({ level: "project", workspaceId: "7", projectId: "42" });
+    await waitFor(() => expect(screen.getByText("planning")).toBeInTheDocument());
+
+    const btn = await screen.findByTitle(
+      "Disabled at workspace level — re-enable in workspace settings",
+    );
+    expect(btn).toBeDisabled();
+
+    // Sanity: clicking the (disabled) button must NOT issue any mutation against
+    // the project's disabled list.
+    await userEvent.click(btn);
+    expect(calls.find((c) => c.method === "POST" || c.method === "DELETE")).toBeUndefined();
+  });
+
+  it("workspace-disabled workspace skill also shows as disabled in project view", async () => {
+    const { mock } = makeRouter({
+      "/skills/global": [],
+      "/skills/workspaces/7/skills": [{ name: "review", level: "workspace", content: "# r" }],
+      "/skills/workspaces/7/projects/42/skills": [],
+      "/skills/workspaces/7/disabled": {
+        disabledSkills: [{ name: "review", level: "workspace" }],
+      },
+      "/skills/projects/42/disabled": { disabledSkills: [] },
+    });
+    (globalThis as any).fetch = mock;
+
+    renderPanel({ level: "project", workspaceId: "7", projectId: "42" });
+    await waitFor(() => expect(screen.getByText("review")).toBeInTheDocument());
+    expect(screen.getByText("disabled by workspace")).toBeInTheDocument();
+  });
+});
+
 describe("SkillsPanel — own skill toggle (project scope)", () => {
   it("click EyeOff on own project skill sends POST /skills/projects/:pid/disabled with level=project", async () => {
     const { mock, calls } = makeRouter({

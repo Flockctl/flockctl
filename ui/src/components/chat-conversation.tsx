@@ -408,8 +408,12 @@ export function ChatConversation({
       {/* Message list (wrapped in a relative container so the floating
           "scroll to bottom" / "prompt history" buttons and the right-hand
           history panel can overlay the scroll area without being clipped
-          by the composer layout below). */}
-      <div className="relative flex min-h-0 flex-1 flex-col">
+          by the composer layout below).
+          `overflow-hidden` is critical — the prompt-history panel sits
+          off-screen at `translate-x-full` while closed; without clipping
+          here it overflows the chat area and triggers a horizontal page
+          scroll. */}
+      <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
       <div ref={scrollRef} className="flex-1 overflow-auto p-4 space-y-4">
         {chatLoading &&
           Array.from({ length: 3 }).map((_, i) => (
@@ -795,6 +799,14 @@ export function ChatConversation({
           <AgentQuestionPrompt
             question={agentQuestion.question}
             requestId={agentQuestion.requestId}
+            // Picker-mode fields (M05 slice 02). Both REST hydration
+            // (`fetchAgentQuestions` → `pendingQuestions` in chat-executor)
+            // and live WS frames (`useChatEventStream`'s `agent_question`
+            // branch) populate these — we just forward whichever shape
+            // landed in the cache. Undefined/null collapses to free-form.
+            {...(agentQuestion.options ? { options: agentQuestion.options } : {})}
+            multiSelect={agentQuestion.multiSelect ?? false}
+            {...(agentQuestion.header ? { header: agentQuestion.header } : {})}
             onAnswer={async (answer) => {
               await answerAgentQuestionMutation.mutateAsync({
                 kind: "chat",

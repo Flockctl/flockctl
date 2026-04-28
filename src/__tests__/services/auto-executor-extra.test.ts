@@ -21,7 +21,7 @@ vi.mock("../../services/task-executor/index", () => ({
 
 vi.mock("../../services/ws-manager", () => ({
   wsManager: {
-    broadcastAll: vi.fn(),
+    broadcastAll: vi.fn(), broadcastTaskStatus: vi.fn(), broadcastChatStatus: vi.fn(),
   },
 }));
 

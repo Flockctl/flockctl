@@ -77,12 +77,26 @@ export function useChatEventStream(chatId: string | null) {
       );
     } else if (msg.type === "agent_question") {
       // Shared agent-question cache — see matching comment in useTaskLogStream.
+      // Picker-mode fields (`options` / `multi_select` / `header`) ride in on
+      // the WS payload per `broadcastAgentQuestion` / `…FromRow`. We pass them
+      // through verbatim so `AgentQuestionPrompt` can render the radio /
+      // checkbox picker without a follow-up REST round-trip. Free-form rows
+      // omit `options` entirely (we keep it `null` so downstream code that
+      // tests `Array.isArray(options)` falls through to the textarea fallback
+      // unchanged).
+      const rawOptions = data.options;
       const item: AgentQuestionItem = {
         id: Number(data.db_id ?? 0),
         requestId: String(data.request_id),
         question: String(data.question ?? ""),
         toolUseId: String(data.tool_use_id ?? ""),
         createdAt: data.created_at ? String(data.created_at) : null,
+        options:
+          Array.isArray(rawOptions) && rawOptions.length > 0
+            ? (rawOptions as AgentQuestionItem["options"])
+            : null,
+        multiSelect: Boolean(data.multi_select),
+        header: data.header ? String(data.header) : null,
       };
       queryClient.setQueryData<{ items: AgentQuestionItem[] }>(
         queryKeys.agentQuestion("chat", chatId),

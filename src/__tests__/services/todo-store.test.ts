@@ -38,6 +38,8 @@ function freshDb() {
       thinking_enabled INTEGER DEFAULT 1 NOT NULL,
       effort TEXT,
       pinned INTEGER DEFAULT 0 NOT NULL,
+      status TEXT NOT NULL DEFAULT 'idle',
+      resume_at INTEGER,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );

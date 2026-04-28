@@ -1,3 +1,10 @@
+import type { AwaitUserAnswerHandler } from "./ask-user-question-bridge.js";
+import {
+  ASK_USER_QUESTION_BUILTIN_NAME,
+  FLOCKCTL_HOST_MCP_SERVER_NAME,
+  buildAskUserQuestionMcpServer,
+} from "./ask-user-question-bridge.js";
+
 interface StreamEvent {
   /**
    * Event kinds the SDK stream surfaces to consumers.
@@ -106,6 +113,21 @@ interface ChatOptions {
     toolUseID: string;
     agentID?: string;
   }) => Promise<{ behavior: "allow"; updatedInput?: Record<string, unknown> } | { behavior: "deny"; message: string }>;
+  /**
+   * Hooks the SDK's `AskUserQuestion` tool through Flockctl's structured
+   * questions pipeline. When set, ai/client.ts:
+   *   1. registers an in-process MCP override under `flockctl_host` whose
+   *      handler awaits this callback,
+   *   2. adds `AskUserQuestion` to the SDK's `disallowedTools` so the
+   *      stubbed-in headless-mode built-in cannot resolve with empty
+   *      answers (the bug behind task 432).
+   *
+   * Callback contract mirrors `agent-session/session.ts:awaitUserAnswer`:
+   * resolve with the answer text once the UI / API delivers it; reject on
+   * abort. See `services/ai/ask-user-question-bridge.ts` for the full
+   * design rationale and why this is *not* an MCP escape hatch.
+   */
+  askUserQuestionHandler?: AwaitUserAnswerHandler;
 }
 
 interface ChatResult {
@@ -217,7 +239,24 @@ export function createAIClient(options?: { configDir?: string }): AIClient {
       if (opts.canUseTool) {
         permissionOpts.canUseTool = opts.canUseTool;
       }
-      const hasMcpServers = !!opts.mcpServers && Object.keys(opts.mcpServers).length > 0;
+      // AskUserQuestion bridge — when the caller wires `askUserQuestionHandler`,
+      // we override the SDK's stubbed-headless built-in with an in-process
+      // tool that blocks until the UI / API delivers the answer. See
+      // `ai/ask-user-question-bridge.ts` for the full design rationale and
+      // why this is the same pattern Claude Code itself uses internally.
+      const mergedMcpServers: Record<string, unknown> = { ...(opts.mcpServers ?? {}) };
+      const disallowedTools: string[] = [];
+      if (opts.askUserQuestionHandler) {
+        mergedMcpServers[FLOCKCTL_HOST_MCP_SERVER_NAME] = await buildAskUserQuestionMcpServer(
+          opts.askUserQuestionHandler,
+        );
+        // Suppress the SDK's built-in `AskUserQuestion` so the model sees
+        // only our override (`mcp__flockctl_host__AskUserQuestion`). Without
+        // this, the headless-mode CLI auto-resolves the built-in with empty
+        // answers BEFORE our override is even consulted.
+        disallowedTools.push(ASK_USER_QUESTION_BUILTIN_NAME);
+      }
+      const hasMcpServers = Object.keys(mergedMcpServers).length > 0;
       // Thinking / effort resolution — both default to the pre-toggle
       // behavior (adaptive thinking on, effort `high`) so existing callers
       // and existing DB rows (where the columns are NULL / default) are
@@ -235,7 +274,8 @@ export function createAIClient(options?: { configDir?: string }): AIClient {
         ...(opts.cwd && { cwd: opts.cwd }),
         ...(opts.noTools && { tools: [] }),
         ...(opts.resumeSessionId && { resume: opts.resumeSessionId }),
-        ...(hasMcpServers && { mcpServers: opts.mcpServers }),
+        ...(disallowedTools.length > 0 && { disallowedTools }),
+        ...(hasMcpServers && { mcpServers: mergedMcpServers }),
       };
 
       if (options?.configDir) {

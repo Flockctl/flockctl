@@ -7,6 +7,10 @@ export const TaskStatus = {
   assigned: "assigned",
   running: "running",
   pending_approval: "pending_approval",
+  /** Parked due to a provider rate-limit / usage-limit. Will auto-resume at
+   *  `resume_at` via the daemon's rate-limit scheduler. The UI renders a
+   *  countdown badge in this state. */
+  rate_limited: "rate_limited",
   done: "done",
   failed: "failed",
   timed_out: "timed_out",
@@ -61,6 +65,12 @@ export interface Task {
   parent_task_id: string | null;
   /** Reruns spawned from this task. Only populated by `GET /tasks/:id`. */
   children?: TaskChainChild[];
+  /**
+   * Unix-epoch milliseconds when the rate-limit scheduler will wake this task
+   * back up. Populated only while `status === 'rate_limited'`; null otherwise.
+   * The countdown badge subtracts this from `Date.now()` once per second.
+   */
+  resume_at?: number | null;
 }
 
 export interface TaskFilters {

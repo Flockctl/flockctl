@@ -23,6 +23,7 @@ import {
 } from "./_gitignore-toggles.js";
 import { reconcileClaudeSkillsForProject } from "../services/claude/skills-sync.js";
 import { reconcileMcpForProject } from "../services/claude/mcp-sync.js";
+import { getProjectOrThrow, getWorkspaceOrThrow } from "../lib/db-helpers.js";
 import {
   readAllProjectLayers,
   writeProjectLayer,
@@ -119,8 +120,7 @@ projectRoutes.get("/", (c) => {
 projectRoutes.get("/:id", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const project = db.select().from(projects).where(eq(projects.id, id)).get();
-  if (!project) throw new NotFoundError("Project");
+  const project = getProjectOrThrow(id);
 
   const ms = project.path ? listMilestones(project.path) : [];
   return c.json({ ...project, milestones: ms });
@@ -267,8 +267,7 @@ function parseImportActions(input: unknown): ImportAction[] {
 projectRoutes.patch("/:id", async (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const existing = db.select().from(projects).where(eq(projects.id, id)).get();
-  if (!existing) throw new NotFoundError("Project");
+  const existing = getProjectOrThrow(id);
 
   const body = await c.req.json();
   const permissionMode = parsePermissionModeBody(body);
@@ -320,8 +319,7 @@ projectRoutes.patch("/:id", async (c) => {
 projectRoutes.delete("/:id", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const existing = db.select().from(projects).where(eq(projects.id, id)).get();
-  if (!existing) throw new NotFoundError("Project");
+  const existing = getProjectOrThrow(id);
 
   deleteSecretsForScope("project", id);
   db.delete(projects).where(eq(projects.id, id)).run();
@@ -347,8 +345,7 @@ projectRoutes.delete("/:id", (c) => {
 projectRoutes.get("/:id/tree", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const project = db.select().from(projects).where(eq(projects.id, id)).get();
-  if (!project) throw new NotFoundError("Project");
+  const project = getProjectOrThrow(id);
 
   if (!project.path) return c.json({ project, milestones: [] });
   const tree = getProjectTree(project.path);
@@ -461,8 +458,7 @@ projectRoutes.get("/:id/tree", (c) => {
 projectRoutes.get("/:id/allowed-keys", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const project = db.select().from(projects).where(eq(projects.id, id)).get();
-  if (!project) throw new NotFoundError("Project");
+  const project = getProjectOrThrow(id);
 
   const parse = (raw: string | null | undefined): number[] | null => {
     if (!raw) return null;
@@ -497,8 +493,7 @@ projectRoutes.get("/:id/allowed-keys", (c) => {
 projectRoutes.get("/:id/stats", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const project = db.select().from(projects).where(eq(projects.id, id)).get();
-  if (!project) throw new NotFoundError("Project");
+  const project = getProjectOrThrow(id);
 
   // Task counts by status
   const taskRows = db.select({
@@ -576,8 +571,7 @@ projectRoutes.get("/:id/schedules", (c) => {
   const pid = parseIdParam(c);
   const { page, perPage, offset } = paginationParams(c);
 
-  const project = db.select().from(projects).where(eq(projects.id, pid)).get();
-  if (!project) throw new NotFoundError("Project");
+  const project = getProjectOrThrow(pid);
 
   // Schedules now carry the template reference inline, so we just filter on
   // the schedule column directly. Only project-scoped templates appear here;
@@ -599,8 +593,7 @@ projectRoutes.get("/:id/schedules", (c) => {
 projectRoutes.get("/:id/config", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const project = db.select().from(projects).where(eq(projects.id, id)).get();
-  if (!project) throw new NotFoundError("Project");
+  const project = getProjectOrThrow(id);
 
   if (!project.path) return c.json({});
   const config = loadProjectConfig(project.path);
@@ -611,8 +604,7 @@ projectRoutes.get("/:id/config", (c) => {
 projectRoutes.put("/:id/config", async (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const project = db.select().from(projects).where(eq(projects.id, id)).get();
-  if (!project) throw new NotFoundError("Project");
+  const project = getProjectOrThrow(id);
 
   if (!project.path) throw new ValidationError("Project has no path — cannot save config file");
 
@@ -633,8 +625,7 @@ projectRoutes.put("/:id/config", async (c) => {
 projectRoutes.get("/:id/agents-md", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const project = db.select().from(projects).where(eq(projects.id, id)).get();
-  if (!project) throw new NotFoundError("Project");
+  const project = getProjectOrThrow(id);
 
   if (!project.path) {
     return c.json({
@@ -654,8 +645,7 @@ projectRoutes.get("/:id/agents-md", (c) => {
 projectRoutes.put("/:id/agents-md", async (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const project = db.select().from(projects).where(eq(projects.id, id)).get();
-  if (!project) throw new NotFoundError("Project");
+  const project = getProjectOrThrow(id);
   if (!project.path) throw new ValidationError("Project has no path — cannot save AGENTS.md");
 
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
@@ -685,8 +675,7 @@ projectRoutes.put("/:id/agents-md", async (c) => {
 projectRoutes.get("/:id/agents-md/effective", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const project = db.select().from(projects).where(eq(projects.id, id)).get();
-  if (!project) throw new NotFoundError("Project");
+  const project = getProjectOrThrow(id);
 
   const flockctlHome = getFlockctlHome();
   const projPath = project.path ?? null;
@@ -713,8 +702,7 @@ projectRoutes.get("/:id/agents-md/effective", (c) => {
 projectRoutes.get("/:id/todo", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const project = db.select().from(projects).where(eq(projects.id, id)).get();
-  if (!project) throw new NotFoundError("Project");
+  const project = getProjectOrThrow(id);
 
   if (!project.path) return c.json({ content: "", path: "" });
   return c.json(loadTodoFile(project.path));
@@ -726,8 +714,7 @@ projectRoutes.get("/:id/todo", (c) => {
 projectRoutes.put("/:id/todo", async (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const project = db.select().from(projects).where(eq(projects.id, id)).get();
-  if (!project) throw new NotFoundError("Project");
+  const project = getProjectOrThrow(id);
   if (!project.path) throw new ValidationError("Project has no path — cannot save TODO.md");
 
   const body = await c.req.json();

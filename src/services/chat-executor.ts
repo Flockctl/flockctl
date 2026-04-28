@@ -5,6 +5,7 @@ import { wsManager } from "./ws-manager.js";
 import { getDb } from "../db/index.js";
 import { chats, chatMessages, agentQuestions } from "../db/schema.js";
 import { and, eq, sql } from "drizzle-orm";
+import { rateLimitScheduler } from "./agents/rate-limit-scheduler.js";
 import { formatToolCall, formatToolResult } from "./tool-format.js";
 import { recordTodoWrite } from "./todo-store.js";
 import { emitAttentionChanged } from "./attention.js";
@@ -29,6 +30,18 @@ import {
  */
 class ChatExecutor {
   private sessions = new Map<number, AgentSession>();
+
+  constructor() {
+    // Wire up the rate-limit scheduler so a chat parked in 'rate_limited'
+    // wakes up and continues via `chat-rate-limit.resumeChatAfterRateLimit`.
+    // Lazy-import the resume helper to keep module-load order off the
+    // critical path — the handler only fires after a real timer expires.
+    rateLimitScheduler.registerHandler("chat", async (chatId: number) => {
+      const { resumeChatAfterRateLimit } = await import("./chat-rate-limit.js");
+      await resumeChatAfterRateLimit(chatId);
+    });
+  }
+
   // Chats that have been claimed (user message persisted + stream endpoint
   // entered) but whose AgentSession is still being wired up. Needed because
   // there's a small async window between `POST /chats/:id/messages/stream`
@@ -265,6 +278,11 @@ class ChatExecutor {
   }
 
   cancel(chatId: number): boolean {
+    // Tear down any pending rate-limit wake-up so a chat cancelled during
+    // pause doesn't auto-resume minutes later. Idempotent — no-op when no
+    // timer is armed for this chat.
+    rateLimitScheduler.cancel("chat", chatId);
+
     const s = this.sessions.get(chatId);
     if (!s) return false;
     s.abort();
@@ -276,6 +294,9 @@ class ChatExecutor {
     for (const [, session] of this.sessions) {
       session.abort("shutdown");
     }
+    // Drop in-memory wake-up timers; the persisted `chats.resume_at` survives
+    // and `recoverFromDatabase()` re-arms them on the next boot.
+    rateLimitScheduler.cancelAll();
   }
 
   /**
@@ -378,13 +399,23 @@ class ChatExecutor {
     return true;
   }
 
-  /** Pending agent questions for a chat, oldest-first. */
+  /** Pending agent questions for a chat, oldest-first.
+   *
+   * `options` is JSON-deserialised here (the column stores a string per 0042)
+   * so consumers see `null` for free-form prompts and a typed array for
+   * picker prompts without re-implementing the parse. Malformed JSON in the
+   * row collapses to `null` — same forgiving rule the WS resume path uses
+   * (`broadcastAgentQuestionFromRow` in agent-interaction.ts) so a corrupt
+   * row never blocks page hydration. */
   pendingQuestions(chatId: number): Array<{
     id: number;
     requestId: string;
     question: string;
     toolUseId: string;
     createdAt: string | null;
+    options: Array<{ label: string; description?: string; preview?: string }> | null;
+    multiSelect: boolean;
+    header: string | null;
   }> {
     const db = getDb();
     const rows = db
@@ -397,13 +428,31 @@ class ChatExecutor {
        TS null-safety glue that no test path exercises. */
     return rows
       .sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""))
-      .map((r) => ({
-        id: r.id,
-        requestId: r.requestId,
-        question: r.question,
-        toolUseId: r.toolUseId,
-        createdAt: r.createdAt ?? null,
-      }));
+      .map((r) => {
+        let parsedOptions:
+          | Array<{ label: string; description?: string; preview?: string }>
+          | null = null;
+        if (r.options != null) {
+          try {
+            const parsed = JSON.parse(r.options);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              parsedOptions = parsed;
+            }
+          } catch {
+            parsedOptions = null;
+          }
+        }
+        return {
+          id: r.id,
+          requestId: r.requestId,
+          question: r.question,
+          toolUseId: r.toolUseId,
+          createdAt: r.createdAt ?? null,
+          options: parsedOptions,
+          multiSelect: Boolean(r.multiSelect),
+          header: r.header ?? null,
+        };
+      });
     /* v8 ignore stop */
   }
 

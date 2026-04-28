@@ -84,6 +84,26 @@ describe("tool-format", () => {
     });
   });
 
+  describe("formatToolCall — empty fallback for *_path / pattern", () => {
+    // Hits the third leg of `?? ?? ""` chains in Read/Write/Edit/Glob/Grep:
+    // when neither key is set, the chain falls all the way through to "".
+    it("Read with no file_path or filePath falls back to empty string", () => {
+      expect(formatToolCall("Read", {})).toBe("📄 Read ");
+    });
+    it("Write with no file_path or filePath falls back to empty string", () => {
+      expect(formatToolCall("Write", {})).toBe("✏️ Write ");
+    });
+    it("Edit with no file_path or filePath falls back to empty string", () => {
+      expect(formatToolCall("Edit", {})).toBe("✏️ Edit ");
+    });
+    it("Glob with no pattern or path falls back to empty string", () => {
+      expect(formatToolCall("Glob", {})).toBe("📂 Glob ");
+    });
+    it("Grep with no pattern or query falls back to empty quoted string", () => {
+      expect(formatToolCall("Grep", {})).toBe('🔍 Grep ""');
+    });
+  });
+
   describe("formatToolCall — default", () => {
     it("serializes unknown tools", () => {
       const out = formatToolCall("Custom", { a: 1 });

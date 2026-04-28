@@ -7,6 +7,7 @@ import { parseIdParam } from "../../lib/route-params.js";
 import { chatExecutor } from "../../services/chat-executor.js";
 import { wsManager } from "../../services/ws-manager.js";
 import { emitAttentionChanged } from "../../services/attention.js";
+import { getChatOrThrow } from "../../lib/db-helpers.js";
 
 export function registerChatGlobalPendingPermissions(router: Hono): void {
   // GET /chats/pending-permissions — live map of {chat_id: count} for active
@@ -30,10 +31,8 @@ export function registerChatIdPendingPermissions(router: Hono): void {
   // running chat session. Used by the chat detail UI to re-hydrate the permission
   // card after a page reload (WS events are not replayed on reconnect).
   router.get("/:id/pending-permissions", (c) => {
-    const db = getDb();
     const id = parseIdParam(c);
-    const chat = db.select().from(chats).where(eq(chats.id, id)).get();
-    if (!chat) throw new NotFoundError("Chat");
+    getChatOrThrow(id);
 
     const requests = chatExecutor.pendingPermissions(id).map((r) => ({
       request_id: r.requestId,
@@ -106,8 +105,7 @@ export function registerChatApproval(router: Hono): void {
     const body = await c.req.json().catch(() => ({}));
     const note = typeof body.note === "string" ? body.note : null;
 
-    const chat = db.select().from(chats).where(eq(chats.id, id)).get();
-    if (!chat) throw new NotFoundError("Chat");
+    const chat = getChatOrThrow(id);
     if (chat.approvalStatus !== "pending") {
       throw new ValidationError(
         `Cannot approve chat with approval_status='${chat.approvalStatus ?? "null"}'`,
@@ -142,8 +140,7 @@ export function registerChatApproval(router: Hono): void {
     const body = await c.req.json().catch(() => ({}));
     const note = typeof body.note === "string" ? body.note : null;
 
-    const chat = db.select().from(chats).where(eq(chats.id, id)).get();
-    if (!chat) throw new NotFoundError("Chat");
+    const chat = getChatOrThrow(id);
     if (chat.approvalStatus !== "pending") {
       throw new ValidationError(
         `Cannot reject chat with approval_status='${chat.approvalStatus ?? "null"}'`,

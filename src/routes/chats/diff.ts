@@ -1,14 +1,11 @@
 import type { Hono } from "hono";
-import { eq } from "drizzle-orm";
-import { getDb } from "../../db/index.js";
-import { chats } from "../../db/schema.js";
-import { NotFoundError } from "../../lib/errors.js";
 import { parseIdParam } from "../../lib/route-params.js";
 import {
   parseJournal,
   renderJournalAsUnifiedDiff,
   summarizeJournal,
 } from "../../services/file-edit-journal.js";
+import { getChatOrThrow } from "../../lib/db-helpers.js";
 
 /**
  * `GET /chats/:id/diff` — synthesized unified diff covering every
@@ -24,10 +21,8 @@ import {
  */
 export function registerChatDiff(router: Hono): void {
   router.get("/:id/diff", (c) => {
-    const db = getDb();
     const id = parseIdParam(c);
-    const chat = db.select().from(chats).where(eq(chats.id, id)).get();
-    if (!chat) throw new NotFoundError("Chat");
+    const chat = getChatOrThrow(id);
 
     const maxLines = parseInt(c.req.query("maxLines") ?? "2000") || 2000;
     const journal = parseJournal(chat.fileEdits);

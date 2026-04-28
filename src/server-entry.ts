@@ -5,8 +5,18 @@ import { SchedulerService } from "./services/scheduler.js";
 import { wsManager } from "./services/ws-manager.js";
 import { taskExecutor } from "./services/task-executor/index.js";
 import { chatExecutor } from "./services/chat-executor.js";
+import { rateLimitScheduler } from "./services/agents/rate-limit-scheduler.js";
 import { seedDefaultKey } from "./services/ai/key-selection.js";
 import { reconcilePlanStatuses, resumeStaleMilestones, cancelOrphanedExecutionTasks } from "./services/auto-executor.js";
+import {
+  registerHeartbeats,
+  unregisterAllHeartbeats,
+  type HeartbeatCallback,
+} from "./services/missions/heartbeat.js";
+import {
+  startStalledDetector,
+  stopStalledDetector,
+} from "./services/missions/stalled-detector.js";
 import {
   seedBundledSkills,
   checkRcPermissions,
@@ -126,12 +136,57 @@ reconcilePlanStatuses();
 // 2c. Re-queue stale tasks left running OR queued by previous daemon instance
 const requeued = taskExecutor.resetStaleTasks();
 
+// 2c-rate-limit. Re-arm wake-up timers for tasks/chats parked in
+// `status='rate_limited'` from a prior daemon instance. The scheduler reads
+// `resume_at` off the row and arms a setTimeout per parked entry; a row whose
+// resume_at has already passed fires after the 50ms event-loop floor (see
+// MIN_DELAY_MS in rate-limit-scheduler.ts). MUST run after taskExecutor and
+// chatExecutor are imported (handlers register in their constructors) — the
+// scheduler logs a warning and skips a row whose handler isn't registered yet.
+{
+  const rl = rateLimitScheduler.recoverFromDatabase();
+  if (rl.tasks > 0 || rl.chats > 0) {
+    console.log(
+      `[rate-limit] re-armed ${rl.tasks} task(s) and ${rl.chats} chat(s) parked in rate_limited`,
+    );
+  }
+}
+
 // 2d. Resume auto-execution for milestones that were active before shutdown
 resumeStaleMilestones();
 
 // 3. Start background services
 const scheduler = new SchedulerService();
 scheduler.loadExistingSchedules();
+
+// 3a-mission. Mission-tier liveness wiring. MUST run AFTER `SchedulerService`
+//   has started (the heartbeat + stalled-detector use the same node-cron
+//   tick infrastructure as scheduler.ts) AND AFTER the missions event
+//   subscriber is attached (so the synthetic `taskTerminalEvents` emit from
+//   the stalled-detector lands at a wired listener — without the
+//   subscriber the synthetic event would be a tree-falls-in-the-forest).
+//
+//   The subscriber is wired in a sibling slice (slice 11/03 §"production
+//   wiring"); when that wiring lands, it MUST run before this block. We
+//   guard against a misordered boot by accepting that — without a
+//   supervisor — the heartbeat callback degrades to a logged warning,
+//   and the synthetic `stalled` event broadcasts on `taskTerminalEvents`
+//   regardless (consumers attached later will receive subsequent ticks).
+//
+//   `heartbeatDispatch` is the seam that the supervisor wiring slice will
+//   replace with `(missionId) => supervisorService.evaluate(missionId,
+//   { kind: 'heartbeat' })`. The placeholder logs at debug-cost — a
+//   missing supervisor must NOT crash the daemon.
+const heartbeatDispatch: HeartbeatCallback = (missionId) => {
+  console.log(`[missions/heartbeat] tick for mission ${missionId}`);
+};
+const { registered: registeredHeartbeats } = registerHeartbeats(heartbeatDispatch);
+if (registeredHeartbeats.length > 0) {
+  console.log(
+    `[missions] heartbeat installed for ${registeredHeartbeats.length} active mission(s)`,
+  );
+}
+startStalledDetector();
 
 // 3. Start HTTP server
 startServer(port, host);
@@ -194,6 +249,8 @@ async function shutdown(reason: string = "signal") {
   console.log(`Shutting down Flockctl (${reason})...`);
   try {
     scheduler.stopAll();
+    unregisterAllHeartbeats();
+    stopStalledDetector();
     taskExecutor.cancelAll();
     chatExecutor.cancelAll();
     // Drain chat streams and tear down ssh tunnels in parallel — both are

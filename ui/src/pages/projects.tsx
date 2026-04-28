@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { useProjects, useCreateProject, useDeleteProject, useWorkspaces, useAttention, useAIKeys } from "@/lib/hooks";
 import { scanProjectPath } from "@/lib/api";
 import type { ImportAction, ProjectCreate, ProjectScan } from "@/lib/types";
-import { slugify } from "@/lib/utils";
+import { slugify, timeAgo } from "@/lib/utils";
 import {
   Table,
   TableHeader,
@@ -48,18 +48,6 @@ import { FolderOpen } from "lucide-react";
 // DirectoryPicker, used as the next session's initialPath so re-opening the
 // picker lands back where the user left off instead of $HOME.
 const LAST_PICKED_PATH_KEY = "flockctl.lastPickedPath";
-
-function timeAgo(iso: string): string {
-  const diff = Date.now() - new Date(iso).getTime();
-  const seconds = Math.floor(diff / 1000);
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
-}
 
 type SourceMode = "local" | "git";
 

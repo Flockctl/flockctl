@@ -110,5 +110,9 @@ function attentionKey(item: AttentionItem): string {
       return `task_permission:${item.task_id}:${item.request_id}`;
     case "chat_permission":
       return `chat_permission:${item.chat_id}:${item.request_id}`;
+    case "task_question":
+      return `task_question:${item.task_id}:${item.request_id}`;
+    case "chat_question":
+      return `chat_question:${item.chat_id}:${item.request_id}`;
   }
 }

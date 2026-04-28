@@ -11,5 +11,34 @@
     "tunnel_open_timeout": "Timed out waiting for the SSH tunnel to become ready.",
     "persistence_failed": "Could not save server connection to ~/.flockctlrc.",
     "unknown": "An unknown error occurred. See the daemon logs for details."
+  },
+  "notifications": {
+    "tab_label": "Notifications",
+    "master": "Show desktop notifications",
+    "cat": {
+      "approval": "Approval needed",
+      "question": "Agent asked a question",
+      "done": "Task completed",
+      "failed": "Task failed",
+      "blocked": "Task cancelled or timed out"
+    },
+    "permission": {
+      "granted": "Browser permission: granted",
+      "denied": "Browser permission: denied",
+      "default": "Browser permission: not requested yet"
+    },
+    "banner": {
+      "insecure_context": "Desktop notifications require a secure context (https:// or http://localhost). Reach Flockctl over a secure URL to enable them.",
+      "unsupported": "This browser does not support the Notification API. Use a recent Chrome, Edge, Firefox, or Safari build.",
+      "denied_recovery": "You blocked notifications for this site. Re-enable them from the browser's site-settings panel, then come back to this tab."
+    },
+    "leader": {
+      "status_leader": "This tab fires notifications for this device",
+      "status_follower": "Another tab is firing notifications for this device"
+    },
+    "chatReply": {
+      "label": "Notify on chat reply",
+      "description": "When the agent finishes its turn in a chat and posts a reply, fire a browser notification."
+    }
   }
 }

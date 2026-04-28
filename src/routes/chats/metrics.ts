@@ -1,18 +1,17 @@
 import type { Hono } from "hono";
 import { getDb } from "../../db/index.js";
-import { chats, chatMessages, usageRecords } from "../../db/schema.js";
+import { chatMessages, usageRecords } from "../../db/schema.js";
 import { eq, sql } from "drizzle-orm";
-import { NotFoundError } from "../../lib/errors.js";
 import { parseIdParam } from "../../lib/route-params.js";
 import { getChatMetrics } from "./helpers.js";
+import { getChatOrThrow } from "../../lib/db-helpers.js";
 
 export function registerChatMetrics(router: Hono): void {
   // GET /chats/:id/metrics — full usage metrics for a single chat
   router.get("/:id/metrics", (c) => {
     const db = getDb();
     const id = parseIdParam(c);
-    const chat = db.select().from(chats).where(eq(chats.id, id)).get();
-    if (!chat) throw new NotFoundError("Chat");
+    const chat = getChatOrThrow(id);
 
     const base = getChatMetrics(db, id);
 

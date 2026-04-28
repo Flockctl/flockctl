@@ -22,6 +22,16 @@ import type { ProjectTree } from "@/lib/types";
 
 vi.mock("@/lib/hooks", () => ({
   useProjectTree: vi.fn(),
+  // Slice 11/04 added a `useMissions(projectId)` call inside the panel.
+  // These tests don't exercise mission rendering, so we always return an
+  // empty list — the panel falls back to its pre-mission flat layout.
+  useMissions: vi.fn(() => ({
+    data: { items: [] },
+    isLoading: false,
+    error: null,
+    isSuccess: true,
+    isError: false,
+  })),
 }));
 import { useProjectTree } from "@/lib/hooks";
 

@@ -55,7 +55,20 @@ vi.mock("@/lib/hooks", async () => {
       isError: false,
     }),
     useStartAutoExecute: () => ({ mutate: () => {}, isPending: false }),
+    useRerunFailedMilestone: () => ({ mutate: () => {}, isPending: false }),
     useCreateChat: () => ({ mutateAsync: async () => ({ id: "chat" }), isPending: false }),
+    // Slice 11/04: ProjectTreePanel now also calls `useMissions(projectId)`.
+    // No QueryClient is wired up here, so shadow with an idle stub returning
+    // an empty list. The panel falls back to its pre-mission flat layout —
+    // every assertion in this file (URL params, selection ring, ArrowKey
+    // navigation) keeps holding because no mission grouping is exercised.
+    useMissions: () => ({
+      data: { items: [] },
+      isLoading: false,
+      error: null,
+      isSuccess: true,
+      isError: false,
+    }),
   };
 });
 

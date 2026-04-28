@@ -135,3 +135,68 @@ describe("McpPanel — project scope", () => {
     });
   });
 });
+
+describe("McpPanel — workspace disable cascades to project view", () => {
+  // Bug fix: when an MCP server is disabled at the workspace level, the
+  // project view must show it as disabled. Mirrors the same fix applied to
+  // SkillsPanel.
+
+  it("global server disabled at workspace shows as 'disabled by workspace' in project view", async () => {
+    const { mock } = makeRouter({
+      "/mcp/global": [{ name: "github", level: "global", config: { command: "npx" } }],
+      "/mcp/workspaces/7/servers": [],
+      "/mcp/workspaces/7/projects/42/servers": [],
+      "/mcp/workspaces/7/disabled-mcp": {
+        disabledMcpServers: [{ name: "github", level: "global" }],
+      },
+      "/mcp/projects/42/disabled-mcp": { disabledMcpServers: [] },
+    });
+    (globalThis as any).fetch = mock;
+
+    renderPanel({ level: "project", workspaceId: "7", projectId: "42" });
+    await waitFor(() => expect(screen.getByText("github")).toBeInTheDocument());
+
+    expect(screen.getByText("disabled by workspace")).toBeInTheDocument();
+  });
+
+  it("workspace-disabled server cannot be toggled from project view (button disabled)", async () => {
+    const { mock, calls } = makeRouter({
+      "/mcp/global": [{ name: "github", level: "global", config: { command: "npx" } }],
+      "/mcp/workspaces/7/servers": [],
+      "/mcp/workspaces/7/projects/42/servers": [],
+      "/mcp/workspaces/7/disabled-mcp": {
+        disabledMcpServers: [{ name: "github", level: "global" }],
+      },
+      "/mcp/projects/42/disabled-mcp": { disabledMcpServers: [] },
+    });
+    (globalThis as any).fetch = mock;
+
+    renderPanel({ level: "project", workspaceId: "7", projectId: "42" });
+    await waitFor(() => expect(screen.getByText("github")).toBeInTheDocument());
+
+    const btn = await screen.findByTitle(
+      "Disabled at workspace level — re-enable in workspace settings",
+    );
+    expect(btn).toBeDisabled();
+
+    await userEvent.click(btn);
+    expect(calls.find((c) => c.method === "POST" || c.method === "DELETE")).toBeUndefined();
+  });
+
+  it("workspace-disabled workspace server also shows as disabled in project view", async () => {
+    const { mock } = makeRouter({
+      "/mcp/global": [],
+      "/mcp/workspaces/7/servers": [{ name: "ws-srv", level: "workspace", config: { command: "node" } }],
+      "/mcp/workspaces/7/projects/42/servers": [],
+      "/mcp/workspaces/7/disabled-mcp": {
+        disabledMcpServers: [{ name: "ws-srv", level: "workspace" }],
+      },
+      "/mcp/projects/42/disabled-mcp": { disabledMcpServers: [] },
+    });
+    (globalThis as any).fetch = mock;
+
+    renderPanel({ level: "project", workspaceId: "7", projectId: "42" });
+    await waitFor(() => expect(screen.getByText("ws-srv")).toBeInTheDocument());
+    expect(screen.getByText("disabled by workspace")).toBeInTheDocument();
+  });
+});

@@ -5,7 +5,7 @@ import { and, desc, eq, like } from "drizzle-orm";
 import { NotFoundError, ValidationError } from "../lib/errors.js";
 import { parseIdParam } from "../lib/route-params.js";
 import { buildPlanGenerationPrompt } from "../services/plan-prompt.js";
-import { startAutoExecution, stopAutoExecution, getAutoExecutionStatus } from "../services/auto-executor.js";
+import { startAutoExecution, stopAutoExecution, getAutoExecutionStatus, repointPlanTask } from "../services/auto-executor.js";
 import { resolveAllowedKeyIds, selectKeyForTask } from "../services/ai/key-selection.js";
 import { taskExecutor } from "../services/task-executor/index.js";
 import { computeWaves } from "../services/dependency-graph.js";
@@ -17,14 +17,13 @@ import {
 } from "../services/plan-store/index.js";
 import { readFileSync, existsSync } from "fs";
 import { join } from "path";
+import { getProjectOrThrow } from "../lib/db-helpers.js";
 
 export const planningRoutes = new Hono();
 
 /** Resolve project path from numeric project ID */
 function getProjectPath(pid: number): string {
-  const db = getDb();
-  const project = db.select().from(projects).where(eq(projects.id, pid)).get();
-  if (!project) throw new NotFoundError("Project");
+  const project = getProjectOrThrow(pid);
   if (!project.path) throw new ValidationError("Project has no path configured");
   return project.path;
 }
@@ -409,6 +408,105 @@ planningRoutes.get("/:pid/milestones/:mslug/auto-execute", (c) => {
     started_at: null,
     completed_slices: completedSlices,
     total_slices: slices.length,
+  });
+});
+
+// POST /projects/:pid/milestones/:mslug/rerun-failed —
+// bulk re-run every plan task in this milestone whose latest execution
+// attempt is in a "failed" terminal state. Mirrors the per-task
+// `POST /tasks/:id/rerun` shape (clone the task row, set parentTaskId,
+// `repointPlanTask` to flip the plan task back to "active", and queue
+// the new task) but does it across the whole milestone in one shot so
+// users don't have to click `Re-run` on every red row when a wave
+// fails.
+//
+// Notes:
+//  - Only plan tasks with `status === "failed"` AND a non-null
+//    `executionTaskId` are rerun. A failed plan task without an exec
+//    link is a planning-time failure with nothing to clone, so we skip
+//    it rather than fabricating a task row.
+//  - Query param `resume` (default "true") controls whether we restart
+//    auto-execution for this milestone. Pass `?resume=false` if the
+//    caller only wants to re-queue the failed leaves and leave the
+//    orchestrator alone (e.g. a smoke test).
+//  - Idempotent-ish: calling it twice in a row simply produces a
+//    fresh batch of rerun tasks the second time only if any of the
+//    first batch failed again. If everything from the first batch is
+//    still active/done the second call returns `count: 0`.
+planningRoutes.post("/:pid/milestones/:mslug/rerun-failed", async (c) => {
+  const db = getDb();
+  const pid = parseIdParam(c, "pid");
+  const projectPath = getProjectPath(pid);
+  const mslug = c.req.param("mslug");
+
+  const m = getMilestone(projectPath, mslug);
+  if (!m) throw new NotFoundError("Milestone");
+
+  const resumeQuery = c.req.query("resume");
+  const resume = resumeQuery == null ? true : resumeQuery !== "false";
+
+  // Walk slices → plan tasks → collect failed leaves with a linked exec task.
+  const slices = listSlices(projectPath, mslug);
+  const failedExecIds: number[] = [];
+  for (const s of slices) {
+    const planTasks = listPlanTasks(projectPath, mslug, s.slug);
+    for (const pt of planTasks) {
+      if (pt.status === "failed" && typeof pt.executionTaskId === "number") {
+        failedExecIds.push(pt.executionTaskId);
+      }
+    }
+  }
+
+  if (failedExecIds.length === 0) {
+    return c.json({ rerun: [], count: 0, resumed: false });
+  }
+
+  const created: { originalTaskId: number; newTaskId: number }[] = [];
+  for (const execId of failedExecIds) {
+    const original = db.select().from(tasks).where(eq(tasks.id, execId)).get();
+    /* v8 ignore next — failed plan tasks always carry a live exec row;
+       the missing-row branch is defensive against a manually-deleted
+       task and isn't worth staging in the test bed. */
+    if (!original) continue;
+
+    const newTask = db.insert(tasks).values({
+      projectId: original.projectId,
+      prompt: original.prompt,
+      promptFile: original.promptFile,
+      agent: original.agent,
+      model: original.model,
+      taskType: original.taskType,
+      label: original.label ? `rerun-${original.label}` : `rerun-${execId}`,
+      workingDir: original.workingDir,
+      timeoutSeconds: original.timeoutSeconds,
+      maxRetries: original.maxRetries,
+      parentTaskId: execId,
+      requiresApproval: original.requiresApproval,
+      targetSliceSlug: original.targetSliceSlug,
+      permissionMode: original.permissionMode,
+      envVars: original.envVars,
+    }).returning().get();
+    /* v8 ignore next — `.returning().get()` on a just-inserted row is always defined in better-sqlite3 */
+    if (!newTask) continue;
+
+    repointPlanTask(execId, newTask.id);
+    taskExecutor.execute(newTask.id);
+    created.push({ originalTaskId: execId, newTaskId: newTask.id });
+  }
+
+  let resumed = false;
+  if (resume && created.length > 0) {
+    // Fire-and-forget, same shape as POST /auto-execute. The orchestrator
+    // early-returns if it's already running for this milestone, so this
+    // is safe to call regardless of current state.
+    void startAutoExecution(pid, projectPath, mslug);
+    resumed = true;
+  }
+
+  return c.json({
+    rerun: created,
+    count: created.length,
+    resumed,
   });
 });
 

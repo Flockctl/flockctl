@@ -32,7 +32,7 @@ import { eq } from "drizzle-orm";
 vi.mock("../../../services/ws-manager", () => ({
   wsManager: {
     broadcast: vi.fn(),
-    broadcastAll: vi.fn(),
+    broadcastAll: vi.fn(), broadcastTaskStatus: vi.fn(), broadcastChatStatus: vi.fn(),
     broadcastChat: vi.fn(),
     connections: new Map(),
   },
@@ -331,5 +331,119 @@ describe("listPendingQuestions", () => {
     for (const r of out) {
       expect(r.createdAt).toBeNull();
     }
+  });
+
+  it("surfaces structured options / multiSelect / header so the task page can render the picker", () => {
+    // Regression: before symmetry with chat-executor, the task page rendered
+    // a free-form text input even when the underlying row had options. The
+    // /attention inbox showed the picker correctly because it built its own
+    // payload — listPendingQuestions silently dropped the columns.
+    const taskId = newTask();
+    db.insert(agentQuestions).values({
+      requestId: "opts-1",
+      taskId,
+      toolUseId: "tu",
+      question: "Pick a backend",
+      header: "Stack",
+      multiSelect: false,
+      options: JSON.stringify([
+        { label: "Node + Hono", description: "Current Flockctl pick" },
+        { label: "Bun + Elysia", description: "Max throughput" },
+      ]),
+      status: "pending",
+      createdAt: "2026-02-02T00:00:01Z",
+    }).run();
+    db.insert(agentQuestions).values({
+      requestId: "opts-2",
+      taskId,
+      toolUseId: "tu",
+      question: "Which features?",
+      header: "Roadmap",
+      multiSelect: true,
+      options: JSON.stringify([
+        { label: "Diff viewer" },
+        { label: "Slack notifs" },
+      ]),
+      status: "pending",
+      createdAt: "2026-02-02T00:00:02Z",
+    }).run();
+
+    const out = listPendingQuestions(taskId);
+    expect(out).toHaveLength(2);
+
+    const first = out[0]!;
+    expect(first.requestId).toBe("opts-1");
+    expect(first.header).toBe("Stack");
+    expect(first.multiSelect).toBe(false);
+    expect(first.options).toEqual([
+      { label: "Node + Hono", description: "Current Flockctl pick" },
+      { label: "Bun + Elysia", description: "Max throughput" },
+    ]);
+
+    const second = out[1]!;
+    expect(second.multiSelect).toBe(true);
+    expect(second.options).toHaveLength(2);
+    expect(second.options![0]!.label).toBe("Diff viewer");
+  });
+
+  it("returns null options for free-form rows (no options column)", () => {
+    // Free-form (text-only) questions store NULL in `options` — the bridge
+    // contract says the UI MUST distinguish "no options" (free-form) from
+    // "empty options array" (would-be malformed). Both collapse to null
+    // here so the UI can pivot on a single null check.
+    const taskId = newTask();
+    db.insert(agentQuestions).values({
+      requestId: "free-1",
+      taskId,
+      toolUseId: "tu",
+      question: "What's the risk?",
+      header: "Risk",
+      multiSelect: false,
+      // options omitted → NULL in DB
+      status: "pending",
+      createdAt: "2026-02-02T00:00:01Z",
+    }).run();
+
+    const out = listPendingQuestions(taskId);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.options).toBeNull();
+    expect(out[0]!.header).toBe("Risk");
+    expect(out[0]!.multiSelect).toBe(false);
+  });
+
+  it("collapses malformed options JSON to null instead of throwing", () => {
+    // Mirrors chat-executor's forgiving rule: a corrupt options payload must
+    // never block page hydration. The row is still surfaced, just without
+    // structured options — the UI degrades to free-form input.
+    const taskId = newTask();
+    sqlite.prepare(
+      "INSERT INTO agent_questions (request_id, task_id, tool_use_id, question, status, options) VALUES (?, ?, ?, ?, 'pending', ?)",
+    ).run("bad-json", taskId, "tu", "broken", "{not valid json");
+
+    const out = listPendingQuestions(taskId);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.options).toBeNull();
+    expect(out[0]!.question).toBe("broken");
+  });
+
+  it("collapses an empty options array to null (matches chat path semantics)", () => {
+    // `options: []` and `options: null` are both interpreted as "free-form"
+    // upstream (see agent-tools.ts `parseAskUserQuestionInput` which drops
+    // empty arrays). This mapping mirrors that — the UI never sees an
+    // empty array.
+    const taskId = newTask();
+    db.insert(agentQuestions).values({
+      requestId: "empty-arr",
+      taskId,
+      toolUseId: "tu",
+      question: "Q?",
+      multiSelect: false,
+      options: JSON.stringify([]),
+      status: "pending",
+    }).run();
+
+    const out = listPendingQuestions(taskId);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.options).toBeNull();
   });
 });

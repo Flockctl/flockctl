@@ -34,6 +34,7 @@ import { metricsRoutes } from "./routes/metrics.js";
 import { fsRoutes } from "./routes/fs.js";
 import { attentionRoutes } from "./routes/attention.js";
 import { incidentRoutes } from "./routes/incidents.js";
+import { missionRoutes } from "./routes/missions.js";
 
 const app = new Hono();
 
@@ -159,6 +160,7 @@ app.route("/keys", aiKeyRoutes);
 app.route("/meta", metaRoutes);
 app.route("/fs", fsRoutes);
 app.route("/incidents", incidentRoutes);
+app.route("/missions", missionRoutes);
 app.route("/ws", wsRoutes);
 
 // WebSocket endpoint for live task logs

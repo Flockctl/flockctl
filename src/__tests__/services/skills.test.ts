@@ -174,6 +174,67 @@ describe("resolveSkillsForProject", () => {
     expect(result.find((s) => s.name === "own-disabled")).toBeUndefined();
   });
 
+  it("workspace config disables a workspace skill — cascades to project view", () => {
+    // Requirement: if a skill is disabled at workspace level, it must also be
+    // considered disabled in projects of that workspace.
+    const wsPath = join(tmpBase, "ws-disables-ws-skill");
+    const wsSkillDir = join(wsPath, ".flockctl", "skills", "ws-disabled-skill");
+    mkdirSync(wsSkillDir, { recursive: true });
+    writeFileSync(join(wsSkillDir, "SKILL.md"), "# Workspace skill — should be hidden in projects");
+
+    writeFileSync(
+      join(wsPath, ".flockctl", "config.json"),
+      JSON.stringify({ disabledSkills: [{ name: "ws-disabled-skill", level: "workspace" }] }),
+    );
+    const ws = db.insert(workspaces).values({ name: "ws-dws", path: wsPath }).returning().get();
+
+    const projPath = join(tmpBase, "proj-ws-disables-ws-skill");
+    mkdirSync(projPath, { recursive: true });
+    const proj = db.insert(projects).values({
+      name: "proj-dws",
+      workspaceId: ws!.id,
+      path: projPath,
+    }).returning().get();
+
+    // Project does NOT disable anything itself — the disable lives only on the workspace.
+    const result = resolveSkillsForProject(proj!.id);
+    expect(result.find((s) => s.name === "ws-disabled-skill")).toBeUndefined();
+  });
+
+  it("workspace disable cascades to multiple sibling projects", () => {
+    // Two sibling projects under the same workspace must both lose visibility
+    // of a skill the workspace disabled.
+    const globalDir = join(tmpBase, "global");
+    const gskill = join(globalDir, "shared-disabled");
+    mkdirSync(gskill, { recursive: true });
+    writeFileSync(join(gskill, "SKILL.md"), "# global");
+
+    const wsPath = join(tmpBase, "ws-cascade-siblings");
+    mkdirSync(join(wsPath, ".flockctl"), { recursive: true });
+    writeFileSync(
+      join(wsPath, ".flockctl", "config.json"),
+      JSON.stringify({ disabledSkills: [{ name: "shared-disabled", level: "global" }] }),
+    );
+    const ws = db.insert(workspaces).values({ name: "ws-cs", path: wsPath }).returning().get();
+
+    const projPathA = join(tmpBase, "proj-cs-a");
+    mkdirSync(projPathA, { recursive: true });
+    const projA = db.insert(projects).values({
+      name: "proj-cs-a", workspaceId: ws!.id, path: projPathA,
+    }).returning().get();
+
+    const projPathB = join(tmpBase, "proj-cs-b");
+    mkdirSync(projPathB, { recursive: true });
+    const projB = db.insert(projects).values({
+      name: "proj-cs-b", workspaceId: ws!.id, path: projPathB,
+    }).returning().get();
+
+    const resA = resolveSkillsForProject(projA!.id);
+    const resB = resolveSkillsForProject(projB!.id);
+    expect(resA.find((s) => s.name === "shared-disabled")).toBeUndefined();
+    expect(resB.find((s) => s.name === "shared-disabled")).toBeUndefined();
+  });
+
   it("workspace config can disable a global skill (visible in resolveSkillsForProject)", () => {
     const globalDir = join(tmpBase, "global");
     const gskill = join(globalDir, "ws-disables-global");

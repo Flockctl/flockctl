@@ -7,18 +7,38 @@ import {
   removeRemoteAccessToken,
 } from "./config/index.js";
 import { generateRemoteAccessToken, tokenFingerprint } from "./lib/token.js";
+import { getPackageVersion } from "./lib/package-version.js";
 import { runCheck, formatViolations } from "./services/state-machines/sm-diff-analyzer.js";
 import { registerProjectCommand } from "./cli-commands/project.js";
 import { registerWorkspaceCommand } from "./cli-commands/workspace.js";
 import { registerAgentsCommand } from "./cli-commands/agents.js";
 import { registerRemoteBootstrapCommand } from "./cli-commands/remote-bootstrap.js";
+import { registerVersionCommand } from "./cli-commands/version.js";
+import { registerCompletionCommand } from "./cli-commands/completion.js";
+import { registerTasksCommand } from "./cli-commands/tasks.js";
+import { registerSecretsCommand } from "./cli-commands/secrets.js";
+import { registerAiKeysCommand } from "./cli-commands/ai-keys.js";
+import { registerDoctorCommand } from "./cli-commands/doctor.js";
+import { registerMcpCommand } from "./cli-commands/mcp.js";
+import { registerSchedulesCommand } from "./cli-commands/schedules.js";
+import { registerSkillsCommand } from "./cli-commands/skills.js";
+import { registerTemplatesCommand } from "./cli-commands/templates.js";
+import { registerChatsCommand } from "./cli-commands/chats.js";
+import { registerLogsCommand } from "./cli-commands/logs.js";
+import { registerIncidentsCommand } from "./cli-commands/incidents.js";
+import { registerMetricsCommand, registerUsageCommand } from "./cli-commands/metrics.js";
+import { registerFsCommand } from "./cli-commands/fs.js";
+import { registerConfigCommand } from "./cli-commands/config.js";
+import { registerBackupCommand } from "./cli-commands/backup.js";
+import { registerMigrateCommand } from "./cli-commands/migrate.js";
+import { registerOpenCommand } from "./cli-commands/open.js";
 
 const program = new Command();
 
 program
   .name("flockctl")
   .description("Local AI task orchestration tool")
-  .version("1.0.0");
+  .version(getPackageVersion());
 
 program
   .command("start")
@@ -175,6 +195,26 @@ smCmd
     }
   });
 
+registerVersionCommand(program);
+registerCompletionCommand(program);
+registerTasksCommand(program);
+registerSecretsCommand(program);
+registerAiKeysCommand(program);
+registerDoctorCommand(program);
+registerMcpCommand(program);
+registerSchedulesCommand(program);
+registerSkillsCommand(program);
+registerTemplatesCommand(program);
+registerChatsCommand(program);
+registerLogsCommand(program);
+registerIncidentsCommand(program);
+registerMetricsCommand(program);
+registerUsageCommand(program);
+registerFsCommand(program);
+registerConfigCommand(program);
+registerBackupCommand(program);
+registerMigrateCommand(program);
+registerOpenCommand(program);
 registerProjectCommand(program);
 registerWorkspaceCommand(program);
 registerAgentsCommand(program);

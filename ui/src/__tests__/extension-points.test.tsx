@@ -54,6 +54,17 @@ vi.mock("@/lib/hooks", async () => {
   return {
     ...actual,
     useProjectTree: (...args: unknown[]) => useProjectTreeMock(...args),
+    // Slice 11/04: ProjectTreePanel now also calls `useMissions(projectId)`.
+    // No QueryClientProvider wraps these tests, so shadow the real hook with
+    // an idle stub returning an empty list. The dangling-mission tolerance
+    // assertions still hold because empty-list missions ⇒ orphan rendering.
+    useMissions: () => ({
+      data: { items: [] },
+      isLoading: false,
+      error: null,
+      isSuccess: true,
+      isError: false,
+    }),
   };
 });
 

@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { SliceCard, type SlicePriority } from "./SliceCard";
+import { ProposedCard, type ProposalTargetType } from "./ProposedCard";
 import {
   DEFAULT_SLICE_COLUMNS,
   type ColumnDef,
@@ -95,14 +96,57 @@ function groupSlices(
   return { byColumn, other };
 }
 
+/**
+ * Mission proposal payload as flattened by the caller (typically the
+ * mission proposals query). One entry per outstanding proposal — the
+ * board renders these in the "proposed" column when DEFAULT_MISSION_COLUMNS
+ * is in use. `missionId` is repeated per row so the proposed card can
+ * fire the approve/dismiss POST without the board having to thread a
+ * mission scope down separately.
+ */
+export interface BoardProposal {
+  proposalId: string;
+  missionId: string;
+  rationale: string;
+  targetType: ProposalTargetType;
+  candidateAction: string;
+  candidateSummary?: string | null;
+  candidateTargetId?: string | null;
+}
+
 export interface SliceBoardProps {
   /** Flat slice array — grouped into columns internally. */
   slices: readonly PlanSliceTree[];
   /**
    * Column definitions. Defaults to `DEFAULT_SLICE_COLUMNS` so callers that
-   * just want the 4-column default layout can omit this prop entirely.
+   * just want the 3-column default layout can omit this prop entirely.
+   * Pass `DEFAULT_MISSION_COLUMNS` to get the 5-column mission-scoped
+   * variant (Proposed | Pending | Active | Verifying | Completed).
    */
   columns?: readonly ColumnDef[];
+  /**
+   * Outstanding mission proposals. Rendered as `ProposedCard`s in the
+   * column whose `id === "proposed"`. Empty / undefined ⇒ the proposed
+   * column shows the standard empty-state placeholder.
+   *
+   * Only consulted when a `proposed` column actually exists in `columns`
+   * — passing proposals without a proposed column is a no-op rather than
+   * an error so callers can hand the same array in regardless of which
+   * column layout they chose.
+   */
+  proposals?: readonly BoardProposal[];
+  /**
+   * Fires after a proposal is successfully approved on the server. The
+   * caller typically invalidates its proposals query so the card drops
+   * out of the proposed column on the next render.
+   */
+  onProposalApproved?: (proposalId: string, decisionId: string) => void;
+  /** Symmetric callback for dismissed proposals. */
+  onProposalDismissed?: (
+    proposalId: string,
+    decisionId: string,
+    reason: string | null,
+  ) => void;
   /**
    * Called to resolve the human-readable milestone title shown as the
    * breadcrumb on each `SliceCard`. A function (rather than a map) so the
@@ -122,6 +166,9 @@ export interface SliceBoardProps {
 export function SliceBoard({
   slices,
   columns = DEFAULT_SLICE_COLUMNS,
+  proposals,
+  onProposalApproved,
+  onProposalDismissed,
   milestoneTitleFor,
   priorityFor,
   selectedSliceId = null,
@@ -134,10 +181,14 @@ export function SliceBoard({
   );
 
   const showOther = other.length > 0;
+  const proposalList = proposals ?? [];
 
   return (
     <div
       data-testid="slice-board"
+      data-mission-scoped={
+        columns.some((c) => c.id === "proposed") ? "true" : "false"
+      }
       className={cn(
         "flex h-full w-full gap-3 overflow-x-auto overflow-y-hidden p-1",
         className,
@@ -149,6 +200,9 @@ export function SliceBoard({
           columnId={column.id}
           title={column.title}
           slices={byColumn.get(column.id) ?? []}
+          proposals={column.id === "proposed" ? proposalList : []}
+          onProposalApproved={onProposalApproved}
+          onProposalDismissed={onProposalDismissed}
           milestoneTitleFor={milestoneTitleFor}
           priorityFor={priorityFor}
           selectedSliceId={selectedSliceId}
@@ -161,6 +215,7 @@ export function SliceBoard({
           columnId="other"
           title="Other"
           slices={other}
+          proposals={[]}
           milestoneTitleFor={milestoneTitleFor}
           priorityFor={priorityFor}
           selectedSliceId={selectedSliceId}
@@ -175,6 +230,15 @@ interface SliceBoardColumnProps {
   columnId: string;
   title: string;
   slices: readonly PlanSliceTree[];
+  /** Proposals to render in this column. Non-empty only for the "proposed"
+   * column; every other column passes an empty array. */
+  proposals: readonly BoardProposal[];
+  onProposalApproved?: (proposalId: string, decisionId: string) => void;
+  onProposalDismissed?: (
+    proposalId: string,
+    decisionId: string,
+    reason: string | null,
+  ) => void;
   milestoneTitleFor: (slice: PlanSliceTree) => string;
   priorityFor?: (slice: PlanSliceTree) => SlicePriority | undefined;
   selectedSliceId: string | null;
@@ -185,12 +249,17 @@ function SliceBoardColumn({
   columnId,
   title,
   slices,
+  proposals,
+  onProposalApproved,
+  onProposalDismissed,
   milestoneTitleFor,
   priorityFor,
   selectedSliceId,
   onSelectSlice,
 }: SliceBoardColumnProps) {
-  const count = slices.length;
+  // Total count combines slices + proposals so the badge on the proposed
+  // column reflects the number of cards the operator will see, not zero.
+  const count = slices.length + proposals.length;
   const isEmpty = count === 0;
 
   return (
@@ -225,20 +294,41 @@ function SliceBoardColumn({
             data-testid="slice-board-column-empty"
             className="px-2 py-4 text-center text-xs text-muted-foreground/70"
           >
-            No slices
+            {columnId === "proposed" ? "No proposals" : "No slices"}
           </p>
         ) : (
-          slices.map((slice) => (
-            <SliceCard
-              key={slice.id}
-              slice={slice}
-              milestoneTitle={milestoneTitleFor(slice)}
-              priority={priorityFor?.(slice)}
-              selected={selectedSliceId === slice.id}
-              onSelect={onSelectSlice}
-              className="shrink-0"
-            />
-          ))
+          <>
+            {proposals.map((p) => (
+              <ProposedCard
+                key={p.proposalId}
+                missionId={p.missionId}
+                proposalId={p.proposalId}
+                rationale={p.rationale}
+                targetType={p.targetType}
+                candidateAction={p.candidateAction}
+                candidateSummary={p.candidateSummary ?? null}
+                candidateTargetId={p.candidateTargetId ?? null}
+                onApproved={(decisionId) =>
+                  onProposalApproved?.(p.proposalId, decisionId)
+                }
+                onDismissed={(decisionId, reason) =>
+                  onProposalDismissed?.(p.proposalId, decisionId, reason)
+                }
+                className="shrink-0"
+              />
+            ))}
+            {slices.map((slice) => (
+              <SliceCard
+                key={slice.id}
+                slice={slice}
+                milestoneTitle={milestoneTitleFor(slice)}
+                priority={priorityFor?.(slice)}
+                selected={selectedSliceId === slice.id}
+                onSelect={onSelectSlice}
+                className="shrink-0"
+              />
+            ))}
+          </>
         )}
       </div>
     </div>

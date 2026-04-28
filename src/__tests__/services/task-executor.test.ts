@@ -34,7 +34,7 @@ vi.mock("../../services/agent-session/index", () => {
 vi.mock("../../services/ws-manager", () => ({
   wsManager: {
     broadcast: vi.fn(),
-    broadcastAll: vi.fn(),
+    broadcastAll: vi.fn(), broadcastTaskStatus: vi.fn(), broadcastChatStatus: vi.fn(),
   },
 }));
 
@@ -113,9 +113,9 @@ describe("TaskExecutor", () => {
 
   it("execute() sets status to running first", async () => {
     const statuses: string[] = [];
-    const mockBroadcastAll = wsManager.broadcastAll as any;
-    mockBroadcastAll.mockImplementation((data: any) => {
-      if (data.type === "task_status") statuses.push(data.status);
+    const mockBroadcastTaskStatus = (wsManager as any).broadcastTaskStatus;
+    mockBroadcastTaskStatus.mockImplementation((_taskId: number, status: string) => {
+      statuses.push(status);
     });
 
     const task = db.insert(tasks).values({

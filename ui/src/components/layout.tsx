@@ -26,6 +26,9 @@ import { ServerSwitcher } from "@/components/server-switcher";
 import { SidebarFooter } from "@/components/sidebar-footer";
 import { ConnectionBanner } from "@/components/connection-banner";
 import { useAttention } from "@/lib/hooks";
+import { AttentionNotificationsRunner } from "@/lib/hooks/use-attention-notifications";
+import { NotificationClickRouterRunner } from "@/lib/hooks/use-notification-click-router";
+import { TaskTerminalNotificationsRunner } from "@/lib/hooks/use-task-terminal-notifications";
 import {
   toggleGroupCollapsed,
   useGroupCollapsed,
@@ -248,6 +251,35 @@ export default function Layout() {
 
   return (
     <div className="flex h-screen min-h-0">
+      {/*
+        Attention → notification pump. Mounted at the layout root so the
+        diff baseline is per-tab (not per-route): re-mounting under a
+        route would reset the prevRef and silently drop notifications
+        for rows that arrived during the unmount/remount window. The
+        runner needs to live under <RouterProvider> because its hook
+        calls `useLocation()` for self-poke suppression — and Layout is
+        the closest router-aware ancestor every route shares.
+      */}
+      <AttentionNotificationsRunner />
+      {/*
+        Task-terminal → notification pump. Sibling of the attention
+        runner (and mounted at the same layer for the same per-tab
+        baseline reason). Listens to global WS `task_status` frames and
+        forwards `done`/`failed`/`cancelled`/`timed_out` events into the
+        dispatcher with `source: "task_terminal"` so the dispatcher's
+        auto-close TTL closes the OS notification — there's no inbox row
+        for `resolveByKey` to drain it.
+      */}
+      <TaskTerminalNotificationsRunner />
+      {/*
+        Notification → SPA route bridge. Subscribes to the dispatcher's
+        synthetic `notification-click` bus and navigates to the route
+        chosen by `routeForNotification`. MUST live inside the router
+        tree (i.e. <Layout />, mounted by RouterProvider) because the
+        hook calls `useNavigate()` — sibling-of-RouterProvider placement
+        in main.tsx would crash.
+      */}
+      <NotificationClickRouterRunner />
       {/* Desktop sidebar — static column, hidden below md. */}
       <aside className="hidden w-56 shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground md:flex">
         {renderSidebarBody()}

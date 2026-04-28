@@ -132,6 +132,35 @@ The whole plan lives under `<project>/.flockctl/plans/` as git-friendly markdown
 
 ---
 
+## Missions
+
+A **mission** is a long-running, *supervised* goal that lives on top of a project. Where a slice or plan-task is "one PR's worth of work" or "one prompt", a mission is "keep watching this objective and propose the next move whenever something changes". Missions are how Flockctl handles work that isn't a single hand-off — recurring quality goals, ongoing investigations, or anything where the right next action depends on what just happened.
+
+*Example:* a `keep main green` mission watches every task that runs against the project; when a build fails, the supervisor proposes opening a focused remediation slice. The proposal lands in the approval queue, you approve it, and Flockctl files the slice for you.
+
+**The mission loop, end to end:**
+
+1. You create a mission with an **objective** (one sentence — what success looks like) and a **budget** (tokens + USD ceiling).
+2. Triggers fire: a task ends, a heartbeat ticks, the stalled-detector notices no progress.
+3. The **supervisor** — a read-only Flockctl agent session — wakes up, looks at the trigger, and emits a single JSON reply: either a `propose` with a concrete next action, or a `no_action` with a reason.
+4. Every supervisor round-trip is metered: a budget enforcer refuses to evaluate once you're out of tokens or dollars, and a depth guard caps recursion when the supervisor's own proposals would re-trigger it.
+5. Proposals land in the **approval queue**. Nothing mutates the plan until you approve. Rejecting a proposal is a first-class outcome — it's recorded, and it's safe.
+6. Every step — proposal, approval, rejection, budget reject, parse failure — is appended to a mission event timeline, so the mission has a full audit trail.
+
+**Why supervisors don't act on their own.** The supervisor is structurally a *proposer*. It runs under a narrower contract than a normal task or chat session: it has no plan-mutation tools, its output is JSON-only, destructive verbs (`delete`, `drop`, `remove`, `destroy`, `truncate`, `rm `) are rejected at parse time, and the mission objective + trigger envelope are assembled from trusted DB rows — never from user input the supervisor reads. If something looks like an instruction inside the trigger payload, it's data, not a directive.
+
+**Autonomy in v1.** Mission autonomy has two settings on paper — `proposal` (queue everything for human approval) and `auto` (apply without approval). In v1, only `proposal` is active; `auto` is disabled at the daemon level. Every proposal lands in the queue.
+
+**Where missions show up in the UI:**
+
+- The project tree gains a **Missions** node listing every mission attached to the project.
+- Each mission has a detail page showing objective, budget burn-down, the supervisor log, and pending proposals.
+- The global **Inbox** surfaces pending mission proposals alongside task approvals and permission requests.
+
+For the deeper specification — event schema, guard behaviour, prompt versioning, and the supervisor's exact contract — see [MISSIONS.md](MISSIONS.md). For where the components live in the codebase, see [ARCHITECTURE.md §Missions subsystem](ARCHITECTURE.md#missions-subsystem).
+
+---
+
 ## Execution
 
 ### Task

@@ -19,22 +19,9 @@ import {
   TableCell,
 } from "@/components/ui/table";
 import { CreateScheduleDialog } from "@/pages/schedules";
+import { ScheduleStatusBadge } from "@/components/schedule-status-badge";
 
 // --- Scheduled Tasks Section ---
-
-function ScheduleStatusBadge({ status }: { status: string }) {
-  const variants: Record<string, string> = {
-    [ScheduleStatus.active]:
-      "bg-green-500/15 text-green-700 dark:text-green-400",
-    [ScheduleStatus.paused]:
-      "bg-orange-500/15 text-orange-700 dark:text-orange-400",
-  };
-  const className = variants[status];
-  if (className) {
-    return <Badge className={className}>{status}</Badge>;
-  }
-  return <Badge variant="outline">{status}</Badge>;
-}
 
 function formatScheduleTime(iso: string | null): string {
   if (!iso) return "\u2014";

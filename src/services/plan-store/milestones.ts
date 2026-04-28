@@ -12,6 +12,7 @@ import {
   dedupeSlug,
   toSlug,
 } from "./md-io.js";
+import { parseMissionId } from "./schema.js";
 
 // ─── Milestone frontmatter mapping ───
 
@@ -37,6 +38,10 @@ export function milestoneFromFile(slug: string, fm: Record<string, any>, body: s
     // frontmatter — treat that as opt-out so we don't retroactively block
     // ready transitions on plans authored before the gate existed.
     specRequired: typeof fm.spec_required === "boolean" ? fm.spec_required : false,
+    // Validate on read: malformed values throw so downstream code never sees
+    // them. A missing key is fine — milestones authored before this field
+    // existed must keep parsing.
+    missionId: parseMissionId(fm.mission_id),
     createdAt: fm.created_at,
     updatedAt: fm.updated_at,
   };
@@ -59,6 +64,7 @@ export function milestoneToFrontmatter(data: Partial<MilestoneData>): Record<str
     verification_uat: data.verificationUat,
     definition_of_done: data.definitionOfDone,
     spec_required: data.specRequired,
+    mission_id: data.missionId,
     created_at: data.createdAt,
     updated_at: data.updatedAt,
   };
@@ -137,6 +143,7 @@ export function createMilestone(projectPath: string, data: Partial<MilestoneData
     // (e.g. imports, agent-generated scratch milestones) can pass
     // `specRequired: false` explicitly.
     specRequired: data.specRequired ?? true,
+    missionId: data.missionId,
     createdAt: now,
     updatedAt: now,
   };

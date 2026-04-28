@@ -59,6 +59,12 @@ export class ClaudeCodeProvider implements AgentProvider {
       mcpServers: opts.mcpServers,
       thinkingEnabled: opts.thinkingEnabled,
       effort: opts.effort,
+      // The Claude Agent SDK runs tools inside its own subprocess, so the
+      // `for tc of response.toolCalls` AskUserQuestion fallback in
+      // `agent-session/session.ts` never fires for this provider — the
+      // bridge handler IS the only path. Without this forward, headless
+      // mode silently auto-resolves AskUserQuestion with empty answers.
+      askUserQuestionHandler: opts.askUserQuestionHandler,
     });
   }
 

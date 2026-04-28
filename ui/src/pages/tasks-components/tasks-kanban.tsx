@@ -240,7 +240,7 @@ function KanbanTaskCard({ task, projectLabel, onClick }: KanbanTaskCardProps) {
     >
       <CardContent className="space-y-1.5">
         <div className="flex items-center gap-2">
-          <TaskStatusBadge status={task.status} />
+          <TaskStatusBadge status={task.status} resumeAt={task.resume_at} />
           <span className="ml-auto font-mono text-[10px] text-muted-foreground">
             #{String(task.id).slice(0, 8)}
           </span>

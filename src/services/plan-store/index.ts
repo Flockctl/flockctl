@@ -34,3 +34,5 @@ export {
 } from "./tasks.js";
 
 export { getProjectTree } from "./project-tree.js";
+
+export { MISSION_ID_REGEX, parseMissionId } from "./schema.js";

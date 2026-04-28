@@ -4,6 +4,7 @@ import { tasks, taskLogs } from "../../db/schema.js";
 import { eq } from "drizzle-orm";
 import { NotFoundError } from "../../lib/errors.js";
 import { parseIdParam } from "../../lib/route-params.js";
+import { getTaskOrThrow } from "../../lib/db-helpers.js";
 import {
   parseJournal,
   renderJournalAsUnifiedDiff,
@@ -15,8 +16,7 @@ export function registerTaskLogs(router: Hono): void {
   router.get("/:id/logs", (c) => {
     const db = getDb();
     const id = parseIdParam(c);
-    const task = db.select().from(tasks).where(eq(tasks.id, id)).get();
-    if (!task) throw new NotFoundError("Task");
+    getTaskOrThrow(id);
 
     const rows = db.select().from(taskLogs).where(eq(taskLogs.taskId, id)).orderBy(taskLogs.timestamp).all();
     const logs = rows.map((r) => ({
@@ -43,10 +43,8 @@ export function registerTaskLogs(router: Hono): void {
  */
 export function registerTaskDiff(router: Hono): void {
   router.get("/:id/diff", (c) => {
-    const db = getDb();
     const id = parseIdParam(c);
-    const task = db.select().from(tasks).where(eq(tasks.id, id)).get();
-    if (!task) throw new NotFoundError("Task");
+    const task = getTaskOrThrow(id);
 
     const maxLines = parseInt(c.req.query("maxLines") ?? "2000") || 2000;
     const journal = parseJournal(task.fileEdits);

@@ -63,5 +63,18 @@ export function resetStaleTasks(activeTaskIds: Set<number>): number[] {
     console.log(`Left ${waiting.length} task(s) parked in waiting_for_input — will resume on answer`);
   }
 
+  // Rate-limited tasks are intentionally NOT re-queued here — they're parked
+  // by design and will wake up via `rateLimitScheduler.recoverFromDatabase()`
+  // (called separately from server-entry). Logging the count for ops symmetry
+  // with the waiting_for_input branch above.
+  const rateLimited = db
+    .select({ id: tasks.id })
+    .from(tasks)
+    .where(eq(tasks.status, TaskStatus.RATE_LIMITED))
+    .all();
+  if (rateLimited.length > 0) {
+    console.log(`Left ${rateLimited.length} task(s) parked in rate_limited — will resume at scheduled wake-up`);
+  }
+
   return requeued;
 }

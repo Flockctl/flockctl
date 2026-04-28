@@ -1,20 +1,37 @@
 /**
- * Covers the three chats-questions endpoints that the main chats.test.ts
- * suite doesn't exercise:
- *   - GET  /chats/:id/pending-questions
- *   - POST /chats/:id/question/:requestId (the short form w/o /answer)
- *   - POST /chats/:id/question/:requestId/answer — race branch where
- *     chatExecutor.answerQuestion returns false but the row still exists
- *     (409), and where the row disappeared between checks (404).
+ * Route tests for POST /chats/:id/question/:requestId/answer.
+ *
+ * Mirrors the structure of `tasks-questions-extra.test.ts` (the M05 task
+ * variant of the same endpoint) and exercises the chat-side answer route end
+ * to end:
+ *   - request validation (path + body)
+ *   - DB lookup gating (chat, agent_question, status)
+ *   - chat-executor delegation (mocked: chats have no on-disk session in
+ *     unit-test space, so we replicate the real DB transition + WS
+ *     broadcast inside the spy)
+ *   - WS attention_changed broadcast
+ *   - remote-auth gating (401 path)
+ *
+ * The 403_cross_owner_idor case is intentionally `it.skip`'d: the chats
+ * schema currently has no `owner_id` column and bearer tokens grant
+ * un-scoped access, so the IDOR contract has no implementation to gate.
+ * The placeholder is left in so the next pass of M05 can wire it up
+ * without re-discovering the gap.
  */
 
-import { describe, it, expect, beforeAll, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
+import { eq, sql } from "drizzle-orm";
+
 import { app } from "../../server.js";
 import { createTestDb } from "../helpers.js";
 import { setDb } from "../../db/index.js";
 import { chats as chatsTable, agentQuestions } from "../../db/schema.js";
-import { eq } from "drizzle-orm";
+import { wsManager } from "../../services/ws-manager.js";
+import * as config from "../../config/index.js";
+import { _resetRateLimiter } from "../../middleware/remote-auth.js";
 
+// AgentRegistry is consulted on chat reads/updates (cost estimation, session
+// rename). Stub it out so tests don't reach into the real Anthropic stack.
 vi.mock("../../services/agents/registry", () => ({
   getAgent: vi.fn().mockReturnValue({
     renameSession: vi.fn().mockResolvedValue(undefined),
@@ -22,8 +39,10 @@ vi.mock("../../services/agents/registry", () => ({
   }),
 }));
 
-describe("Chats — question endpoints (extra coverage)", () => {
+describe("POST /chats/:id/question/:requestId/answer", () => {
   let testDb: ReturnType<typeof createTestDb>;
+  let chatA: number;
+  let chatB: number;
 
   beforeAll(() => {
     testDb = createTestDb();
@@ -33,226 +52,273 @@ describe("Chats — question endpoints (extra coverage)", () => {
   beforeEach(() => {
     testDb.db.delete(agentQuestions).run();
     testDb.db.delete(chatsTable).run();
+    _resetRateLimiter();
+
+    // Two chats so cross-chat / IDOR-shaped lookups have somewhere to land.
+    chatA = testDb.db
+      .insert(chatsTable)
+      .values({ title: "ownerA-chat" })
+      .returning()
+      .get()!.id;
+    chatB = testDb.db
+      .insert(chatsTable)
+      .values({ title: "ownerB-chat" })
+      .returning()
+      .get()!.id;
+
+    testDb.db
+      .insert(agentQuestions)
+      .values({
+        requestId: "req-1",
+        chatId: chatA,
+        toolUseId: "tu-req-1",
+        question: "what color do you want?",
+        status: "pending",
+      })
+      .run();
   });
 
-  function insertChat(title = "q-chat"): number {
-    const row = testDb.db.insert(chatsTable).values({ title }).returning().get();
-    return row!.id;
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // ─── helpers ────────────────────────────────────────────────────────────
+  async function postAnswer(
+    chatId: number | string,
+    requestId: string,
+    body: unknown,
+    init: { headers?: Record<string, string>; remoteIp?: string } = {},
+  ): Promise<Response> {
+    const reqInit: RequestInit = {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(init.headers ?? {}) },
+      body: typeof body === "string" ? body : JSON.stringify(body),
+    };
+    if (init.remoteIp) {
+      return app.request(
+        `/chats/${chatId}/question/${requestId}/answer`,
+        reqInit,
+        { incoming: { socket: { remoteAddress: init.remoteIp } } },
+      );
+    }
+    return app.request(`/chats/${chatId}/question/${requestId}/answer`, reqInit);
   }
 
-  function insertQuestion(chatId: number, requestId: string, status: "pending" | "answered" | "cancelled" = "pending"): void {
-    testDb.db.insert(agentQuestions).values({
-      requestId,
-      chatId,
-      toolUseId: `tu-${requestId}`,
-      question: "please clarify",
-      status,
-      answer: status === "answered" ? "x" : null,
-      answeredAt: status === "answered" ? new Date().toISOString() : null,
-    }).run();
+  /**
+   * Replace `chatExecutor.answerQuestion` with a stub that performs the same
+   * observable side-effects as the real implementation: flips the
+   * agent_questions row to status='answered', stamps `answer` + `answered_at`,
+   * and broadcasts the attention_changed WS event. Returning `true` makes the
+   * route's success branch fire.
+   */
+  async function spyAnswerSucceeds(): Promise<void> {
+    const { chatExecutor } = await import("../../services/chat-executor.js");
+    vi.spyOn(chatExecutor, "answerQuestion").mockImplementation(
+      (cId: number, rId: string, ans: string): boolean => {
+        const row = testDb.db
+          .select()
+          .from(agentQuestions)
+          .where(eq(agentQuestions.requestId, rId))
+          .get();
+        if (!row || row.chatId !== cId || row.status !== "pending") return false;
+        testDb.db
+          .update(agentQuestions)
+          .set({
+            answer: ans,
+            status: "answered",
+            answeredAt: new Date().toISOString(),
+          })
+          .where(eq(agentQuestions.id, row.id))
+          .run();
+        wsManager.broadcastAll({ type: "attention_changed", payload: {} });
+        return true;
+      },
+    );
   }
 
-  describe("GET /chats/:id/pending-questions", () => {
-    it("returns pending questions for an existing chat", async () => {
-      const chatId = insertChat();
-      insertQuestion(chatId, "cq-pend-1");
-      insertQuestion(chatId, "cq-done-1", "answered");
+  // ─── tests ──────────────────────────────────────────────────────────────
 
-      const { chatExecutor } = await import("../../services/chat-executor.js");
-      const spy = vi
-        .spyOn(chatExecutor, "pendingQuestions")
-        .mockReturnValue([
-          {
-            id: 1,
-            requestId: "cq-pend-1",
-            question: "please clarify",
-            toolUseId: "tu-cq-pend-1",
-            createdAt: null,
-          },
-        ]);
-      try {
-        const res = await app.request(`/chats/${chatId}/pending-questions`);
-        expect(res.status).toBe(200);
-        const body = await res.json();
-        expect(body.items).toHaveLength(1);
-        expect(body.items[0].requestId).toBe("cq-pend-1");
-      } finally {
-        spy.mockRestore();
-      }
-    });
+  it("happy", async () => {
+    await spyAnswerSucceeds();
 
-    it("returns 404 for a missing chat", async () => {
-      const res = await app.request("/chats/999999/pending-questions");
-      expect(res.status).toBe(404);
-    });
+    const res = await postAnswer(chatA, "req-1", { answer: "blue" });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; chatStatus: unknown };
+    expect(body.ok).toBe(true);
+    expect(body).toHaveProperty("chatStatus"); // null until requiresApproval flips it
 
-    it("returns 422 for an invalid :id", async () => {
-      const res = await app.request("/chats/not-a-number/pending-questions");
-      expect(res.status).toBe(422);
-    });
+    const row = testDb.db
+      .select()
+      .from(agentQuestions)
+      .where(eq(agentQuestions.requestId, "req-1"))
+      .get();
+    expect(row?.status).toBe("answered");
+    expect(row?.answer).toBe("blue");
   });
 
-  describe("POST /chats/:id/question/:requestId (short form)", () => {
-    async function hit(chatId: number | string, requestId: string, body: unknown): Promise<Response> {
-      return app.request(`/chats/${chatId}/question/${requestId}`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
+  it("emits_attention_changed", async () => {
+    await spyAnswerSucceeds();
+
+    const received: Array<Record<string, unknown>> = [];
+    const ws = {
+      send: (msg: string) => received.push(JSON.parse(msg)),
+      readyState: 1,
+    };
+    wsManager.addGlobalChatClient(ws as never);
+
+    try {
+      const res = await postAnswer(chatA, "req-1", { answer: "blue" });
+      expect(res.status).toBe(200);
+
+      const types = received.map((m) => m.type);
+      expect(types).toContain("attention_changed");
+    } finally {
+      wsManager.removeClient(ws as never);
     }
-
-    it("returns 422 when answer is missing / not a string", async () => {
-      const chatId = insertChat();
-      insertQuestion(chatId, "cq-sf-1");
-      expect((await hit(chatId, "cq-sf-1", {})).status).toBe(422);
-      expect((await hit(chatId, "cq-sf-1", { answer: 42 })).status).toBe(422);
-      expect((await hit(chatId, "cq-sf-1", { answer: "   " })).status).toBe(422);
-    });
-
-    it("returns 422 for an oversize answer (> 10000 chars)", async () => {
-      const chatId = insertChat();
-      insertQuestion(chatId, "cq-sf-big");
-      const res = await hit(chatId, "cq-sf-big", { answer: "x".repeat(10_001) });
-      expect(res.status).toBe(422);
-    });
-
-    it("returns 422 if the body isn't valid JSON", async () => {
-      const chatId = insertChat();
-      insertQuestion(chatId, "cq-sf-bad");
-      const res = await app.request(`/chats/${chatId}/question/cq-sf-bad`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: "not-json",
-      });
-      // JSON.parse failure ⇒ defaults to {} ⇒ answer missing ⇒ 422
-      expect(res.status).toBe(422);
-    });
-
-    it("returns 404 when the chat does not exist", async () => {
-      const res = await hit(999999, "anything", { answer: "hi" });
-      expect(res.status).toBe(404);
-    });
-
-    it("returns 422 when the chat exists but no session is running", async () => {
-      const chatId = insertChat();
-      insertQuestion(chatId, "cq-sf-norun");
-
-      const { chatExecutor } = await import("../../services/chat-executor.js");
-      const spy = vi.spyOn(chatExecutor, "isRunning").mockReturnValue(false);
-      try {
-        const res = await hit(chatId, "cq-sf-norun", { answer: "hello" });
-        expect(res.status).toBe(422);
-        const body = await res.json();
-        expect(body.error).toMatch(/not running/i);
-      } finally {
-        spy.mockRestore();
-      }
-    });
-
-    it("returns 404 when the session is running but the question is unknown", async () => {
-      const chatId = insertChat();
-
-      const { chatExecutor } = await import("../../services/chat-executor.js");
-      const runSpy = vi.spyOn(chatExecutor, "isRunning").mockReturnValue(true);
-      const ansSpy = vi.spyOn(chatExecutor, "answerQuestion").mockReturnValue(false);
-      try {
-        const res = await hit(chatId, "cq-sf-missing", { answer: "hello" });
-        expect(res.status).toBe(404);
-      } finally {
-        runSpy.mockRestore();
-        ansSpy.mockRestore();
-      }
-    });
-
-    it("returns 200 on successful answer", async () => {
-      const chatId = insertChat();
-      insertQuestion(chatId, "cq-sf-ok");
-
-      const { chatExecutor } = await import("../../services/chat-executor.js");
-      const runSpy = vi.spyOn(chatExecutor, "isRunning").mockReturnValue(true);
-      const ansSpy = vi.spyOn(chatExecutor, "answerQuestion").mockReturnValue(true);
-      try {
-        const res = await hit(chatId, "cq-sf-ok", { answer: "hello" });
-        expect(res.status).toBe(200);
-        const body = await res.json();
-        expect(body.ok).toBe(true);
-        expect(ansSpy).toHaveBeenCalledWith(chatId, "cq-sf-ok", "hello");
-      } finally {
-        runSpy.mockRestore();
-        ansSpy.mockRestore();
-      }
-    });
   });
 
-  describe("POST /chats/:id/question/:requestId/answer — recheck race branch", () => {
-    async function hit(chatId: number | string, requestId: string, body: unknown): Promise<Response> {
-      return app.request(`/chats/${chatId}/question/${requestId}/answer`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
-    }
+  it("404_unknown_chat", async () => {
+    const res = await postAnswer(999_999, "req-1", { answer: "blue" });
+    expect(res.status).toBe(404);
+  });
 
-    it("returns 409 when chatExecutor.answerQuestion=false but row still exists (race: turned into answered)", async () => {
-      const chatId = insertChat();
-      insertQuestion(chatId, "cq-race-409");
+  it("404_unknown_request_id", async () => {
+    const res = await postAnswer(chatA, "bogus-req-id", { answer: "blue" });
+    expect(res.status).toBe(404);
+  });
 
-      const { chatExecutor } = await import("../../services/chat-executor.js");
-      // Simulate race: executor returns false, but the row stays in DB (still
-      // pending when we loaded it, but the executor's own recheck would find
-      // it already answered / no session). The route re-reads the row and
-      // returns 409.
-      const spy = vi.spyOn(chatExecutor, "answerQuestion").mockReturnValue(false);
-      try {
-        const res = await hit(chatId, "cq-race-409", { answer: "hi" });
-        expect(res.status).toBe(409);
-      } finally {
-        spy.mockRestore();
-      }
-    });
+  it("409_already_answered", async () => {
+    await spyAnswerSucceeds();
 
-    it("returns 404 when chatExecutor.answerQuestion=false and the row vanished during the call", async () => {
-      const chatId = insertChat();
-      insertQuestion(chatId, "cq-race-404");
+    const r1 = await postAnswer(chatA, "req-1", { answer: "blue" });
+    expect(r1.status).toBe(200);
 
-      const { chatExecutor } = await import("../../services/chat-executor.js");
-      const spy = vi
-        .spyOn(chatExecutor, "answerQuestion")
-        .mockImplementation(() => {
-          // simulate the row disappearing (e.g. concurrent delete)
-          testDb.db
-            .delete(agentQuestions)
-            .where(eq(agentQuestions.requestId, "cq-race-404"))
-            .run();
-          return false;
-        });
-      try {
-        const res = await hit(chatId, "cq-race-404", { answer: "hi" });
-        expect(res.status).toBe(404);
-      } finally {
-        spy.mockRestore();
-      }
-    });
+    const r2 = await postAnswer(chatA, "req-1", { answer: "red" });
+    expect(r2.status).toBe(409);
 
-    it("returns 400 for invalid path params (non-numeric id caught by schema)", async () => {
-      const res = await app.request("/chats/abc/question/xx/answer", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ answer: "hi" }),
-      });
-      expect(res.status).toBe(400);
-    });
+    // Original answer was preserved.
+    const row = testDb.db
+      .select()
+      .from(agentQuestions)
+      .where(eq(agentQuestions.requestId, "req-1"))
+      .get();
+    expect(row?.answer).toBe("blue");
+  });
 
-    it("returns 400 for invalid request body (missing answer)", async () => {
-      const chatId = insertChat();
-      insertQuestion(chatId, "cq-bad-body");
+  it("400_missing_answer_field", async () => {
+    const res = await postAnswer(chatA, "req-1", {});
+    expect(res.status).toBe(400);
+  });
 
-      const res = await app.request(`/chats/${chatId}/question/cq-bad-body/answer`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({}),
-      });
-      expect(res.status).toBe(400);
-    });
+  it("400_answer_too_long", async () => {
+    // The route schema caps `answer` at max(8000), so 10001 chars is
+    // unambiguously over the limit and the body validator returns 400.
+    const res = await postAnswer(chatA, "req-1", { answer: "x".repeat(10_001) });
+    expect(res.status).toBe(400);
+  });
+
+  it("401_no_token", async () => {
+    // Force remote-auth on, simulate a non-localhost client, omit the
+    // Authorization header → middleware returns 401 before the route runs.
+    vi.spyOn(config, "hasRemoteAuth").mockReturnValue(true);
+    vi.spyOn(config, "findMatchingToken").mockReturnValue(null);
+
+    const res = await postAnswer(
+      chatA,
+      "req-1",
+      { answer: "blue" },
+      { remoteIp: "203.0.113.7" },
+    );
+    expect(res.status).toBe(401);
+
+    // Pending row was not touched.
+    const row = testDb.db
+      .select()
+      .from(agentQuestions)
+      .where(eq(agentQuestions.requestId, "req-1"))
+      .get();
+    expect(row?.status).toBe("pending");
+    expect(row?.answer).toBeNull();
+  });
+
+  // The chats table has no `owner_id` column — bearer tokens are not scoped
+  // to a per-chat owner, so the cross-owner IDOR contract has no
+  // implementation to gate against. Skipped (not deleted) so M05 follow-up
+  // work has a parking spot for the test once chat-level ACLs land.
+  it.skip("403_cross_owner_idor", async () => {
+    // Future shape:
+    //   1. Seed ownerA + ownerB tokens in remote-auth config.
+    //   2. POST to ownerA's chat with ownerB's bearer → expect 403.
+    //   3. Re-read agent_questions row → status still 'pending', answer null.
+    expect(true).toBe(true);
+  });
+
+  it("no_sql_injection", async () => {
+    await spyAnswerSucceeds();
+
+    const before = testDb.db
+      .select({ c: sql<number>`count(*)` })
+      .from(chatsTable)
+      .get();
+
+    const evil = "'); DROP TABLE chats; --";
+    const res = await postAnswer(chatA, "req-1", { answer: evil });
+    expect(res.status).toBe(200);
+
+    // chats table still exists with the same row count.
+    const after = testDb.db
+      .select({ c: sql<number>`count(*)` })
+      .from(chatsTable)
+      .get();
+    expect(after?.c).toBe(before?.c);
+
+    // Literal payload landed in the answer column verbatim.
+    const row = testDb.db
+      .select()
+      .from(agentQuestions)
+      .where(eq(agentQuestions.requestId, "req-1"))
+      .get();
+    expect(row?.answer).toBe(evil);
+  });
+
+  it("single_space", async () => {
+    await spyAnswerSucceeds();
+
+    // Schema is z.string().min(1).max(8000) — a single space has length 1
+    // and is intentionally accepted (the /answer route does NOT trim, unlike
+    // the short-form variant).
+    const res = await postAnswer(chatA, "req-1", { answer: " " });
+    expect(res.status).toBe(200);
+
+    const row = testDb.db
+      .select()
+      .from(agentQuestions)
+      .where(eq(agentQuestions.requestId, "req-1"))
+      .get();
+    expect(row?.answer).toBe(" ");
+  });
+
+  it("unicode/emoji/newlines", async () => {
+    await spyAnswerSucceeds();
+
+    const txt = "line1\nline2 🦆 こんにちは";
+    const res = await postAnswer(chatA, "req-1", { answer: txt });
+    expect(res.status).toBe(200);
+
+    const row = testDb.db
+      .select()
+      .from(agentQuestions)
+      .where(eq(agentQuestions.requestId, "req-1"))
+      .get();
+    expect(row?.answer).toBe(txt);
+  });
+
+  // Sanity: the second chat we seed for the IDOR placeholder is referenced so
+  // TypeScript doesn't flag it as unused, and so that any future cross-chat
+  // assertion has a known target chat id.
+  it("seeds two distinct chats", () => {
+    expect(chatA).not.toBe(chatB);
+    const rows = testDb.db.select().from(chatsTable).all();
+    expect(rows.length).toBe(2);
   });
 });

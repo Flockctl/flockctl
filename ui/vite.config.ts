@@ -17,7 +17,7 @@ function bypassForHtml(req: IncomingMessage) {
 const apiRoutes = [
   "/tasks", "/projects", "/chats", "/templates", "/schedules",
   "/workspaces", "/keys", "/skills", "/mcp", "/health", "/usage", "/meta",
-  "/metrics", "/secrets", "/attention", "/fs", "/incidents",
+  "/metrics", "/secrets", "/attention", "/fs", "/incidents", "/missions",
 ]
 
 const proxy: Record<string, object> = {}

@@ -295,6 +295,27 @@
       "when": 1753900000000,
       "tag": "0041_add_chat_todos_parent_tool_use_id",
       "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "5",
+      "when": 1754000000000,
+      "tag": "0042_add_agent_questions_options",
+      "breakpoints": true
+    },
+    {
+      "idx": 43,
+      "version": "5",
+      "when": 1754100000000,
+      "tag": "0043_add_missions",
+      "breakpoints": true
+    },
+    {
+      "idx": 44,
+      "version": "5",
+      "when": 1754200000000,
+      "tag": "0044_add_rate_limit_pause",
+      "breakpoints": true
     }
   ]
 }

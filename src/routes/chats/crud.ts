@@ -25,6 +25,7 @@ import {
   parseThinkingEnabledBody,
 } from "./helpers.js";
 import { resolveAllowedKeyIds } from "../../services/ai/key-selection.js";
+import { getChatOrThrow } from "../../lib/db-helpers.js";
 
 export function registerChatCrud(router: Hono): void {
   // POST /chats — create, or return the existing entity-scoped chat.
@@ -176,8 +177,7 @@ export function registerChatGetById(router: Hono): void {
   router.get("/:id", (c) => {
     const db = getDb();
     const id = parseIdParam(c);
-    const chat = db.select().from(chats).where(eq(chats.id, id)).get();
-    if (!chat) throw new NotFoundError("Chat");
+    const chat = getChatOrThrow(id);
 
     const messages = db.select().from(chatMessages).where(eq(chatMessages.chatId, id)).orderBy(chatMessages.createdAt).all();
     // Only user messages ever carry attachments (assistant rows never link),
@@ -202,8 +202,7 @@ export function registerChatDelete(router: Hono): void {
   router.delete("/:id", (c) => {
     const db = getDb();
     const id = parseIdParam(c);
-    const chat = db.select().from(chats).where(eq(chats.id, id)).get();
-    if (!chat) throw new NotFoundError("Chat");
+    const chat = getChatOrThrow(id);
 
     const attachments = listAttachmentsForChat(id);
     db.delete(chats).where(eq(chats.id, id)).run();
@@ -219,8 +218,7 @@ export function registerChatPatch(router: Hono): void {
   router.patch("/:id", async (c) => {
     const db = getDb();
     const id = parseIdParam(c);
-    const chat = db.select().from(chats).where(eq(chats.id, id)).get();
-    if (!chat) throw new NotFoundError("Chat");
+    const chat = getChatOrThrow(id);
 
     const body = await c.req.json();
     const updates: Partial<{

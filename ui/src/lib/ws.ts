@@ -36,6 +36,34 @@ export const MessageType = {
   // cards auto-resolved by the swap disappear via the `permission_resolved`
   // frames emitted one-per-request by the backend.
   CHAT_PERMISSION_MODE_CHANGED: "chat_permission_mode_changed",
+  // Chat-only: emitted from the SSE stream_end branch in
+  // `src/routes/chats/messages.ts` (M16/00 slice) immediately AFTER the
+  // assistant chat_messages row has been committed by the
+  // `flushPending('stream_end')` helper, and ONLY on a clean turn-end
+  // (never on abort/error/cancel). Frame shape is
+  // `{ type: "chat_assistant_final", chat_id, message_id, ts }` — no body,
+  // no preview, no title. Consumers (the global chat-list subscriber +
+  // notification dispatcher) treat this as a "the agent's wrap-up
+  // message exists in the DB right now" signal and look up whatever
+  // they need by id; the frame intentionally carries nothing
+  // attacker-controlled.
+  //
+  // Broadcast on the GLOBAL chat-list socket only (not per-chat scoped
+  // clients — they already react to `session_ended` and refetch). See
+  // `wsManager.broadcastChatAssistantFinal` for the matching server-side
+  // helper.
+  CHAT_ASSISTANT_FINAL: "chat_assistant_final",
+  /**
+   * Chat lifecycle frame. Currently emitted by the rate-limit pause path
+   * (`services/chat-rate-limit.ts`) when a chat transitions:
+   *   running → rate_limited (carries `resume_at` ms epoch + `error_message`)
+   *   rate_limited → running (the scheduler-driven resume kick-off)
+   *   running → idle (resume completed; or resume failed with non-limit error)
+   * Frame shape: `{ type: 'chat_status', chatId, status, resume_at?, error_message? }`.
+   * Subscribers should treat the `resume_at` as authoritative — the
+   * countdown card reads it directly from the latest frame.
+   */
+  CHAT_STATUS: "chat_status",
 } as const;
 export type MessageType = (typeof MessageType)[keyof typeof MessageType];
 

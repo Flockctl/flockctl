@@ -51,6 +51,7 @@ sortable by feature surface rather than by spec filename.
 | `ui/e2e/chats.spec.ts` | chat list, composer, streaming | |
 | `ui/e2e/chats-allow-list.spec.ts` | AI key allow-list filtering | |
 | `ui/e2e/chats-incident.spec.ts` | save-as-incident flow | |
+| `ui/e2e/chat-question-picker.spec.ts` | `AskUserQuestion` picker — single-/multi-select, free-form fallback, Other-override, long-label wrap, descriptions, 20-option mount budget, keyboard nav. Visual baselines `agent-question-prompt-radio-three-options`, `agent-question-prompt-checkbox-three-options`, `agent-question-prompt-textarea-fallback`, `agent-question-prompt-long-label-wrap` (M05 slice 06). | Seeds rows directly into `agent_questions` (M05 pattern from `attention.spec.ts`); the answer POST is stubbed via `page.route` because `chatExecutor.answerQuestion` requires a live in-memory `AgentSession`. |
 
 ### Settings & shell
 
@@ -67,6 +68,7 @@ sortable by feature surface rather than by spec filename.
 | `ui/e2e/analytics.spec.ts` | analytics page | |
 | `ui/e2e/navigation.spec.ts` | top-level navigation / accordion sidebar | |
 | `ui/e2e/attention.spec.ts` | global attention inbox | |
+| `ui/e2e/inbox-questions.spec.ts` | `task_question` / `chat_question` rows in the global inbox — picker round-trips, real-time `attention_changed` removal, two-row independence, empty-state regression, 50-row layout smoke check, 409 stale-question handling, and pixel baselines (`inbox-row-task-question-picker.png`, `inbox-row-chat-question-picker.png`, `inbox-row-task-approval.png`, `inbox-row-chat-approval.png`, `inbox-50-row-layout.png`). DB-direct seed via `e2e/helpers/seed-questions.ts` (mock-AI env can't drive a real `AskUserQuestion` tool call); chat-side answer is intercepted via `page.route` because chats have no cold-path resolver. | |
 | `ui/e2e/incident-detail.spec.ts` | `/incidents/:id` detail page | |
 
 ## Staging

@@ -49,6 +49,15 @@ export default defineConfig({
       cwd: here,
       env: {
         VITE_API_TARGET: `http://localhost:${backendPort}`,
+        // The SPA's `apiFetch` calls `fetch("http://127.0.0.1:52077${path}")`
+        // by default (see `ui/src/lib/api/core.ts` — `LOCAL_API_URL` reads
+        // `VITE_API_URL` and falls back to 52077). Without this override
+        // the browser-side fetches bypass the Vite proxy entirely and hit
+        // whichever daemon happens to be listening on 52077 (typically the
+        // contributor's main `flockctl` instance), which makes every e2e
+        // spec that asserts on seeded data flake. Pinning the SPA-side
+        // base URL to the e2e backend keeps the SPA inside its sandbox.
+        VITE_API_URL: `http://127.0.0.1:${backendPort}`,
       },
       port: frontendPort,
       reuseExistingServer: !process.env.CI,

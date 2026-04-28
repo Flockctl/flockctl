@@ -43,6 +43,7 @@ import {
   initTodoFile,
   TODO_FILE_MAX_BYTES,
 } from "../services/todo-file.js";
+import { getWorkspaceOrThrow } from "../lib/db-helpers.js";
 
 export const workspaceRoutes = new Hono();
 
@@ -62,8 +63,7 @@ workspaceRoutes.get("/", (c) => {
 workspaceRoutes.get("/:id", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
-  if (!ws) throw new NotFoundError("Workspace");
+  const ws = getWorkspaceOrThrow(id);
 
   const wsProjects = db.select().from(projects).where(eq(projects.workspaceId, id)).all();
   return c.json({ ...ws, projects: wsProjects });
@@ -182,8 +182,7 @@ workspaceRoutes.post("/", async (c) => {
 workspaceRoutes.patch("/:id", async (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const existing = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
-  if (!existing) throw new NotFoundError("Workspace");
+  const existing = getWorkspaceOrThrow(id);
 
   const body = await c.req.json();
   const permissionMode = parsePermissionModeBody(body);
@@ -243,8 +242,7 @@ workspaceRoutes.patch("/:id", async (c) => {
 workspaceRoutes.delete("/:id", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const existing = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
-  if (!existing) throw new NotFoundError("Workspace");
+  const existing = getWorkspaceOrThrow(id);
 
   deleteSecretsForScope("workspace", id);
   // Projects' workspaceId is SET NULL on cascade by the DB schema
@@ -259,8 +257,7 @@ workspaceRoutes.delete("/:id", (c) => {
 workspaceRoutes.post("/:id/projects", async (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
-  if (!ws) throw new NotFoundError("Workspace");
+  const ws = getWorkspaceOrThrow(id);
 
   // Mode 1: link existing project
   const projectIdParam = c.req.query("project_id");
@@ -333,8 +330,7 @@ workspaceRoutes.post("/:id/projects", async (c) => {
 workspaceRoutes.get("/:id/config", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
-  if (!ws) throw new NotFoundError("Workspace");
+  const ws = getWorkspaceOrThrow(id);
 
   if (!ws.path) return c.json({});
   const config = loadWorkspaceConfig(ws.path);
@@ -345,8 +341,7 @@ workspaceRoutes.get("/:id/config", (c) => {
 workspaceRoutes.put("/:id/config", async (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
-  if (!ws) throw new NotFoundError("Workspace");
+  const ws = getWorkspaceOrThrow(id);
 
   if (!ws.path) throw new ValidationError("Workspace has no path — cannot save config file");
 
@@ -392,8 +387,7 @@ workspaceRoutes.put("/:id/config", async (c) => {
 workspaceRoutes.get("/:id/agents-md", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
-  if (!ws) throw new NotFoundError("Workspace");
+  const ws = getWorkspaceOrThrow(id);
 
   if (!ws.path) {
     return c.json({
@@ -411,8 +405,7 @@ workspaceRoutes.get("/:id/agents-md", (c) => {
 workspaceRoutes.put("/:id/agents-md", async (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
-  if (!ws) throw new NotFoundError("Workspace");
+  const ws = getWorkspaceOrThrow(id);
   if (!ws.path) throw new ValidationError("Workspace has no path — cannot save AGENTS.md");
 
   const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
@@ -438,8 +431,7 @@ workspaceRoutes.put("/:id/agents-md", async (c) => {
 workspaceRoutes.get("/:id/agents-md/effective", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
-  if (!ws) throw new NotFoundError("Workspace");
+  const ws = getWorkspaceOrThrow(id);
 
   const flockctlHome = getFlockctlHome();
   /* v8 ignore next — workspaces.path is NOT NULL in the schema, so `?? ""` is defensive */
@@ -453,8 +445,7 @@ workspaceRoutes.get("/:id/agents-md/effective", (c) => {
 workspaceRoutes.get("/:id/todo", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
-  if (!ws) throw new NotFoundError("Workspace");
+  const ws = getWorkspaceOrThrow(id);
 
   if (!ws.path) return c.json({ content: "", path: "" });
   return c.json(loadTodoFile(ws.path));
@@ -466,8 +457,7 @@ workspaceRoutes.get("/:id/todo", (c) => {
 workspaceRoutes.put("/:id/todo", async (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
-  if (!ws) throw new NotFoundError("Workspace");
+  const ws = getWorkspaceOrThrow(id);
   if (!ws.path) throw new ValidationError("Workspace has no path — cannot save TODO.md");
 
   const body = await c.req.json();
@@ -485,8 +475,7 @@ workspaceRoutes.delete("/:id/projects/:projectId", (c) => {
   const wsId = parseIdParam(c);
   const projectId = parseIdParam(c, "projectId");
 
-  const ws = db.select().from(workspaces).where(eq(workspaces.id, wsId)).get();
-  if (!ws) throw new NotFoundError("Workspace");
+  const ws = getWorkspaceOrThrow(wsId);
 
   const project = db.select().from(projects)
     .where(and(eq(projects.id, projectId), eq(projects.workspaceId, wsId)))
@@ -504,8 +493,7 @@ workspaceRoutes.delete("/:id/projects/:projectId", (c) => {
 workspaceRoutes.get("/:id/dashboard", (c) => {
   const db = getDb();
   const id = parseIdParam(c);
-  const ws = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
-  if (!ws) throw new NotFoundError("Workspace");
+  const ws = getWorkspaceOrThrow(id);
 
   const wsProjects = db.select().from(projects).where(eq(projects.workspaceId, id)).all();
   const projectIds = wsProjects.map(p => p.id);

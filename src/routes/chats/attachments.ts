@@ -11,6 +11,7 @@ import {
   AttachmentError,
   MAX_ATTACHMENT_BYTES,
 } from "../../services/attachments.js";
+import { getChatOrThrow } from "../../lib/db-helpers.js";
 
 // ─── Attachments ────────────────────────────────────────────────────────────
 // Zod-validates only the path param — the body is multipart/form-data, parsed
@@ -34,9 +35,7 @@ export function registerChatAttachments(router: Hono): void {
     if (!paramParse.success) throw new ValidationError("invalid chat id");
     const chatId = paramParse.data.id;
 
-    const db = getDb();
-    const chat = db.select().from(chats).where(eq(chats.id, chatId)).get();
-    if (!chat) throw new NotFoundError("Chat");
+    getChatOrThrow(chatId);
 
     let body: Record<string, unknown>;
     try {

@@ -7,6 +7,7 @@ import { paginationParams } from "../../lib/pagination.js";
 import { NotFoundError, ValidationError } from "../../lib/errors.js";
 import { computeCounts, type Todo } from "../../services/todo-store.js";
 import { parseTodosJson } from "./helpers.js";
+import { getChatOrThrow } from "../../lib/db-helpers.js";
 
 // ─── Todos ──────────────────────────────────────────────────────────────────
 // Zod-validated `:id` path param. Same pattern as `attachmentIdParamSchema`
@@ -129,8 +130,7 @@ export function registerChatTodos(router: Hono): void {
     const chatId = paramParse.data.id;
 
     const db = getDb();
-    const chat = db.select().from(chats).where(eq(chats.id, chatId)).get();
-    if (!chat) throw new NotFoundError("Chat");
+    getChatOrThrow(chatId);
 
     const snapshot = db
       .select()
@@ -166,8 +166,7 @@ export function registerChatTodos(router: Hono): void {
     const chatId = paramParse.data.id;
 
     const db = getDb();
-    const chat = db.select().from(chats).where(eq(chats.id, chatId)).get();
-    if (!chat) throw new NotFoundError("Chat");
+    getChatOrThrow(chatId);
 
     const agentParam = c.req.query("agent");
     // Build the agent filter once and reuse for both rows + count queries so
@@ -231,8 +230,7 @@ export function registerChatTodos(router: Hono): void {
     const chatId = paramParse.data.id;
 
     const db = getDb();
-    const chat = db.select().from(chats).where(eq(chats.id, chatId)).get();
-    if (!chat) throw new NotFoundError("Chat");
+    getChatOrThrow(chatId);
 
     // Fetch every snapshot for this chat in chronological order. We need the
     // full timeline (not just the latest per agent) so `annotateCompletedAt`

@@ -27,19 +27,23 @@ describe("Agent Tools", () => {
     expect(names).toContain("AskUserQuestion");
   });
 
-  it("getAgentTools exposes AskUserQuestion with the shared input schema", () => {
+  it("getAgentTools exposes AskUserQuestion with a JSON schema input contract", () => {
     const tools = getAgentTools(workDir);
     const ask = tools.find(t => t.name === "AskUserQuestion");
     expect(ask).toBeDefined();
     expect(ask!.description).toMatch(/clarification/i);
-    expect(ask!.input_schema).toBe(askUserQuestionInputSchema);
-    expect(askUserQuestionInputSchema).toEqual({
-      type: "object",
-      properties: {
-        question: { type: "string", maxLength: 2000 },
-      },
-      required: ["question"],
-    });
+    // The Anthropic API needs a plain JSON schema, not a Zod schema instance.
+    const schema = ask!.input_schema as { type: string; properties: Record<string, unknown>; required: string[] };
+    expect(schema.type).toBe("object");
+    expect(schema.required).toEqual(["question"]);
+    expect(schema.properties).toHaveProperty("question");
+    expect(schema.properties).toHaveProperty("header");
+    expect(schema.properties).toHaveProperty("multi_select");
+    expect(schema.properties).toHaveProperty("options");
+    // The shared Zod schema is used by the session interceptor for runtime
+    // validation — confirm the export still exists and parses a basic input.
+    const parsed = askUserQuestionInputSchema.safeParse({ question: "ok" });
+    expect(parsed.success).toBe(true);
   });
 
   it("executeToolCall throws for AskUserQuestion (session must handle it)", () => {

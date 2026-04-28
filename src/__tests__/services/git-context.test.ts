@@ -110,6 +110,73 @@ describe("buildCodebaseContext", () => {
     warnSpy.mockRestore();
   });
 
+  it("omits git_status block when working tree is clean (no modified, no untracked)", async () => {
+    const projPath = join(tmpBase, "clean-git-proj");
+    mkdirSync(projPath, { recursive: true });
+    const simpleGit = (await import("simple-git")).default;
+    const git = simpleGit(projPath);
+    await git.init();
+    await git.addConfig("user.email", "test@example.com");
+    await git.addConfig("user.name", "Test");
+    // Commit a file so the tree is clean (no modified, no untracked).
+    writeFileSync(join(projPath, "tracked.txt"), "hello");
+    await git.add("tracked.txt");
+    await git.commit("init");
+
+    const proj = db
+      .insert(projects)
+      .values({ name: "clean-git-proj", path: projPath })
+      .returning()
+      .get();
+
+    const result = await buildCodebaseContext(proj!.id);
+    expect(result).toContain("<file_tree>");
+    // Clean working tree → no git_status block.
+    expect(result).not.toContain("<git_status>");
+  });
+
+  it("buildFileTree returns empty string at maxDepth (line 49 branch)", async () => {
+    // A project with a deeply-nested directory ensures recursion hits the
+    // `depth >= maxDepth` early-return on the inner-most call.
+    const projPath = join(tmpBase, "deep-proj");
+    mkdirSync(join(projPath, "a", "b", "c", "d"), { recursive: true });
+    writeFileSync(join(projPath, "a", "b", "c", "d", "deep.txt"), "");
+    const proj = db
+      .insert(projects)
+      .values({ name: "deep-proj", path: projPath })
+      .returning()
+      .get();
+
+    const result = await buildCodebaseContext(proj!.id);
+    // The 3-level cap means the d/ contents must NOT appear.
+    expect(result).not.toContain("deep.txt");
+  });
+
+  it("buildFileTree sorts directories before files at the same depth", async () => {
+    // Both branches of the sort comparator: dir-vs-file (a.isDirectory()
+    // !== b.isDirectory()) and dir-vs-dir (same isDirectory result, fall
+    // through to localeCompare).
+    const projPath = join(tmpBase, "sort-proj");
+    mkdirSync(join(projPath, "z_dir"), { recursive: true });
+    mkdirSync(join(projPath, "a_dir"), { recursive: true });
+    writeFileSync(join(projPath, "b_file.txt"), "");
+    writeFileSync(join(projPath, "a_file.txt"), "");
+    const proj = db
+      .insert(projects)
+      .values({ name: "sort-proj", path: projPath })
+      .returning()
+      .get();
+
+    const result = await buildCodebaseContext(proj!.id);
+    // a_dir should appear before z_dir; both directories before files.
+    const idxADir = result.indexOf("a_dir/");
+    const idxZDir = result.indexOf("z_dir/");
+    const idxAFile = result.indexOf("a_file.txt");
+    expect(idxADir).toBeGreaterThan(-1);
+    expect(idxZDir).toBeGreaterThan(idxADir);
+    expect(idxAFile).toBeGreaterThan(idxZDir);
+  });
+
   it("ignores node_modules and .git directories in tree", async () => {
     const projPath = join(tmpBase, "ignore-proj");
     mkdirSync(join(projPath, "node_modules", "pkg"), { recursive: true });

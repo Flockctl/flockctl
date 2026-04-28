@@ -137,6 +137,26 @@ export interface ChatOptions {
    * byte-identical to the pre-toggle behavior.
    */
   effort?: "low" | "medium" | "high" | "max";
+  /**
+   * Hooks the SDK's built-in `AskUserQuestion` through Flockctl's structured
+   * questions pipeline. When set, the provider must (1) register an in-process
+   * MCP override that delegates to this callback and (2) add `AskUserQuestion`
+   * to the SDK's `disallowedTools`. See
+   * `services/ai/ask-user-question-bridge.ts` for the design rationale.
+   *
+   * The callback is the same shape as the AgentSession's private
+   * `awaitUserAnswer` — it receives a parsed (Flockctl-singular) question
+   * payload plus the SDK-assigned `tool_use_id`, and resolves with the
+   * answer text once the UI / API delivers one. Rejects on session abort.
+   *
+   * Currently only the Claude Code provider honors this; other providers
+   * keep using `session.ts`'s in-loop AskUserQuestion handling because they
+   * surface tool calls directly via `response.toolCalls`.
+   */
+  askUserQuestionHandler?: (
+    parsed: import("../agent-tools.js").ParsedAskUserQuestion,
+    toolUseId: string,
+  ) => Promise<string>;
 }
 
 export interface ChatResult {

@@ -2,6 +2,7 @@ import * as React from "react";
 
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { SliceDetailPanel } from "./SliceDetailPanel";
+import { SupervisorLogTab } from "./SupervisorLogTab";
 
 /**
  * Context passed to every `TabDef.render`.
@@ -19,6 +20,17 @@ export interface SliceDetailTabsContext {
    * instead of threading it through `SliceDetailTabsProps` per tab.
    */
   projectId?: string;
+  /**
+   * Mission owning the selected slice's parent milestone, when one
+   * exists. Forwarded into the {@link SliceDetailTabsContext} so the
+   * Supervisor log tab (milestone 10/06) can subscribe to the right
+   * `mission_event` channel without a second `useMissions` call.
+   *
+   * Absent on milestones with no `mission_id` frontmatter — see
+   * `getSliceDetailTabs` for the conditional registration that skips
+   * the Supervisor log tab when this field is undefined.
+   */
+  missionId?: string;
 }
 
 /**
@@ -67,6 +79,55 @@ export const DEFAULT_SLICE_TABS: TabDef[] = [
   },
 ];
 
+/**
+ * Stable id for the Supervisor log tab. Exported so callers / tests can
+ * target it via `tabs.find(t => t.id === SUPERVISOR_LOG_TAB_ID)` without
+ * stringly-coupling to the literal.
+ */
+export const SUPERVISOR_LOG_TAB_ID = "supervisor-log" as const;
+
+/**
+ * `TabDef` factory for the Supervisor log tab. Closes over `missionId` so
+ * the registered render function can mount {@link SupervisorLogTab}
+ * without re-deriving the id from {@link SliceDetailTabsContext} —
+ * keeping the closure narrow lets us register the tab once at the call
+ * site and forget about wiring contexts through.
+ *
+ * Why a factory and not a static `TabDef`:
+ *   The mission id is a per-mount value (different slices belong to
+ *   milestones with different missions), so a static export would force
+ *   every consumer to thread `ctx.missionId` through their own render
+ *   wrapper. The factory keeps the registry pattern uniform — callers
+ *   `.push(supervisorLogTab(missionId))` instead of conditional-renders.
+ */
+export function supervisorLogTab(missionId: string): TabDef {
+  return {
+    id: SUPERVISOR_LOG_TAB_ID,
+    label: "Supervisor log",
+    render: () => <SupervisorLogTab missionId={missionId} />,
+  };
+}
+
+/**
+ * Build the slice-detail tab registry for a given context. Returns
+ * `DEFAULT_SLICE_TABS` when no mission is associated with the surface,
+ * or `[...DEFAULT_SLICE_TABS, supervisorLogTab(missionId)]` when one
+ * is — i.e. the Supervisor log tab is registered IFF the mission id
+ * is present.
+ *
+ * This is the canonical extension point parent slice 10/06 references:
+ * "DEFAULT_SLICE_TABS now includes [the Supervisor log tab] when mission
+ * selected". Composing at this seam keeps {@link DEFAULT_SLICE_TABS}'s
+ * own shape stable (so the `slice_detail_tabs` extension-point test
+ * still pins a single-entry default), while letting consumers opt in
+ * to the supervisor tab without touching {@link SliceDetailTabs}.
+ */
+export function getSliceDetailTabs(opts: { missionId?: string } = {}): TabDef[] {
+  const { missionId } = opts;
+  if (!missionId) return DEFAULT_SLICE_TABS;
+  return [...DEFAULT_SLICE_TABS, supervisorLogTab(missionId)];
+}
+
 export interface SliceDetailTabsProps {
   sliceId?: string;
   /**
@@ -75,6 +136,14 @@ export interface SliceDetailTabsProps {
    * can hit the shared `useProjectTree` cache.
    */
   projectId?: string;
+  /**
+   * Mission owning the selected slice's parent milestone, when one
+   * exists. Forwarded into the {@link SliceDetailTabsContext} so a
+   * caller composing the default tabs through {@link getSliceDetailTabs}
+   * can pick up the same id from the ctx in a custom tab without a
+   * second prop.
+   */
+  missionId?: string;
   /** Override the tab registry. Defaults to `DEFAULT_SLICE_TABS`. */
   tabs?: TabDef[];
   /** Optional controlled active tab id. */
@@ -95,6 +164,7 @@ export interface SliceDetailTabsProps {
 export function SliceDetailTabs({
   sliceId,
   projectId,
+  missionId,
   tabs = DEFAULT_SLICE_TABS,
   activeTabId,
   onActiveTabChange,
@@ -121,7 +191,7 @@ export function SliceDetailTabs({
 
   if (tabs.length === 0) return null;
 
-  const ctx: SliceDetailTabsContext = { sliceId, projectId };
+  const ctx: SliceDetailTabsContext = { sliceId, projectId, missionId };
 
   return (
     <Tabs

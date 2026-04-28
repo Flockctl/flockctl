@@ -116,6 +116,16 @@ export const tasks = sqliteTable("tasks", {
   // on every task row.
   acceptanceCriteria: text("acceptance_criteria"),
   decisionTable: text("decision_table"),
+  /**
+   * Wake-up timestamp for tasks parked in `status='rate_limited'`. Unix-epoch
+   * milliseconds (NOT seconds — Anthropic's `retry-after-ms` header is
+   * sub-second-precise and the rate-limit scheduler's setTimeout is too).
+   * NULL on every other status; cleared back to NULL on resume/cancel so a
+   * stale value cannot leak into the next run. See migration 0044 for the
+   * full rationale and `services/agents/rate-limit-scheduler.ts` for the
+   * boot-time recovery query that reads this column.
+   */
+  resumeAt: integer("resume_at"),
   createdAt: text("created_at").default(sql`(datetime('now'))`),
   startedAt: text("started_at"),
   completedAt: text("completed_at"),
@@ -123,6 +133,10 @@ export const tasks = sqliteTable("tasks", {
 }, (table) => [
   index("idx_tasks_project_status").on(table.projectId, table.status),
   index("idx_tasks_status_created").on(table.status, table.createdAt),
+  // Partial index covering only currently-paused rows — keeps the
+  // bootstrap-recovery query bounded by the live rate-limited population
+  // rather than the full tasks table.
+  index("idx_tasks_resume_at").on(table.resumeAt).where(sql`resume_at IS NOT NULL`),
 ]);
 
 // ─── Task Logs ───
@@ -245,10 +259,32 @@ export const chats = sqliteTable("chats", {
    * upgrade as unpinned without a backfill.
    */
   pinned: integer("pinned", { mode: "boolean" }).default(false).notNull(),
+  /**
+   * Per-chat lifecycle state. Added in migration 0044 — the first explicit
+   * status column for chats (the prior model derived "waiting" from
+   * `EXISTS(agent_questions WHERE chat_id=? AND status='pending')` and
+   * "running" from in-memory `chatExecutor.isRunning`). Allowed values:
+   *   'idle'         — no live session
+   *   'running'      — informational; the in-memory `chatExecutor.isRunning`
+   *                    remains the source of truth for "is a session wired up
+   *                    right now" because that survives restarts cleanly
+   *   'rate_limited' — paused awaiting `resumeAt`; the rate-limit scheduler
+   *                    will create a fresh AgentSession and continue via
+   *                    `claudeSessionId`
+   * Default 'idle' so existing rows are byte-equivalent post-migration.
+   */
+  status: text("status").default("idle").notNull(),
+  /**
+   * Wake-up timestamp for chats parked in `status='rate_limited'`. Mirrors
+   * `tasks.resumeAt` — unix-epoch milliseconds, NULL otherwise. See migration
+   * 0044 for full rationale.
+   */
+  resumeAt: integer("resume_at"),
   createdAt: text("created_at").default(sql`(datetime('now'))`),
   updatedAt: text("updated_at").default(sql`(datetime('now'))`),
 }, (table) => [
   index("idx_chats_entity").on(table.projectId, table.entityType, table.entityId),
+  index("idx_chats_resume_at").on(table.resumeAt).where(sql`resume_at IS NOT NULL`),
 ]);
 
 // ─── Chat Messages ───
@@ -416,6 +452,18 @@ export const agentQuestions = sqliteTable("agent_questions", {
   toolUseId: text("tool_use_id").notNull(),
   question: text("question").notNull(),
   answer: text("answer"),
+  // JSON-serialized array of `{ label, description?, preview? }` objects when
+  // the harness emits a multiple-choice prompt via AskUserQuestion. NULL means
+  // free-form (the original 0029 shape) — stored that way so existing rows and
+  // free-form callers stay valid without backfill.
+  options: text("options"),
+  // Whether the user may pick more than one option. Always false for free-form
+  // prompts (NULL `options`), but tracked as its own column so future tooling
+  // can render single- vs multi-select pickers without re-parsing `options`.
+  multiSelect: integer("multi_select", { mode: "boolean" }).notNull().default(false),
+  // Short chip label rendered above the choices (≤ 12 chars per Claude harness
+  // convention). NULL when the prompt has no header — typical for free-form.
+  header: text("header"),
   status: text("status").notNull().default("pending"),
   createdAt: text("created_at").default(sql`(datetime('now'))`),
   answeredAt: text("answered_at"),
@@ -431,4 +479,108 @@ export const agentQuestions = sqliteTable("agent_questions", {
   index("idx_agent_questions_task_status").on(table.taskId, table.status),
   index("idx_agent_questions_chat_status").on(table.chatId, table.status),
   index("idx_agent_questions_status_created").on(table.status, table.createdAt),
+]);
+
+// ─── Missions ───
+// Top-level supervisor objective. A mission is the long-running "why" that
+// owns a tree of milestones / slices / tasks underneath; the supervisor loop
+// reads `objective`, observes downstream task outcomes via `mission_events`,
+// and proposes remediations gated by `autonomy`.
+//
+// `id` is a TEXT uuid-like slug (`^[a-z0-9-]{8,}$`) so it can also appear in
+// milestone YAML frontmatter (`mission_id?`) without numeric coupling to the
+// missions table — see slice 11/00 for the YAML half. `project_id` cascades
+// on project delete so abandoned missions never outlive their project.
+//
+// `status` values trace the mission lifecycle: drafting → active → (paused →)
+// active → completed | failed | aborted. `autonomy` controls the supervisor's
+// permission to act: `manual` (propose only, never act), `suggest` (one-step
+// proposals require approval), `auto` (act inside budget without per-step
+// approval). Both columns are CHECK-constrained so stale code can't insert
+// junk values; the supervisor relies on the enum being closed.
+//
+// Budgets are split: `budget_tokens` and `budget_usd_cents` are both > 0
+// (CHECK) so an "unbounded" mission cannot exist — the supervisor must have
+// a stop condition. `spent_*` counters are advanced by the executor on each
+// downstream LLM call and emit a `budget_warning` / `budget_exceeded` event
+// at the configured thresholds.
+//
+// `supervisor_prompt_version` pins the prompt template used when the mission
+// was created so a later prompt rev can't silently change in-flight mission
+// behavior; the supervisor reads this column to load the matching template.
+//
+// Timestamps use INTEGER `unixepoch()` (not the project-wide `datetime('now')`
+// TEXT default) because the supervisor's hot-path event scan needs cheap
+// integer comparisons and the slice 03 edge test asserts a 10k-event time
+// query under 50ms.
+export const missions = sqliteTable("missions", {
+  id: text("id").primaryKey(),
+  projectId: integer("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
+  objective: text("objective").notNull(),
+  status: text("status").notNull().default("active"),
+  autonomy: text("autonomy").notNull().default("suggest"),
+  budgetTokens: integer("budget_tokens").notNull(),
+  budgetUsdCents: integer("budget_usd_cents").notNull(),
+  spentTokens: integer("spent_tokens").notNull().default(0),
+  spentUsdCents: integer("spent_usd_cents").notNull().default(0),
+  supervisorPromptVersion: text("supervisor_prompt_version").notNull(),
+  createdAt: integer("created_at").notNull().default(sql`(unixepoch())`),
+  updatedAt: integer("updated_at").notNull().default(sql`(unixepoch())`),
+}, (table) => [
+  check(
+    "missions_status_check",
+    sql`status IN ('drafting','active','paused','completed','failed','aborted')`,
+  ),
+  check(
+    "missions_autonomy_check",
+    sql`autonomy IN ('manual','suggest','auto')`,
+  ),
+  check("missions_budget_tokens_check", sql`budget_tokens > 0`),
+  check("missions_budget_usd_cents_check", sql`budget_usd_cents > 0`),
+  index("idx_missions_project").on(table.projectId),
+]);
+
+// ─── Mission Events ───
+// Append-only timeline of supervisor decisions and observations for a mission.
+// Cascades on mission delete (history travels with the mission — the table is
+// not a system audit log). Each row pins the `kind` enum at the DB layer so
+// drift in the supervisor code can't insert unknown event types and silently
+// corrupt the event-replay path.
+//
+// `payload` is a JSON-encoded blob whose shape is keyed by `kind` (e.g.
+// `plan_proposed` carries a milestone tree, `budget_warning` carries the
+// threshold and current spend). Schema-per-kind validation lives in the
+// service layer, not at the DB, so the supervisor can evolve payload shapes
+// without a migration each time.
+//
+// `cost_tokens` / `cost_usd_cents` are the *delta* attributed to producing
+// this event (typically the planning LLM call), not the running mission
+// total — totals live on `missions.spent_*`. `depth` records the nested
+// remediation depth that produced the event so the supervisor can enforce
+// the depth-exceeded stop condition without re-walking the event history.
+//
+// `idx_mission_events_mission_created` covers the dominant query: "give me
+// the latest N events for mission X in reverse chronological order". The
+// (mission_id, created_at DESC) compound is required for the 10k-event
+// 50ms scan target in slice 03.
+export const missionEvents = sqliteTable("mission_events", {
+  id: text("id").primaryKey(),
+  missionId: text("mission_id").notNull().references(() => missions.id, { onDelete: "cascade" }),
+  kind: text("kind").notNull(),
+  payload: text("payload").notNull(),
+  costTokens: integer("cost_tokens").notNull().default(0),
+  costUsdCents: integer("cost_usd_cents").notNull().default(0),
+  depth: integer("depth").notNull().default(0),
+  createdAt: integer("created_at").notNull().default(sql`(unixepoch())`),
+}, (table) => [
+  check(
+    "mission_events_kind_check",
+    sql`kind IN (
+      'plan_proposed','task_observed','remediation_proposed',
+      'remediation_approved','remediation_dismissed',
+      'budget_warning','budget_exceeded','depth_exceeded',
+      'no_action','objective_met','stalled','heartbeat','paused'
+    )`,
+  ),
+  index("idx_mission_events_mission_created").on(table.missionId, desc(table.createdAt)),
 ]);

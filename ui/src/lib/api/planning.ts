@@ -199,6 +199,31 @@ export function fetchAutoExecStatus(
   );
 }
 
+/**
+ * Bulk re-run every plan task in a milestone whose latest execution attempt
+ * is in a "failed" terminal state (execution status `failed` / `timed_out` /
+ * `cancelled` is normalised by the backend's `repointPlanTask` to a single
+ * "failed" plan-task status). The orchestrator is restarted by default; pass
+ * `resume: false` to re-queue without kicking auto-execution back on.
+ */
+export interface RerunFailedMilestoneResponse {
+  rerun: { originalTaskId: number; newTaskId: number }[];
+  count: number;
+  resumed: boolean;
+}
+
+export function rerunFailedMilestone(
+  projectId: string,
+  milestoneId: string,
+  options?: { resume?: boolean },
+): Promise<RerunFailedMilestoneResponse> {
+  const qs = options?.resume === false ? "?resume=false" : "";
+  return apiFetch<RerunFailedMilestoneResponse>(
+    `/projects/${projectId}/milestones/${milestoneId}/rerun-failed${qs}`,
+    { method: "POST", body: "{}" },
+  );
+}
+
 // --- Plan File Content ---
 
 export function fetchPlanFile(

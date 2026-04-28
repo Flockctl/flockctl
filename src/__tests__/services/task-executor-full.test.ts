@@ -35,7 +35,7 @@ vi.mock("../../services/agent-session/index", () => {
 });
 
 vi.mock("../../services/ws-manager", () => ({
-  wsManager: { broadcast: vi.fn(), broadcastAll: vi.fn() },
+  wsManager: { broadcast: vi.fn(), broadcastAll: vi.fn(), broadcastTaskStatus: vi.fn(), broadcastChatStatus: vi.fn() },
 }));
 vi.mock("../../services/claude/skills-sync", () => ({
   reconcileClaudeSkillsForProject: vi.fn(),

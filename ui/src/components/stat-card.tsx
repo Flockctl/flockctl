@@ -7,15 +7,21 @@ export function StatCard({
   value,
   subtitle,
   isLoading,
+  testId,
 }: {
   icon: React.ComponentType<React.SVGProps<SVGSVGElement>>;
   label: string;
   value: number | string;
   subtitle?: string;
   isLoading: boolean;
+  /** Forwarded as `data-testid` on the rendered <Card>. Lets callers drop
+   *  the wrapper `<div data-testid="…">` they previously needed — the wrapper
+   *  was preventing the inner Card from stretching to the grid-cell height,
+   *  so the wrapped slots rendered visibly shorter than the un-wrapped ones. */
+  testId?: string;
 }) {
   return (
-    <Card>
+    <Card data-testid={testId}>
       <CardHeader className="pb-2">
         <CardTitle className="text-sm font-medium text-muted-foreground">
           <Icon className="mr-2 inline h-4 w-4" />

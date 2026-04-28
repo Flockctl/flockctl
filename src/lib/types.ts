@@ -10,13 +10,23 @@
 // (usage persistence, git diff snapshot, retry accounting).
 export const TASK_STATUS_TRANSITIONS: Record<string, string[]> = {
   queued: ["running", "cancelled"],
-  running: ["done", "failed", "cancelled", "timed_out", "pending_approval", "waiting_for_input"],
+  // `rate_limited` is reachable from `running` when the AI provider returns a
+  // rate-limit / usage-limit error mid-turn (see
+  // `services/agents/rate-limit-classifier.ts`). The task is parked, NOT
+  // failed — its `claude_session_id` lets `rate-limit-scheduler.ts` resume the
+  // SDK session at `resume_at` without losing context.
+  running: ["done", "failed", "cancelled", "timed_out", "pending_approval", "waiting_for_input", "rate_limited"],
   // `queued` is allowed so a waiting task can be resumed after a daemon
   // restart: the in-memory session is gone, so the answer handler flips
   // the task back to queued and lets execute() spin up a fresh session
   // via the persisted claudeSessionId.
   waiting_for_input: ["running", "queued", "cancelled", "timed_out"],
   pending_approval: ["done", "cancelled"],
+  // From rate_limited: scheduler wakes the task → `queued` (executor will
+  // pick it up and resume); user cancels via DELETE → `cancelled`; if the
+  // resumed run hits the limit AGAIN, it transitions running→rate_limited
+  // again, so we don't need a self-loop here.
+  rate_limited: ["queued", "cancelled"],
   done: [],
   failed: ["queued"],
   cancelled: ["queued"],
@@ -32,6 +42,9 @@ export const TaskStatus = {
   RUNNING: "running",
   WAITING_FOR_INPUT: "waiting_for_input",
   PENDING_APPROVAL: "pending_approval",
+  /** Parked due to provider rate-limit / usage-limit. Will auto-resume at
+   *  `tasks.resume_at` via the rate-limit scheduler. */
+  RATE_LIMITED: "rate_limited",
   DONE: "done",
   FAILED: "failed",
   CANCELLED: "cancelled",
@@ -57,6 +70,10 @@ export type TerminalErrorTaskStatus =
 export const LIVE_TASK_STATUSES: readonly string[] = [
   TaskStatus.RUNNING,
   TaskStatus.WAITING_FOR_INPUT,
+  // Rate-limited tasks are still "live" — they own a session_id and will
+  // resume on schedule. Treated like `waiting_for_input` for accounting:
+  // the task hasn't finished, but it isn't actively burning a slot either.
+  TaskStatus.RATE_LIMITED,
 ] as const;
 
 /**

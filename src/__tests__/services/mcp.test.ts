@@ -146,6 +146,63 @@ describe("resolveMcpServersForProject", () => {
     expect(srv).toBeUndefined();
   });
 
+  it("workspace config disables a workspace MCP server — cascades to project view", () => {
+    // Requirement: if an MCP server is disabled at workspace level, it must
+    // also be considered disabled in projects of that workspace.
+    const wsPath = join(tmpBase, "ws-mcp-disables-ws-srv");
+    const wsMcpDir = join(wsPath, ".flockctl", "mcp");
+    mkdirSync(wsMcpDir, { recursive: true });
+    writeFileSync(join(wsMcpDir, "ws-srv-hidden.json"), JSON.stringify({ command: "node", args: ["x.js"] }));
+
+    mkdirSync(join(wsPath, ".flockctl"), { recursive: true });
+    writeFileSync(
+      join(wsPath, ".flockctl", "config.json"),
+      JSON.stringify({ disabledMcpServers: [{ name: "ws-srv-hidden", level: "workspace" }] }),
+    );
+    const ws = db.insert(workspaces).values({ name: "ws-mcp-dws", path: wsPath }).returning().get();
+
+    const projPath = join(tmpBase, "proj-mcp-dws");
+    mkdirSync(projPath, { recursive: true });
+    const proj = db.insert(projects).values({
+      name: "proj-mcp-dws", workspaceId: ws!.id, path: projPath,
+    }).returning().get();
+
+    // Project itself disables nothing — disable only lives on the workspace.
+    const result = resolveMcpServersForProject(proj!.id);
+    expect(result.find((s) => s.name === "ws-srv-hidden")).toBeUndefined();
+  });
+
+  it("workspace MCP disable cascades to multiple sibling projects", () => {
+    const globalDir = join(tmpBase, "global-mcp");
+    mkdirSync(globalDir, { recursive: true });
+    writeFileSync(join(globalDir, "shared-mcp-disabled.json"), JSON.stringify({ command: "g" }));
+
+    const wsPath = join(tmpBase, "ws-mcp-cascade-siblings");
+    mkdirSync(join(wsPath, ".flockctl"), { recursive: true });
+    writeFileSync(
+      join(wsPath, ".flockctl", "config.json"),
+      JSON.stringify({ disabledMcpServers: [{ name: "shared-mcp-disabled", level: "global" }] }),
+    );
+    const ws = db.insert(workspaces).values({ name: "ws-mcp-cs", path: wsPath }).returning().get();
+
+    const projPathA = join(tmpBase, "proj-mcp-cs-a");
+    mkdirSync(projPathA, { recursive: true });
+    const projA = db.insert(projects).values({
+      name: "proj-mcp-cs-a", workspaceId: ws!.id, path: projPathA,
+    }).returning().get();
+
+    const projPathB = join(tmpBase, "proj-mcp-cs-b");
+    mkdirSync(projPathB, { recursive: true });
+    const projB = db.insert(projects).values({
+      name: "proj-mcp-cs-b", workspaceId: ws!.id, path: projPathB,
+    }).returning().get();
+
+    const resA = resolveMcpServersForProject(projA!.id);
+    const resB = resolveMcpServersForProject(projB!.id);
+    expect(resA.find((s) => s.name === "shared-mcp-disabled")).toBeUndefined();
+    expect(resB.find((s) => s.name === "shared-mcp-disabled")).toBeUndefined();
+  });
+
   it("project disabledMcpServers removes workspace servers", () => {
     const wsPath = join(tmpBase, "ws-mcp-disable-ws");
     mkdirSync(wsPath, { recursive: true });

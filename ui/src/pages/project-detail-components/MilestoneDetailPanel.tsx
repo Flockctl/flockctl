@@ -18,6 +18,7 @@ import {
   useAutoExecStatus,
   useCreateChat,
   useProjectTree,
+  useRerunFailedMilestone,
   useStartAutoExecute,
 } from "@/lib/hooks";
 import type { MilestoneTree, PlanSliceTree, PlanTask } from "@/lib/types";
@@ -25,6 +26,7 @@ import { statusBadge } from "@/components/status-badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
+import { formatDurationMs, formatCostPrecise } from "@/lib/format";
 import { usePlanEditor } from "./plan-editor-context";
 
 /**
@@ -62,6 +64,13 @@ interface MilestoneAggregate {
   completedSliceCount: number;
   taskCount: number;
   completedTaskCount: number;
+  /**
+   * Plan tasks that ended in a "failed" terminal state (which the backend
+   * collapses execution `failed` / `timed_out` / `cancelled` into). Used to
+   * gate the "Re-run failed (N)" affordance — the button only renders when
+   * there's actually something to re-run.
+   */
+  failedTaskCount: number;
   durationMs: number | null;
   costUsd: number | null;
 }
@@ -71,11 +80,13 @@ function aggregateMilestone(milestone: MilestoneTree): MilestoneAggregate {
   let costUsd: number | null = null;
   let taskCount = 0;
   let completedTaskCount = 0;
+  let failedTaskCount = 0;
 
   for (const s of milestone.slices) {
     for (const t of s.tasks) {
       taskCount++;
       if (t.status === "completed") completedTaskCount++;
+      else if (t.status === "failed") failedTaskCount++;
       const summary = t.summary as
         | { duration_ms?: unknown; total_cost_usd?: unknown }
         | null;
@@ -97,28 +108,10 @@ function aggregateMilestone(milestone: MilestoneTree): MilestoneAggregate {
       .length,
     taskCount,
     completedTaskCount,
+    failedTaskCount,
     durationMs,
     costUsd,
   };
-}
-
-function formatDuration(ms: number | null): string {
-  if (ms == null) return "—";
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  const s = ms / 1000;
-  if (s < 60) return `${s.toFixed(1)}s`;
-  const m = Math.floor(s / 60);
-  const rem = Math.round(s - m * 60);
-  if (m < 60) return `${m}m ${rem}s`;
-  const h = Math.floor(m / 60);
-  const mrem = m - h * 60;
-  return `${h}h ${mrem}m`;
-}
-
-function formatCost(usd: number | null): string {
-  if (usd == null) return "—";
-  if (usd < 0.01) return `$${usd.toFixed(4)}`;
-  return `$${usd.toFixed(2)}`;
 }
 
 export function MilestoneDetailPanel({
@@ -131,6 +124,7 @@ export function MilestoneDetailPanel({
   const createChat = useCreateChat();
   const planEditor = usePlanEditor();
   const startAutoExecute = useStartAutoExecute(projectId);
+  const rerunFailed = useRerunFailedMilestone(projectId);
   // Only gate on the auto-exec status when we actually know the id; the
   // hook will noop while disabled so a panel without a selection does not
   // poll an empty endpoint.
@@ -176,6 +170,11 @@ export function MilestoneDetailPanel({
     if (!milestone) return;
     startAutoExecute.mutate({ milestoneId: milestone.id });
   }, [milestone, startAutoExecute]);
+
+  const onRerunFailed = useCallback(() => {
+    if (!milestone) return;
+    rerunFailed.mutate({ milestoneId: milestone.id });
+  }, [milestone, rerunFailed]);
 
   if (!milestoneId) {
     return (
@@ -232,13 +231,22 @@ export function MilestoneDetailPanel({
   // - Pending / planning milestones (and milestones whose aggregate slice
   //   list is "completed 0 of N") read as a first-time **Run** with a
   //   play icon.
-  // - Anything else (active / completed / failed / partially-run) reads as
-  //   **Re-run** — we do not want the button to vanish on a completed
-  //   milestone because "re-run everything" is a valid repair affordance.
+  // - Active / partially-run milestones read as **Re-run** (whole-milestone
+  //   restart from the first wave).
+  // - **Completed** milestones hide the button entirely. Restarting a green
+  //   milestone is a destructive corner case (it re-queues every task,
+  //   spending tokens on work that already passed); the previous "always
+  //   show Re-run as a repair affordance" contract proved confusing —
+  //   users hit it expecting a no-op and got a full re-run.
   // - The button is disabled whenever the daemon reports auto-exec is
   //   already in flight for this milestone OR while our own mutation is
   //   pending, with a tooltip explaining why. Same corner case
   //   `rerun-already-running disabled` called out for `SliceDetailPanel`.
+  // - Independently, when ≥1 plan task is in a "failed" terminal state we
+  //   surface a focused **Re-run failed (N)** button that only re-queues
+  //   those leaves (not the whole milestone). It also restarts the
+  //   orchestrator so anything blocked behind a previously-failed task
+  //   unblocks naturally.
   const autoExecRunning = autoExecStatus.data?.status === "running";
   const runDisabled = autoExecRunning || startAutoExecute.isPending;
   const runTitle = autoExecRunning
@@ -256,6 +264,9 @@ export function MilestoneDetailPanel({
       ? "Run"
       : "Re-run";
   const RunIcon = isFirstRun ? Play : RotateCcw;
+  const failedTaskCount = aggregate?.failedTaskCount ?? 0;
+  const showRerunFailed = failedTaskCount > 0;
+  const rerunFailedDisabled = autoExecRunning || rerunFailed.isPending;
 
   return (
     <aside
@@ -302,17 +313,38 @@ export function MilestoneDetailPanel({
 
       {/* --- Action buttons --- */}
       <div className="flex flex-wrap items-center gap-2">
-        <Button
-          size="sm"
-          variant="default"
-          onClick={onRun}
-          disabled={runDisabled}
-          title={runTitle}
-          data-testid="milestone-detail-panel-run"
-        >
-          <RunIcon className="mr-1 h-4 w-4" />
-          {runLabel}
-        </Button>
+        {!completed && (
+          <Button
+            size="sm"
+            variant={showRerunFailed ? "outline" : "default"}
+            onClick={onRun}
+            disabled={runDisabled}
+            title={runTitle}
+            data-testid="milestone-detail-panel-run"
+          >
+            <RunIcon className="mr-1 h-4 w-4" />
+            {runLabel}
+          </Button>
+        )}
+        {showRerunFailed && (
+          <Button
+            size="sm"
+            variant="default"
+            onClick={onRerunFailed}
+            disabled={rerunFailedDisabled}
+            title={
+              autoExecRunning
+                ? "Auto-execution is already running for this milestone"
+                : `Re-queue ${failedTaskCount} failed task${failedTaskCount === 1 ? "" : "s"}`
+            }
+            data-testid="milestone-detail-panel-rerun-failed"
+          >
+            <RotateCcw className="mr-1 h-4 w-4" />
+            {rerunFailed.isPending
+              ? "Re-running…"
+              : `Re-run failed (${failedTaskCount})`}
+          </Button>
+        )}
         <Button
           size="sm"
           variant="outline"
@@ -373,13 +405,13 @@ export function MilestoneDetailPanel({
           <StatCell
             icon={<Timer className="h-3.5 w-3.5" aria-hidden />}
             label="Duration"
-            value={formatDuration(aggregate.durationMs)}
+            value={formatDurationMs(aggregate.durationMs)}
             testId="milestone-detail-panel-stat-duration"
           />
           <StatCell
             icon={<DollarSign className="h-3.5 w-3.5" aria-hidden />}
             label="Cost"
-            value={formatCost(aggregate.costUsd)}
+            value={formatCostPrecise(aggregate.costUsd)}
             testId="milestone-detail-panel-stat-cost"
           />
         </section>

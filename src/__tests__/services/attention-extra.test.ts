@@ -227,4 +227,133 @@ describe("task_approval title derivation", () => {
     expect(items.filter((i) => i.kind === "task_approval")).toHaveLength(0);
     sqlite.close();
   });
+
+  // ─── chat_question rows from agent_questions table ─────────────────────
+  // attention.ts §6 walks `agent_questions WHERE chatId IS NOT NULL AND
+  // status='pending'` and joins each row to its chat. Three branches need
+  // exercise:
+  //   • happy path → emits a chat_question item with projectId from the
+  //     joined chat row (line 342 — `chatRow.projectId ?? null` true side)
+  //   • chat row deleted under us → row skipped (line 336)
+  //   • chat with projectId=null → emit with projectId=null (line 342 falsy)
+  it("chat_question rows surface as chat_question items with the joined projectId", async () => {
+    const { db, sqlite } = createTestDb();
+    const { agentQuestions, chats: chatsTable } = await import(
+      "../../db/schema.js"
+    );
+    db.insert(projects).values({ name: "p1" }).run();
+    const chatRow = db
+      .insert(chatsTable)
+      .values({ projectId: 1, title: "c1" })
+      .returning()
+      .get()!;
+    db.insert(agentQuestions).values({
+      requestId: "cq-1",
+      chatId: chatRow.id,
+      toolUseId: "tu-cq-1",
+      question: "Pick a color",
+      status: "pending",
+      createdAt: "2099-06-01T00:00:00.000Z",
+    }).run();
+
+    const items = collectAttentionItems(db, new FakeRegistry());
+    const cq = items.filter((i) => i.kind === "chat_question");
+    expect(cq).toHaveLength(1);
+    expect(cq[0]).toMatchObject({
+      kind: "chat_question",
+      chatId: chatRow.id,
+      projectId: 1,
+      question: "Pick a color",
+    });
+    sqlite.close();
+  });
+
+  it("chat_question with projectId=null is preserved (workspace-level chat)", async () => {
+    const { db, sqlite } = createTestDb();
+    const { agentQuestions, chats: chatsTable } = await import(
+      "../../db/schema.js"
+    );
+    const chatRow = db
+      .insert(chatsTable)
+      .values({ projectId: null, title: "unattached" })
+      .returning()
+      .get()!;
+    db.insert(agentQuestions).values({
+      requestId: "cq-2",
+      chatId: chatRow.id,
+      toolUseId: "tu-cq-2",
+      question: "free-form?",
+      status: "pending",
+      createdAt: "2099-06-02T00:00:00.000Z",
+    }).run();
+
+    const items = collectAttentionItems(db, new FakeRegistry());
+    const cq = items.filter((i) => i.kind === "chat_question");
+    expect(cq).toHaveLength(1);
+    expect(cq[0]).toMatchObject({
+      kind: "chat_question",
+      chatId: chatRow.id,
+      projectId: null,
+    });
+    sqlite.close();
+  });
+
+  // task_question rows: section 5 walks `agent_questions WHERE taskId IS
+  // NOT NULL AND status='pending'`. The "task row exists but projectId is
+  // null → skip" branch (line 295) is the gap.
+  it("task_question rows are skipped when the joined task has projectId=null", async () => {
+    const { db, sqlite } = createTestDb();
+    const { agentQuestions, tasks: tasksTable } = await import(
+      "../../db/schema.js"
+    );
+    // Task row exists but projectId is null → skip
+    const t1 = db
+      .insert(tasksTable)
+      .values({ projectId: null, prompt: "p", status: "running" })
+      .returning()
+      .get()!;
+    db.insert(agentQuestions).values({
+      requestId: "tq-1",
+      taskId: t1.id,
+      toolUseId: "tu-tq-1",
+      question: "?",
+      status: "pending",
+      createdAt: "2099-07-01T00:00:00.000Z",
+    }).run();
+
+    const items = collectAttentionItems(db, new FakeRegistry());
+    expect(items.filter((i) => i.kind === "task_question")).toHaveLength(0);
+    sqlite.close();
+  });
+
+  it("task_question happy path emits a task_question item with the joined projectId", async () => {
+    const { db, sqlite } = createTestDb();
+    const { agentQuestions, tasks: tasksTable } = await import(
+      "../../db/schema.js"
+    );
+    db.insert(projects).values({ name: "p1" }).run();
+    const t = db
+      .insert(tasksTable)
+      .values({ projectId: 1, prompt: "p", status: "running" })
+      .returning()
+      .get()!;
+    db.insert(agentQuestions).values({
+      requestId: "tq-ok",
+      taskId: t.id,
+      toolUseId: "tu-tq-ok",
+      question: "Pick one",
+      status: "pending",
+      createdAt: "2099-07-03T00:00:00.000Z",
+    }).run();
+
+    const items = collectAttentionItems(db, new FakeRegistry());
+    const tq = items.filter((i) => i.kind === "task_question");
+    expect(tq).toHaveLength(1);
+    expect(tq[0]).toMatchObject({
+      kind: "task_question",
+      taskId: t.id,
+      projectId: 1,
+    });
+    sqlite.close();
+  });
 });

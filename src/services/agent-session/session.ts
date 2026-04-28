@@ -1,5 +1,10 @@
 import { EventEmitter } from "events";
-import { getAgentTools, executeToolCall } from "../agent-tools.js";
+import {
+  getAgentTools,
+  executeToolCall,
+  parseAskUserQuestionInput,
+  type ParsedAskUserQuestion,
+} from "../agent-tools.js";
 import { getAgent } from "../agents/registry.js";
 import type { AgentProvider } from "../agents/types.js";
 import {
@@ -465,6 +470,12 @@ export class AgentSession extends EventEmitter {
           ...(this.opts.thinkingEnabled !== undefined && { thinkingEnabled: this.opts.thinkingEnabled }),
           ...(this.opts.effort !== undefined && { effort: this.opts.effort }),
           ...(sdkOpts.useCanUseTool ? { canUseTool } : {}),
+          // Hook AskUserQuestion through the bridge so providers that run
+          // tools inside the SDK subprocess (Claude Code) route question
+          // requests back into our `pendingInteractive` flow. For providers
+          // that surface tool calls via `response.toolCalls` (Copilot et al.)
+          // the bridge is unused — `session.ts:606` still owns that path.
+          askUserQuestionHandler: (parsed, toolUseId) => this.awaitUserAnswer(toolUseId, parsed),
           onEvent: (event) => {
             if (event.type === "text") {
               streamedText = true;
@@ -599,11 +610,24 @@ export class AgentSession extends EventEmitter {
           this.emit("tool_call", tc.name, tc.input, null, tc.id ?? null);
           let result: string;
           if (tc.name === "AskUserQuestion") {
-            const question =
-              typeof (tc.input as any)?.question === "string"
-                ? ((tc.input as any).question as string)
-                : "";
-            result = await this.awaitUserAnswer(tc.id, question);
+            // Strict-validate the input through the shared Zod schema. On
+            // failure we relay an error string back to the agent as the
+            // tool_result content (mirrors the convention in
+            // executeToolCall — invalid inputs surface as `Error: …`
+            // strings, never as thrown exceptions that would crash the
+            // agentic loop) and DO NOT emit a question_request event, so
+            // no `agent_questions` row is written and no UI block is shown.
+            const parsed = parseAskUserQuestionInput(tc.input);
+            if (!parsed.ok) {
+              const issues = parsed.error.issues
+                .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+                .join("; ");
+              const msg = `Error: invalid AskUserQuestion input — ${issues}`;
+              console.error(`[agent-session] ${this.sessionPrefix()} AskUserQuestion validation failed: ${issues}`);
+              result = msg;
+            } else {
+              result = await this.awaitUserAnswer(tc.id, parsed.value);
+            }
           } else {
             result = executeToolCall(tc.name, tc.input, this.opts.workingDir, this.abortController.signal);
           }
@@ -644,11 +668,27 @@ export class AgentSession extends EventEmitter {
    * answer text once the UI calls `resolveQuestion(requestId, answerText)`.
    * On abort, resolves with a placeholder so the agentic loop can still
    * build a valid tool_result and unwind cleanly.
+   *
+   * `parsed` is the post-validation `AskUserQuestion` payload — `options`
+   * (already-empty arrays dropped by the parser), `multi_select` (defaults
+   * to false), and `header` ride into the `QuestionRequest` so executors
+   * persist the structured shape and WS subscribers see it on the
+   * `agent_question` frame.
    */
-  private awaitUserAnswer(toolUseID: string, question: string): Promise<string> {
+  private awaitUserAnswer(toolUseID: string, parsed: ParsedAskUserQuestion): Promise<string> {
     return new Promise<string>((resolve) => {
       const requestId = `q-${this.sessionPrefix()}-${++this.questionCounter}`;
-      const request: QuestionRequest = { requestId, question, toolUseID };
+      const request: QuestionRequest = {
+        requestId,
+        question: parsed.question,
+        toolUseID,
+        // `options` is omitted when absent (free-form) so consumers can
+        // distinguish "no options" from "empty options" without re-checking
+        // length. The parser already drops `[]` to undefined for us.
+        ...(parsed.options ? { options: parsed.options } : {}),
+        multiSelect: parsed.multi_select ?? false,
+        ...(parsed.header ? { header: parsed.header } : {}),
+      };
 
       const onAbort = () => {
         this.pendingInteractive.delete(requestId);

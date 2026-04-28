@@ -14,6 +14,17 @@ import type { ProjectTree } from "@/lib/types";
 // canned response — no fetch mocking needed.
 vi.mock("@/lib/hooks", () => ({
   useProjectTree: vi.fn(),
+  // Slice 11/04 added a `useMissions(projectId)` call inside the panel.
+  // These pre-mission tests don't exercise the mission grouping, so we
+  // always return an empty list — the panel falls back to its original
+  // flat-milestones layout and every assertion below stays valid.
+  useMissions: vi.fn(() => ({
+    data: { items: [] },
+    isLoading: false,
+    error: null,
+    isSuccess: true,
+    isError: false,
+  })),
 }));
 import { useProjectTree } from "@/lib/hooks";
 

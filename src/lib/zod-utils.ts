@@ -1,4 +1,4 @@
-import type { z } from "zod";
+import { z } from "zod";
 
 /**
  * Flatten a Zod error into a `{ field: messages[] }` map suitable for
@@ -12,3 +12,14 @@ export function flattenZodError(err: z.ZodError): Record<string, string[]> {
   }
   return out;
 }
+
+/**
+ * Shared schema for `{ id }` URL params — coerces to a positive integer.
+ *
+ * Replaces the 5+ inline copies (`tasks/permissions.ts`,
+ * `chats/questions.ts`, `chats/attachments.ts`, `chats/todos.ts`).
+ */
+export const positiveIdSchema = z.object({
+  id: z.coerce.number().int().positive(),
+});
+

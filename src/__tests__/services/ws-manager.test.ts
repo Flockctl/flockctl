@@ -170,4 +170,70 @@ describe("WSManager", () => {
   it("broadcastAll with no clients does nothing", () => {
     expect(() => WSManagerModule.wsManager.broadcastAll({ type: "test" })).not.toThrow();
   });
+
+  describe("broadcastChatAssistantFinal", () => {
+    it("emits a chat_assistant_final frame to global chat-list clients only", () => {
+      const global = { send: vi.fn(), readyState: 1 };
+      const scoped = { send: vi.fn(), readyState: 1 };
+      const task = { send: vi.fn(), readyState: 1 };
+
+      WSManagerModule.wsManager.addGlobalChatClient(global);
+      WSManagerModule.wsManager.addChatClient(7, scoped);
+      WSManagerModule.wsManager.addTaskClient(1, task);
+
+      WSManagerModule.wsManager.broadcastChatAssistantFinal(7, 123);
+
+      // Per-chat scoped + task clients must NOT receive this frame —
+      // scoped clients already react to session_ended and refetch.
+      expect(scoped.send).not.toHaveBeenCalled();
+      expect(task.send).not.toHaveBeenCalled();
+
+      expect(global.send).toHaveBeenCalledOnce();
+      const msg = JSON.parse(global.send.mock.calls[0][0]);
+      expect(msg.type).toBe("chat_assistant_final");
+      expect(msg.chat_id).toBe(7);
+      expect(msg.message_id).toBe(123);
+      expect(typeof msg.ts).toBe("number");
+      // No body / preview / title — frame is id-only.
+      expect(Object.keys(msg).sort()).toEqual(
+        ["chat_id", "message_id", "ts", "type"].sort(),
+      );
+    });
+
+    it("skips CLOSED global chat-list clients", () => {
+      const open = { send: vi.fn(), readyState: 1 };
+      const closed = { send: vi.fn(), readyState: 3 };
+      WSManagerModule.wsManager.addGlobalChatClient(open);
+      WSManagerModule.wsManager.addGlobalChatClient(closed);
+
+      WSManagerModule.wsManager.broadcastChatAssistantFinal(1, 2);
+
+      expect(open.send).toHaveBeenCalledOnce();
+      expect(closed.send).not.toHaveBeenCalled();
+    });
+
+    it("is a no-op when no global chat-list clients are connected", () => {
+      const scoped = { send: vi.fn(), readyState: 1 };
+      WSManagerModule.wsManager.addChatClient(7, scoped);
+      expect(() =>
+        WSManagerModule.wsManager.broadcastChatAssistantFinal(7, 1),
+      ).not.toThrow();
+      expect(scoped.send).not.toHaveBeenCalled();
+    });
+
+    it("tolerates clients that throw on send", () => {
+      const dead = {
+        send: vi.fn(() => { throw new Error("dead"); }),
+        readyState: 1,
+      };
+      const live = { send: vi.fn(), readyState: 1 };
+      WSManagerModule.wsManager.addGlobalChatClient(dead);
+      WSManagerModule.wsManager.addGlobalChatClient(live);
+
+      expect(() =>
+        WSManagerModule.wsManager.broadcastChatAssistantFinal(1, 2),
+      ).not.toThrow();
+      expect(live.send).toHaveBeenCalledOnce();
+    });
+  });
 });

@@ -54,7 +54,6 @@ ui/playwright-report/
 # ─── Flockctl (auto-managed — do not edit) ───
 .claude/skills/
 .mcp.json
-.flockctl/mcp-state.json
 .flockctl/.skills-reconcile
 .flockctl/.mcp-reconcile
 .flockctl/.agents-reconcile

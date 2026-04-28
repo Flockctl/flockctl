@@ -34,6 +34,16 @@ vi.mock("@/lib/hooks", async () => {
   return {
     ...actual,
     useProjectTree: (...args: unknown[]) => useProjectTreeMock(...args),
+    // Slice 11/04: ProjectTreePanel now also calls `useMissions(projectId)`.
+    // No QueryClient is wired up here, so shadow with an idle stub returning
+    // an empty list. The flat-tree assertions below are unaffected.
+    useMissions: () => ({
+      data: { items: [] },
+      isLoading: false,
+      error: null,
+      isSuccess: true,
+      isError: false,
+    }),
   };
 });
 

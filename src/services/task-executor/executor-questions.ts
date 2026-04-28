@@ -51,7 +51,7 @@ export function handleQuestionEmitted(taskId: number, request: QuestionRequest):
       .set({ status: TaskStatus.WAITING_FOR_INPUT, updatedAt: new Date().toISOString() })
       .where(eq(tasks.id, taskId))
       .run();
-    wsManager.broadcastAll({ type: "task_status", taskId, status: TaskStatus.WAITING_FOR_INPUT });
+    wsManager.broadcastTaskStatus(taskId, TaskStatus.WAITING_FOR_INPUT);
   }
 
   const backingChat = db
@@ -102,7 +102,7 @@ export function resolveQuestionHot(taskId: number, row: AgentQuestionRow, reques
       .set({ status: TaskStatus.RUNNING, updatedAt: new Date().toISOString() })
       .where(eq(tasks.id, taskId))
       .run();
-    wsManager.broadcastAll({ type: "task_status", taskId, status: TaskStatus.RUNNING });
+    wsManager.broadcastTaskStatus(taskId, TaskStatus.RUNNING);
   }
 
   const taskRef = { kind: "task", id: taskId } as const;
@@ -144,7 +144,7 @@ export function resolveQuestionCold(taskId: number, row: AgentQuestionRow, reque
     .set({ status: TaskStatus.QUEUED, updatedAt: new Date().toISOString() })
     .where(eq(tasks.id, taskId))
     .run();
-  wsManager.broadcastAll({ type: "task_status", taskId, status: TaskStatus.QUEUED });
+  wsManager.broadcastTaskStatus(taskId, TaskStatus.QUEUED);
   const taskRef = { kind: "task", id: taskId } as const;
   broadcastAgentQuestionResolved(taskRef, requestId, answer);
   const backingChat = db
@@ -164,13 +164,32 @@ export function resolveQuestionCold(taskId: number, row: AgentQuestionRow, reque
   return true;
 }
 
-/** Fetch pending questions for a task ordered oldest-first. */
+/**
+ * Fetch pending questions for a task ordered oldest-first.
+ *
+ * Symmetric with `chat-executor.ts:pendingQuestions` — surfaces the
+ * structured `options` / `multiSelect` / `header` columns alongside the
+ * question text so the task page can render the same single/multi-select
+ * picker the inbox renders. Without these fields the UI falls back to a
+ * text-only input even when the underlying `agent_questions` row has
+ * options (the bug surfaced when QA noticed the task page showed only
+ * "Type your answer…" while `/attention` rendered the radio group for
+ * the same question).
+ *
+ * `options` is parsed from the JSON-encoded text column. Malformed JSON
+ * collapses to `null` so a corrupt row never blocks page hydration —
+ * matches the forgiving rule used by both the chat path and
+ * `broadcastAgentQuestionFromRow` in `agent-interaction.ts`.
+ */
 export function listPendingQuestions(taskId: number): Array<{
   id: number;
   requestId: string;
   question: string;
   toolUseId: string;
   createdAt: string | null;
+  options: Array<{ label: string; description?: string; preview?: string }> | null;
+  multiSelect: boolean;
+  header: string | null;
 }> {
   const db = getDb();
   const rows = db
@@ -178,13 +197,35 @@ export function listPendingQuestions(taskId: number): Array<{
     .from(agentQuestions)
     .where(and(eq(agentQuestions.taskId, taskId), eq(agentQuestions.status, "pending")))
     .all();
+  /* v8 ignore start — createdAt has a DB default so r.createdAt is always
+     a populated string in practice; the `?? null` fallbacks are TS
+     null-safety glue that no test path exercises. */
   return rows
     .sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""))
-    .map((r) => ({
-      id: r.id,
-      requestId: r.requestId,
-      question: r.question,
-      toolUseId: r.toolUseId,
-      createdAt: r.createdAt ?? null,
-    }));
+    .map((r) => {
+      let parsedOptions:
+        | Array<{ label: string; description?: string; preview?: string }>
+        | null = null;
+      if (r.options != null) {
+        try {
+          const parsed = JSON.parse(r.options);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            parsedOptions = parsed;
+          }
+        } catch {
+          parsedOptions = null;
+        }
+      }
+      return {
+        id: r.id,
+        requestId: r.requestId,
+        question: r.question,
+        toolUseId: r.toolUseId,
+        createdAt: r.createdAt ?? null,
+        options: parsedOptions,
+        multiSelect: Boolean(r.multiSelect),
+        header: r.header ?? null,
+      };
+    });
+  /* v8 ignore stop */
 }

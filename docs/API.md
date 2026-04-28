@@ -649,7 +649,7 @@ The service (`src/services/incidents/service.ts#searchIncidents`) is also invoke
 
 ## Attention
 
-Aggregated list of blockers currently awaiting user action: tasks halted in `pending_approval`, chats halted in `approval_status='pending'` (opt-in via `chats.requiresApproval`), plus per-tool permission prompts on every active task and chat `AgentSession`. Read-only — there is no filter, no pagination, and no write counterpart; the UI filters client-side and refetches whenever the `attention_changed` WS event fires. Tool-call arguments are deliberately stripped (they can contain secrets) — only the tool name is surfaced.
+Aggregated list of blockers currently awaiting user action: tasks halted in `pending_approval`, chats halted in `approval_status='pending'` (opt-in via `chats.requiresApproval`), per-tool permission prompts on every active task and chat `AgentSession`, and pending `agent_questions` rows scoped to either a task (`task_question`) or chat (`chat_question`). Read-only — there is no filter, no pagination, and no write counterpart; the UI filters client-side and refetches whenever the `attention_changed` WS event fires. Tool-call arguments are deliberately stripped (they can contain secrets) — only the tool name is surfaced.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -686,6 +686,8 @@ Item shape varies by `kind`:
 - `chat_approval` — `{ kind, chatId, projectId, title, since }` (`projectId` is `null` for chats not attached to a project; `title` is the chat's `title` column or `""` when unset). Clear via `POST /chats/:id/{approve,reject}`.
 - `task_permission` — `{ kind, taskId, projectId, requestId, tool, since }`.
 - `chat_permission` — `{ kind, chatId, projectId, requestId, tool, since }` (`projectId` is `null` for chats not attached to a project).
+- `task_question` — `{ kind, requestId, taskId, projectId, question, header?, options?, multiSelect, createdAt }`. `options` (`Array<{ label, description?, preview? }>`) is omitted entirely (not `null`) for free-form prompts — the UI reads absence as "no picker, render a text input"; when present, `multiSelect` flips the renderer between radio and checkbox modes. `header` is omitted when the underlying `agent_questions` row has no chip label. Clear via `POST /tasks/:id/question/:requestId/answer`.
+- `chat_question` — `{ kind, requestId, chatId, projectId, question, header?, options?, multiSelect, createdAt }` — same shape as `task_question` but bound to a chat. `projectId` is `null` for chats not attached to a project. Clear via `POST /chats/:id/question/:requestId/answer`.
 
 Errors:
 - `401` — in remote mode, missing / invalid bearer token for a non-local request.
@@ -727,7 +729,7 @@ All WebSocket endpoints respect the same auth rules as REST: in remote mode, non
 
 Frames are JSON objects `{ type, payload }` broadcast to all connected clients. The UI reacts to the event, not to the payload.
 
-- `attention_changed` — payload `{ type: 'attention_changed' }`. Fired whenever the set of blockers returned by `GET /attention` changes (a task enters `pending_approval`, is approved/rejected, or a task/chat session raises/resolves a tool-permission request). Clients should refetch `GET /attention` on receipt.
+- `attention_changed` — payload `{ type: 'attention_changed' }`. Fired whenever the set of blockers returned by `GET /attention` changes (a task enters `pending_approval`, is approved/rejected, a task/chat session raises/resolves a tool-permission request, or an `agent_questions` row is created or answered for a task or chat). Clients should refetch `GET /attention` on receipt.
 - `chat_diff_updated` — payload `{ chat_id, summary, total_entries }`. Broadcast on the per-chat channel (`/ws/ui/chats/:chatId/events`) whenever an `Edit` / `Write` / `MultiEdit` tool call appends new entries to the chat's file-edit journal. Clients invalidate `GET /chats/:id/diff` on receipt so the "Changes" card at the bottom of the chat stays live.
 - `chat_permission_mode_changed` — payload `{ chat_id, previous, current }`. Broadcast on the per-chat channel whenever `PATCH /chats/:id` changes `permission_mode` while a chat session is in flight. Clients sync the permission-mode selector and clear any pending-permission card that the new mode has auto-resolved. Not fired when the effective mode is unchanged (no-op transition).
 

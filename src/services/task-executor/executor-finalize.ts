@@ -58,7 +58,7 @@ export function finalizeSuccess(args: FinalizeSuccessArgs): void {
     })
     .where(eq(tasks.id, taskId))
     .run();
-  wsManager.broadcastAll({ type: "task_status", taskId, status: finalStatus });
+  wsManager.broadcastTaskStatus(taskId, finalStatus);
   // Pending-approval tasks appear in GET /attention; notify clients so
   // they can re-fetch without waiting for the next poll.
   if (finalStatus === TaskStatus.PENDING_APPROVAL) {
@@ -94,7 +94,7 @@ export function finalizeError(args: FinalizeErrorArgs): void {
       .set({ status, exitCode: 1, errorMessage, completedAt: new Date().toISOString() })
       .where(eq(tasks.id, taskId))
       .run();
-    wsManager.broadcastAll({ type: "task_status", taskId, status });
+    wsManager.broadcastTaskStatus(taskId, status);
   }
   syncPlan(taskId);
 }

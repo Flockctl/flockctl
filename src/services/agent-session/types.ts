@@ -77,15 +77,38 @@ export interface PermissionRequest {
 }
 
 /**
+ * Single option entry in a multiple-choice `AskUserQuestion` payload. Mirrors
+ * the Claude Code harness shape — `label` is the visible chip text, while
+ * `description` and `preview` are optional metadata the UI can render
+ * alongside.
+ */
+export interface QuestionOption {
+  label: string;
+  description?: string;
+  preview?: string;
+}
+
+/**
  * Open-ended clarification question surfaced by the agent via the
  * `AskUserQuestion` tool. The session intercepts the tool_use, emits this
  * request, and awaits `resolveQuestion(requestId, answerText)` from the UI
  * before turning the answer into a `tool_result` back to the model.
+ *
+ * The optional `options` / `multiSelect` / `header` fields carry the
+ * harness-style multiple-choice shape forward end-to-end (DB row + WS
+ * payload). When `options` is absent or empty the prompt is free-form
+ * — backwards-compatible with the original 0029 model.
  */
 export interface QuestionRequest {
   requestId: string;
   question: string;
   toolUseID: string;
+  /** Optional structured choice list (max 20 items per harness convention). */
+  options?: QuestionOption[];
+  /** Whether the user may pick more than one option. Defaults to false. */
+  multiSelect?: boolean;
+  /** Short chip label rendered above the option list (≤ 12 chars typical). */
+  header?: string;
 }
 
 export interface AgentSessionMetrics {

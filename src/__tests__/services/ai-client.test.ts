@@ -1,10 +1,30 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-// Mock the Claude Agent SDK. We control what `query()` yields.
+// Mock the Claude Agent SDK. We control what `query()` yields. The
+// `createSdkMcpServer` / `tool` mocks return tagged sentinels so tests can
+// assert that the AskUserQuestion bridge wires through to the SDK without
+// needing the real in-process MCP-server runtime — the actual server is
+// opaque to the test and we only care that the right slot in `mcpServers`
+// got populated.
 const mockQuery = vi.fn();
+const mockCreateSdkMcpServer = vi.fn((opts: any) => ({
+  __mockMcpServer: true,
+  name: opts.name,
+  version: opts.version,
+  tools: opts.tools,
+}));
+const mockTool = vi.fn((name: string, description: string, inputSchema: any, handler: any) => ({
+  __mockTool: true,
+  name,
+  description,
+  inputSchema,
+  handler,
+}));
 
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   query: mockQuery,
+  createSdkMcpServer: (opts: any) => mockCreateSdkMcpServer(opts),
+  tool: (...args: any[]) => mockTool(...(args as [string, string, any, any])),
 }));
 
 // Mock renameClaudeSession — it's a dynamic import from ./claude-cli
@@ -17,6 +37,8 @@ import { createAIClient } from "../../services/ai/client.js";
 
 beforeEach(() => {
   mockQuery.mockReset();
+  mockCreateSdkMcpServer.mockClear();
+  mockTool.mockClear();
 });
 
 // Helper to build an async iterable for the mocked stream
@@ -272,5 +294,152 @@ it("throws AbortError when abortSignal already aborted", async () => {
     expect(emitted[0].type).toBe("user");
     expect(emitted[0].message.role).toBe("user");
     expect(emitted[0].message.content).toBe(blocks);
+  });
+});
+
+describe("createAIClient.chat — AskUserQuestion bridge wiring", () => {
+  // Regression coverage for the milestone "Structured agent questions +
+  // inbox integration" bug that landed task 432 in `done` after the inner
+  // agent called AskUserQuestion three times: the SDK's stubbed-headless
+  // built-in resolved with empty answers because Flockctl never registered
+  // an in-process override. These tests assert that when an
+  // `askUserQuestionHandler` is wired, the SDK options carry both
+  // `disallowedTools: ["AskUserQuestion"]` AND a `mcpServers.flockctl_host`
+  // entry — without that combination the bug recurs silently.
+
+  it("does NOT add disallowedTools or flockctl_host when no handler is provided", async () => {
+    let captured: any;
+    mockQuery.mockImplementationOnce((opts: any) => {
+      captured = opts;
+      return asStream([{ type: "result", result: "", session_id: "s", total_cost_usd: 0, usage: {} }]);
+    });
+
+    const client = createAIClient();
+    await client.chat({
+      model: "m",
+      system: "",
+      messages: [{ role: "user", content: "hi" }],
+    });
+
+    // Backward-compat: callers that don't ask for the bridge get the
+    // historic SDK invocation byte-identical to the pre-fix behavior.
+    expect(captured.options.disallowedTools).toBeUndefined();
+    expect(captured.options.mcpServers).toBeUndefined();
+    expect(mockCreateSdkMcpServer).not.toHaveBeenCalled();
+  });
+
+  it("registers the flockctl_host MCP server and disables AskUserQuestion when a handler is provided", async () => {
+    let captured: any;
+    mockQuery.mockImplementationOnce((opts: any) => {
+      captured = opts;
+      return asStream([{ type: "result", result: "", session_id: "s", total_cost_usd: 0, usage: {} }]);
+    });
+
+    const handler = vi.fn(async () => "the answer");
+
+    const client = createAIClient();
+    await client.chat({
+      model: "m",
+      system: "",
+      messages: [{ role: "user", content: "hi" }],
+      askUserQuestionHandler: handler,
+    });
+
+    // Built-in must be removed from the tool inventory — without this, the
+    // CLI subprocess auto-resolves AskUserQuestion before the model ever
+    // sees our override.
+    expect(captured.options.disallowedTools).toEqual(["AskUserQuestion"]);
+
+    // Override is registered as an in-process MCP server under the
+    // `flockctl_host` name. The model sees the tool as
+    // `mcp__flockctl_host__AskUserQuestion`.
+    expect(captured.options.mcpServers).toBeDefined();
+    expect(captured.options.mcpServers.flockctl_host).toBeDefined();
+    expect(captured.options.mcpServers.flockctl_host.__mockMcpServer).toBe(true);
+
+    // The single tool registered in the override must be named
+    // `AskUserQuestion` so namespace+name composes to the documented
+    // `mcp__flockctl_host__AskUserQuestion` identifier.
+    expect(mockTool).toHaveBeenCalledTimes(1);
+    expect(mockTool.mock.calls[0]![0]).toBe("AskUserQuestion");
+  });
+
+  it("preserves caller-supplied mcpServers alongside the bridge entry", async () => {
+    // Real callers pass project-resolved MCP servers (github, albs, etc.)
+    // via opts.mcpServers — the bridge MUST add to the map, not replace it,
+    // otherwise wiring AskUserQuestion would silently strip every other
+    // MCP integration the project relies on.
+    let captured: any;
+    mockQuery.mockImplementationOnce((opts: any) => {
+      captured = opts;
+      return asStream([{ type: "result", result: "", session_id: "s", total_cost_usd: 0, usage: {} }]);
+    });
+
+    const handler = vi.fn(async () => "answer");
+    const userMcpServers = {
+      github: { command: "/bin/gh-mcp" } as Record<string, unknown>,
+      albs: { command: "/bin/albs-mcp" } as Record<string, unknown>,
+    };
+
+    const client = createAIClient();
+    await client.chat({
+      model: "m",
+      system: "",
+      messages: [{ role: "user", content: "hi" }],
+      mcpServers: userMcpServers,
+      askUserQuestionHandler: handler,
+    });
+
+    expect(Object.keys(captured.options.mcpServers).sort()).toEqual([
+      "albs",
+      "flockctl_host",
+      "github",
+    ]);
+    expect(captured.options.mcpServers.github).toEqual({ command: "/bin/gh-mcp" });
+    expect(captured.options.mcpServers.albs).toEqual({ command: "/bin/albs-mcp" });
+  });
+
+  it("invokes the underlying handler when the bridge tool is called by the SDK", async () => {
+    // The bridge handler captured by `tool()` MUST round-trip a structured
+    // question through the user's `askUserQuestionHandler` — the SDK
+    // routes a `tool_use` for AskUserQuestion to this closure, so if the
+    // closure doesn't end up calling the user-supplied handler the agent
+    // will sit forever (or worse, the SDK will surface an exception).
+    mockQuery.mockImplementationOnce(() =>
+      asStream([{ type: "result", result: "", session_id: "s", total_cost_usd: 0, usage: {} }]),
+    );
+
+    const handler = vi.fn(async (_parsed: { question: string }, _id: string) => "user picked option A");
+
+    const client = createAIClient();
+    await client.chat({
+      model: "m",
+      system: "",
+      messages: [{ role: "user", content: "hi" }],
+      askUserQuestionHandler: handler as any,
+    });
+
+    // Now simulate the SDK calling the registered tool's handler closure
+    // exactly as it would when the agent emits a tool_use for AskUserQuestion.
+    const toolCall = mockTool.mock.calls[0];
+    if (!toolCall) throw new Error("expected tool() to have been called once");
+    const registeredHandler = toolCall[3] as (
+      args: any,
+      extra: any,
+    ) => Promise<{ content: Array<{ type: "text"; text: string }> }>;
+
+    const result = await registeredHandler(
+      {
+        questions: [{ question: "Pick one", options: [{ label: "A" }, { label: "B" }] }],
+      },
+      { toolUseId: "toolu_xyz" },
+    );
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    const handlerCall = handler.mock.calls[0];
+    if (!handlerCall) throw new Error("expected askUserQuestionHandler to have been called once");
+    expect(handlerCall[0].question).toBe("Pick one");
+    expect(handlerCall[1]).toBe("toolu_xyz");
+    expect(result.content[0]!.text).toBe("user picked option A");
   });
 });

@@ -3,24 +3,16 @@ import {
   useGlobalMcpServers,
   useWorkspaceMcpServers,
   useProjectMcpServers,
-  useCreateWorkspaceMcpServer,
-  useCreateProjectMcpServer,
   useDeleteWorkspaceMcpServer,
   useDeleteProjectMcpServer,
   useWorkspaceDisabledMcpServers,
   useToggleWorkspaceDisabledMcpServer,
   useProjectDisabledMcpServers,
   useToggleProjectDisabledMcpServer,
-  useGlobalSecrets,
-  useWorkspaceSecrets,
-  useProjectSecrets,
 } from "@/lib/hooks";
-import type { McpServer, McpServerConfig, SecretRecord } from "@/lib/types";
+import type { McpServer } from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Card,
@@ -28,225 +20,11 @@ import {
   CardTitle,
   CardContent,
 } from "@/components/ui/card";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Server, Plus, Trash2, Pencil, ChevronDown, ChevronRight, Eye, EyeOff, KeyRound } from "lucide-react";
+import { Server, Plus, Trash2, Pencil, ChevronDown, ChevronRight } from "lucide-react";
+import { DisableToggle } from "@/components/skills-mcp/DisableToggle";
+import { McpServerDialog } from "@/components/skills-mcp/McpServerDialog";
+import { levelColors } from "@/components/skills-mcp/shared";
 import { ConfirmDialog, useConfirmDialog } from "@/components/confirm-dialog";
-
-const levelColors: Record<string, string> = {
-  global: "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-300",
-  workspace: "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300",
-  project: "bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-300",
-};
-
-// --- MCP Dialog (create + edit) ---
-
-function McpDialog({
-  open,
-  onOpenChange,
-  level,
-  workspaceId,
-  projectId,
-  editServer,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  level: "workspace" | "project";
-  workspaceId: string;
-  projectId?: string;
-  editServer?: McpServer | null;
-}) {
-  const createWorkspace = useCreateWorkspaceMcpServer(workspaceId);
-  const createProject = useCreateProjectMcpServer(workspaceId, projectId ?? "");
-
-  const globalSecretsQ = useGlobalSecrets();
-  const workspaceSecretsQ = useWorkspaceSecrets(workspaceId);
-  const projectSecretsQ = useProjectSecrets(projectId ?? "");
-
-  const availableSecrets = useMemo<SecretRecord[]>(() => {
-    const map = new Map<string, SecretRecord>();
-    for (const s of globalSecretsQ.data?.secrets ?? []) map.set(s.name, s);
-    for (const s of workspaceSecretsQ.data?.secrets ?? []) map.set(s.name, s);
-    if (level === "project") {
-      for (const s of projectSecretsQ.data?.secrets ?? []) map.set(s.name, s);
-    }
-    return [...map.values()].sort((a, b) => a.name.localeCompare(b.name));
-  }, [globalSecretsQ.data, workspaceSecretsQ.data, projectSecretsQ.data, level]);
-
-  const [name, setName] = useState(editServer?.name ?? "");
-  const [command, setCommand] = useState(editServer?.config.command ?? "");
-  const [args, setArgs] = useState(editServer?.config.args?.join(" ") ?? "");
-  const [envVars, setEnvVars] = useState(
-    editServer?.config.env
-      ? Object.entries(editServer.config.env).map(([k, v]) => `${k}=${v}`).join("\n")
-      : "",
-  );
-  const [error, setError] = useState("");
-
-  function insertSecretPlaceholder(secretName: string) {
-    const placeholder = "${secret:" + secretName + "}";
-    setEnvVars((prev) => {
-      const trimmed = prev.replace(/\s+$/, "");
-      const prefix = trimmed ? trimmed + "\n" : "";
-      return prefix + `${secretName}=${placeholder}\n`;
-    });
-  }
-
-  const [prevEdit, setPrevEdit] = useState<McpServer | null | undefined>(undefined);
-  if (editServer !== prevEdit) {
-    setPrevEdit(editServer);
-    setName(editServer?.name ?? "");
-    setCommand(editServer?.config.command ?? "");
-    setArgs(editServer?.config.args?.join(" ") ?? "");
-    setEnvVars(
-      editServer?.config.env
-        ? Object.entries(editServer.config.env).map(([k, v]) => `${k}=${v}`).join("\n")
-        : "",
-    );
-    setError("");
-  }
-
-  function reset() {
-    setName("");
-    setCommand("");
-    setArgs("");
-    setEnvVars("");
-    setError("");
-  }
-
-  function handleClose(v: boolean) {
-    if (!v) reset();
-    onOpenChange(v);
-  }
-
-  async function handleSave() {
-    if (!name.trim() || !command.trim()) {
-      setError("Name and command are required");
-      return;
-    }
-    setError("");
-    try {
-      const config: McpServerConfig = { command: command.trim() };
-      if (args.trim()) config.args = args.split(/\s+/).filter(Boolean);
-      if (envVars.trim()) {
-        config.env = {};
-        for (const line of envVars.split("\n")) {
-          const eqIdx = line.indexOf("=");
-          if (eqIdx > 0) config.env[line.slice(0, eqIdx).trim()] = line.slice(eqIdx + 1).trim();
-        }
-      }
-      const data = { name: name.trim(), config };
-      if (level === "workspace") await createWorkspace.mutateAsync(data);
-      else await createProject.mutateAsync(data);
-      handleClose(false);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to save");
-    }
-  }
-
-  const isPending = createWorkspace.isPending || createProject.isPending;
-  const isEditing = !!editServer;
-
-  return (
-    <Dialog open={open} onOpenChange={handleClose}>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>{isEditing ? "Edit MCP Server" : "Add MCP Server"}</DialogTitle>
-          <DialogDescription>
-            {isEditing
-              ? `Edit the "${editServer.name}" MCP server at ${level} level.`
-              : `Configure a new MCP server at the ${level} level.`}
-          </DialogDescription>
-        </DialogHeader>
-        <div className="space-y-4">
-          <div className="space-y-2">
-            <Label htmlFor="mcp-name">Name</Label>
-            <Input
-              id="mcp-name"
-              placeholder="e.g. github"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              disabled={isEditing}
-            />
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="mcp-command">Command</Label>
-            <Input
-              id="mcp-command"
-              placeholder="e.g. npx"
-              value={command}
-              onChange={(e) => setCommand(e.target.value)}
-              className="font-mono text-sm"
-            />
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="mcp-args">Arguments (space-separated)</Label>
-            <Input
-              id="mcp-args"
-              placeholder="e.g. -y @modelcontextprotocol/server-github"
-              value={args}
-              onChange={(e) => setArgs(e.target.value)}
-              className="font-mono text-sm"
-            />
-          </div>
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <Label htmlFor="mcp-env">Environment variables (KEY=VALUE, one per line)</Label>
-              {availableSecrets.length > 0 && (
-                <Select value="" onValueChange={insertSecretPlaceholder}>
-                  <SelectTrigger className="h-7 w-[200px] text-xs">
-                    <SelectValue placeholder={
-                      <span className="flex items-center gap-1 text-muted-foreground">
-                        <KeyRound className="h-3 w-3" /> Insert secret…
-                      </span>
-                    } />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {availableSecrets.map((s) => (
-                      <SelectItem key={`${s.scope}-${s.id}`} value={s.name} className="font-mono text-xs">
-                        {s.name} <span className="text-muted-foreground">({s.scope})</span>
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              )}
-            </div>
-            <Textarea
-              id="mcp-env"
-              placeholder={"GITHUB_TOKEN=${secret:GITHUB_TOKEN}"}
-              value={envVars}
-              onChange={(e) => setEnvVars(e.target.value)}
-              className="min-h-[80px] font-mono text-sm"
-            />
-            <p className="text-xs text-muted-foreground">
-              Use <code className="rounded bg-muted px-1">{"${secret:NAME}"}</code> to reference a stored secret. Placeholders are resolved when Claude Code loads the server; the raw value never lives in the committed config.
-            </p>
-          </div>
-          {error && <p className="text-sm text-destructive">{error}</p>}
-        </div>
-        <DialogFooter>
-          <Button variant="outline" onClick={() => handleClose(false)}>Cancel</Button>
-          <Button onClick={handleSave} disabled={isPending}>
-            {isPending ? "Saving…" : "Save"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
-  );
-}
 
 // --- McpPanel ---
 
@@ -299,7 +77,20 @@ export function McpPanel({
   function isInheritedDisabled(server: McpServer): boolean {
     const key = `${server.level}:${server.name}`;
     if (level === "workspace") return wsDisabledSet.has(key);
-    return projDisabledSet.has(key);
+    // In the project view a server is effectively disabled if EITHER the
+    // workspace OR the project itself disables it. Workspace disables
+    // cascade to all child projects (see resolveMcpServersForProject) so the
+    // UI must mirror that — otherwise the server looks "enabled" here while
+    // the daemon has already filtered it out of the project's effective set.
+    return wsDisabledSet.has(key) || projDisabledSet.has(key);
+  }
+
+  // True only when the disable comes from the workspace (so the user can't
+  // toggle it off from the project view — it must be re-enabled at the
+  // workspace level).
+  function isDisabledByWorkspace(server: McpServer): boolean {
+    if (level !== "project") return false;
+    return wsDisabledSet.has(`${server.level}:${server.name}`);
   }
 
   function toggleInheritedDisable(server: McpServer) {
@@ -364,6 +155,7 @@ export function McpPanel({
                 const key = `${server.level}:${server.name}`;
                 const isExpanded = expandedServer === key;
                 const disabled = isInheritedDisabled(server);
+                const inheritedDisable = isDisabledByWorkspace(server);
                 const isPending =
                   level === "workspace" ? toggleWsDisabled.isPending : toggleProjDisabled.isPending;
                 return (
@@ -388,21 +180,22 @@ export function McpPanel({
                         {server.level}
                       </Badge>
                       {disabled && (
-                        <Badge variant="outline" className="text-xs">disabled</Badge>
+                        <Badge variant="outline" className="text-xs">
+                          {inheritedDisable ? "disabled by workspace" : "disabled"}
+                        </Badge>
                       )}
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-7 w-7"
-                        title={disabled ? `Enable at ${level}` : `Disable at ${level}`}
-                        disabled={isPending}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          toggleInheritedDisable(server);
-                        }}
-                      >
-                        {disabled ? <Eye className="h-3.5 w-3.5" /> : <EyeOff className="h-3.5 w-3.5" />}
-                      </Button>
+                      <DisableToggle
+                        disabled={disabled}
+                        title={
+                          inheritedDisable
+                            ? "Disabled at workspace level — re-enable in workspace settings"
+                            : disabled
+                              ? `Enable at ${level}`
+                              : `Disable at ${level}`
+                        }
+                        pending={isPending || inheritedDisable}
+                        onToggle={() => toggleInheritedDisable(server)}
+                      />
                     </div>
                     {isExpanded && (
                       <div className="px-3 pb-3 space-y-1 text-xs text-muted-foreground">
@@ -517,12 +310,12 @@ export function McpPanel({
         )}
       </CardContent>
 
-      <McpDialog
+      <McpServerDialog
         open={dialogOpen}
         onOpenChange={setDialogOpen}
-        level={level}
+        scope={level}
         workspaceId={workspaceId}
-        projectId={projectId}
+        projectId={projectId ?? ""}
         editServer={editServer}
       />
       <ConfirmDialog

@@ -72,7 +72,7 @@ vi.mock("../../services/agent-session/index", () => {
 vi.mock("../../services/ws-manager", () => ({
   wsManager: {
     broadcast: vi.fn(),
-    broadcastAll: vi.fn(),
+    broadcastAll: vi.fn(), broadcastTaskStatus: vi.fn(), broadcastChatStatus: vi.fn(),
     broadcastChat: vi.fn(),
     connections: new Map(),
   },

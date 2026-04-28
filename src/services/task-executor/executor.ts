@@ -35,6 +35,8 @@ import {
   finalizeSuccess,
   scheduleRetry,
 } from "./executor-finalize.js";
+import { classifyLimit } from "../agents/rate-limit-classifier.js";
+import { rateLimitScheduler } from "../agents/rate-limit-scheduler.js";
 
 export class TaskExecutor {
   private sessions = new Map<number, AgentSession>();
@@ -44,6 +46,18 @@ export class TaskExecutor {
   /** Set during graceful shutdown so in-flight aborts are recognized as restart-induced
    *  and don't mark tasks as cancelled — resetStaleTasks re-queues them on next boot. */
   private shuttingDown = false;
+
+  constructor() {
+    // Wire up the rate-limit scheduler so a parked task wakes up with a fresh
+    // session created from the same `claudeSessionId`. Done in the constructor
+    // so the singleton at module bottom is reachable from any caller — the
+    // bootstrap recovery in server-entry.ts only has to call
+    // `rateLimitScheduler.recoverFromDatabase()` and the handler is already
+    // attached.
+    rateLimitScheduler.registerHandler("task", (taskId: number) =>
+      this.resumeFromRateLimit(taskId),
+    );
+  }
 
   /** Compatibility setter used by tests; now interpreted as per-key capacity. */
   setMaxConcurrent(n: number) {
@@ -91,7 +105,7 @@ export class TaskExecutor {
       .set({ status: TaskStatus.FAILED, errorMessage: message, completedAt: new Date().toISOString() })
       .where(eq(tasks.id, taskId))
       .run();
-    wsManager.broadcastAll({ type: "task_status", taskId, status: TaskStatus.FAILED });
+    wsManager.broadcastTaskStatus(taskId, TaskStatus.FAILED);
   }
 
   private async _run(taskId: number, selectedKey: KeySelection | null): Promise<void> {
@@ -105,7 +119,7 @@ export class TaskExecutor {
       .where(eq(tasks.id, taskId))
       .run();
 
-    wsManager.broadcastAll({ type: "task_status", taskId, status: TaskStatus.RUNNING });
+    wsManager.broadcastTaskStatus(taskId, TaskStatus.RUNNING);
 
     const budgetResult = checkBudget(task.projectId);
     if (!budgetResult.allowed) {
@@ -123,7 +137,7 @@ export class TaskExecutor {
         .where(eq(tasks.id, taskId))
         .run();
 
-      wsManager.broadcastAll({ type: "task_status", taskId, status: TaskStatus.FAILED });
+      wsManager.broadcastTaskStatus(taskId, TaskStatus.FAILED);
       syncPlan(taskId);
       return;
     }
@@ -154,7 +168,7 @@ export class TaskExecutor {
         .set({ status: TaskStatus.FAILED, errorMessage: err.message, completedAt: new Date().toISOString() })
         .where(eq(tasks.id, taskId))
         .run();
-      wsManager.broadcastAll({ type: "task_status", taskId, status: TaskStatus.FAILED });
+      wsManager.broadcastTaskStatus(taskId, TaskStatus.FAILED);
       syncPlan(taskId);
       return;
     }
@@ -231,6 +245,21 @@ export class TaskExecutor {
       // resume via the persisted claudeSessionId).
       const isShutdown = err.reason === "shutdown" || (this.shuttingDown && err.name === "AbortError");
       if (isShutdown) {
+        return;
+      }
+
+      // Provider rate-limit / usage-limit detection. If the error matches the
+      // classifier (Anthropic 429, Pro/Max usage cap, Copilot quota), we PARK
+      // the task in `rate_limited` and arm a wake-up timer instead of failing
+      // it. The persisted `claudeSessionId` lets the scheduled resume continue
+      // the same SDK conversation. See rate-limit-classifier.ts for the full
+      // shape and rate-limit-scheduler.ts for the wake-up handler. This block
+      // MUST run before classifyRunError() — otherwise a 429 would be
+      // classified as a generic FAILED and trigger scheduleRetry, defeating
+      // the pause-and-resume behavior.
+      const limit = classifyLimit(err);
+      if (limit) {
+        this.parkRateLimited(taskId, limit.resumeAtMs, limit.rawMessage);
         return;
       }
 
@@ -346,12 +375,88 @@ export class TaskExecutor {
     const qIdx = this.queue.indexOf(taskId);
     if (qIdx !== -1) this.queue.splice(qIdx, 1);
 
+    // Tear down a pending rate-limit wake-up too — without this, a task
+    // cancelled during pause would still get resumed when the timer fires
+    // minutes later. cancel() is idempotent so calling for an unscheduled
+    // task is a no-op (matches the queue-removal contract above).
+    rateLimitScheduler.cancel("task", taskId);
+
     const session = this.sessions.get(taskId);
     if (session) {
       session.abort("user");
       return true;
     }
     return false;
+  }
+
+  /**
+   * Park a task that was just hit with a provider rate-limit / usage-limit.
+   * Persists the new status and `resume_at`, broadcasts via WS so the UI can
+   * show the countdown immediately, and arms the wake-up timer.
+   *
+   * No file-edit-journal flush here — the in-flight session never reached a
+   * tool boundary that would have populated the journal (the limit error is
+   * thrown from inside the SDK stream loop before any tool executes); for
+   * tasks that DID make edits before the failure, those were already persisted
+   * by the per-call `tool_call` listener in `_wireSessionEvents`.
+   */
+  private parkRateLimited(taskId: number, resumeAtMs: number, errorMessage: string): void {
+    const db = getDb();
+    db.update(tasks)
+      .set({
+        status: TaskStatus.RATE_LIMITED,
+        resumeAt: resumeAtMs,
+        errorMessage,
+      })
+      .where(eq(tasks.id, taskId))
+      .run();
+    // Broadcast snake_case `resume_at` to match the HTTP response shape (the
+     // UI's apiFetch converter spits out snake_case; WS frames bypass that
+     // converter so we have to match by hand).
+    wsManager.broadcastTaskStatus(taskId, TaskStatus.RATE_LIMITED, {
+      resume_at: resumeAtMs,
+    });
+    this.appendLog(
+      taskId,
+      `⏸ Rate limit hit — task parked, will resume at ${new Date(resumeAtMs).toISOString()}`,
+      "stderr",
+    );
+    rateLimitScheduler.schedule({ kind: "task", id: taskId, resumeAtMs });
+    syncPlan(taskId);
+  }
+
+  /**
+   * Wake-up handler invoked by the rate-limit scheduler. Flips the parked
+   * task back to `queued` (the `claudeSessionId` is preserved on the row, so
+   * `_run()` will pass it as `resumeSessionId` to the new AgentSession),
+   * clears `resumeAt`, then dispatches via the normal execute() path. If the
+   * limit is still in force, the next failure will park it again with an
+   * escalated `resumeAt` (the classifier's MIN/MAX lattice handles this; the
+   * scheduler does not need to track attempt count itself because each park
+   * call simply replaces the prior timer).
+   *
+   * Cancellation safety: a user DELETE during pause flips the task to
+   * `cancelled`. This handler MUST refuse to resume a cancelled row — the
+   * scheduler's own cancel() also tears down the timer when the route runs,
+   * but a tiny race window exists where the timer fires between the DB write
+   * and the cancel() call. The status guard below closes that.
+   */
+  private async resumeFromRateLimit(taskId: number): Promise<void> {
+    const db = getDb();
+    const row = db.select().from(tasks).where(eq(tasks.id, taskId)).get();
+    if (!row) return;
+    if (row.status !== TaskStatus.RATE_LIMITED) {
+      // Status changed under us (cancel race / manual DB edit / second timer)
+      // — leave the row alone.
+      return;
+    }
+    db.update(tasks)
+      .set({ status: TaskStatus.QUEUED, resumeAt: null, errorMessage: null })
+      .where(eq(tasks.id, taskId))
+      .run();
+    wsManager.broadcastTaskStatus(taskId, TaskStatus.QUEUED);
+    this.appendLog(taskId, `▶ Resuming after rate-limit pause`, "stdout");
+    void this.execute(taskId);
   }
 
   private handleQuestionEmitted(taskId: number, request: QuestionRequest): void {
@@ -394,13 +499,25 @@ export class TaskExecutor {
     return true;
   }
 
-  /** Pending questions awaiting a UI answer for this task, newest-first. */
+  /**
+   * Pending questions awaiting a UI answer for this task, oldest-first.
+   *
+   * Mirrors `chat-executor.pendingQuestions` shape — including the parsed
+   * `options` JSON, `multiSelect`, and `header` so the task page can render
+   * the same single/multi-select picker the inbox renders. Without those
+   * fields the UI fell back to a text-only input even when the row had
+   * structured options (see `executor-questions.ts:listPendingQuestions`
+   * for the full rationale).
+   */
   pendingQuestions(taskId: number): Array<{
     id: number;
     requestId: string;
     question: string;
     toolUseId: string;
     createdAt: string | null;
+    options: Array<{ label: string; description?: string; preview?: string }> | null;
+    multiSelect: boolean;
+    header: string | null;
   }> {
     return listPendingQuestions(taskId);
   }
@@ -444,6 +561,10 @@ export class TaskExecutor {
       session.abort("shutdown");
     }
     this.queue.length = 0;
+    // Tear down rate-limit wake-up timers so the daemon can exit cleanly.
+    // The persisted `tasks.resume_at` survives — `recoverFromDatabase()`
+    // re-arms timers on the next boot from those rows.
+    rateLimitScheduler.cancelAll();
   }
 
   private appendLog(taskId: number, content: string, streamType: string) {

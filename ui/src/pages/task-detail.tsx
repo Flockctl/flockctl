@@ -594,6 +594,18 @@ export default function TaskDetailPage() {
         <AgentQuestionPrompt
           question={agentQuestion.question}
           requestId={agentQuestion.requestId}
+          // Picker-mode fields (M05 slice 02). Both REST hydration
+          // (`fetchAgentQuestions` → `pendingQuestions` in task-executor)
+          // and live WS frames (`useTaskStream`'s `agent_question` branch)
+          // populate these — we just forward whichever shape landed in the
+          // cache. Undefined/null collapses to free-form. Without this
+          // forward the task page renders only the textarea even when the
+          // underlying question carries structured `options` (the bug QA
+          // hit when /attention rendered the radio group correctly but
+          // the task page showed only "Type your answer…").
+          {...(agentQuestion.options ? { options: agentQuestion.options } : {})}
+          multiSelect={agentQuestion.multiSelect ?? false}
+          {...(agentQuestion.header ? { header: agentQuestion.header } : {})}
           onAnswer={async (answer) => {
             await answerAgentQuestionMutation.mutateAsync({
               kind: "task",

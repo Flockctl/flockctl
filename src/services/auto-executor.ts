@@ -1,15 +1,42 @@
 import { getDb } from "../db/index.js";
 import { tasks, projects } from "../db/schema.js";
-import { and, eq, inArray, or, isNotNull } from "drizzle-orm";
+import { and, eq, or, isNotNull } from "drizzle-orm";
 import { computeWaves, type DependencyItem } from "./dependency-graph.js";
 import { taskExecutor } from "./task-executor/index.js";
 import { wsManager } from "./ws-manager.js";
 import {
   listMilestones, listSlices, listPlanTasks,
   updateMilestone, updateSlice, updatePlanTask,
-  getMilestone, getPlanDir,
+  getPlanDir,
 } from "./plan-store/index.js";
 import { join } from "path";
+import {
+  TaskStatus,
+  MilestoneStatus,
+  SliceStatus,
+  PlanTaskStatus,
+} from "../lib/types.js";
+import { TypedEventEmitter } from "./typed-event-emitter.js";
+
+/**
+ * Synthetic terminal status emitted by the stalled-detector cron when a task
+ * has been `running` past the wall-clock + idle thresholds without reaching
+ * a real terminal state. Not a real DB status — never persisted to
+ * `tasks.status`. Lives on the event payload only so the missions
+ * subscriber can route it through to the supervisor with `status='stalled'`.
+ */
+export const STALLED_SYNTHETIC_STATUS = "stalled" as const;
+
+export interface TaskTerminalEvent {
+  taskId: number;
+  status:
+    | (typeof TaskStatus)[keyof typeof TaskStatus]
+    | typeof STALLED_SYNTHETIC_STATUS;
+  error?: string;
+  depth?: number;
+}
+
+export const taskTerminalEvents = new TypedEventEmitter<TaskTerminalEvent>();
 
 interface AutoExecutorState {
   projectId: number;
@@ -57,7 +84,7 @@ export function getAutoExecutionStatus(milestoneSlug: string): { running: boolea
 
 async function executeMilestone(state: AutoExecutorState): Promise<void> {
   // Update milestone status
-  updateMilestone(state.projectPath, state.milestoneSlug, { status: "active" });
+  updateMilestone(state.projectPath, state.milestoneSlug, { status: MilestoneStatus.ACTIVE });
 
   // Get all slices for this milestone
   const slices = listSlices(state.projectPath, state.milestoneSlug);
@@ -92,22 +119,22 @@ async function executeMilestone(state: AutoExecutorState): Promise<void> {
 
   // Update milestone status based on final slice states
   const finalSlices = listSlices(state.projectPath, state.milestoneSlug);
-  const allCompleted = finalSlices.every(s => s.status === "completed");
-  const anyFailed = finalSlices.some(s => s.status === "failed");
+  const allCompleted = finalSlices.every(s => s.status === SliceStatus.COMPLETED);
+  const anyFailed = finalSlices.some(s => s.status === SliceStatus.FAILED);
 
   updateMilestone(state.projectPath, state.milestoneSlug, {
-    status: allCompleted ? "completed" : anyFailed ? "active" : "active",
+    status: allCompleted ? MilestoneStatus.COMPLETED : anyFailed ? MilestoneStatus.ACTIVE : MilestoneStatus.ACTIVE,
   });
 }
 
 async function executeSlice(state: AutoExecutorState, sliceSlug: string): Promise<void> {
   // Skip already completed/failed slices
   const currentSlice = listSlices(state.projectPath, state.milestoneSlug).find(s => s.slug === sliceSlug);
-  if (currentSlice && (currentSlice.status === "completed" || currentSlice.status === "failed")) return;
+  if (currentSlice && (currentSlice.status === SliceStatus.COMPLETED || currentSlice.status === SliceStatus.FAILED)) return;
 
   // Update slice status
-  updateSlice(state.projectPath, state.milestoneSlug, sliceSlug, { status: "active" });
-  wsManager.broadcastAll({ type: "slice_status", sliceSlug, status: "active" });
+  updateSlice(state.projectPath, state.milestoneSlug, sliceSlug, { status: SliceStatus.ACTIVE });
+  wsManager.broadcastAll({ type: "slice_status", sliceSlug, status: SliceStatus.ACTIVE });
 
   // Get all tasks for this slice
   const sliceTasks = listPlanTasks(state.projectPath, state.milestoneSlug, sliceSlug);
@@ -140,10 +167,10 @@ async function executeSlice(state: AutoExecutorState, sliceSlug: string): Promis
 
   // Update slice status
   const finalTasks = listPlanTasks(state.projectPath, state.milestoneSlug, sliceSlug);
-  const allCompleted = finalTasks.every(t => t.status === "completed");
-  const anyFailed = finalTasks.some(t => t.status === "failed");
+  const allCompleted = finalTasks.every(t => t.status === PlanTaskStatus.COMPLETED);
+  const anyFailed = finalTasks.some(t => t.status === PlanTaskStatus.FAILED);
 
-  const newStatus = allCompleted ? "completed" : anyFailed ? "failed" : "active";
+  const newStatus = allCompleted ? SliceStatus.COMPLETED : anyFailed ? SliceStatus.FAILED : SliceStatus.ACTIVE;
   updateSlice(state.projectPath, state.milestoneSlug, sliceSlug, { status: newStatus });
   wsManager.broadcastAll({ type: "slice_status", sliceSlug, status: newStatus });
 }
@@ -157,10 +184,10 @@ async function executePlanTask(state: AutoExecutorState, sliceSlug: string, task
   if (!planTask) return;
 
   // Skip already completed/failed tasks
-  if (planTask.status === "completed" || planTask.status === "failed") return;
+  if (planTask.status === PlanTaskStatus.COMPLETED || planTask.status === PlanTaskStatus.FAILED) return;
 
   // Update plan task status
-  updatePlanTask(state.projectPath, state.milestoneSlug, sliceSlug, taskSlug, { status: "active" });
+  updatePlanTask(state.projectPath, state.milestoneSlug, sliceSlug, taskSlug, { status: PlanTaskStatus.ACTIVE });
 
   // Reuse an existing non-terminal execution task if the plan file already
   // points at one — re-triggering auto-execution must not spawn a duplicate
@@ -169,10 +196,14 @@ async function executePlanTask(state: AutoExecutorState, sliceSlug: string, task
   if (planTask.executionTaskId) {
     const existing = db.select().from(tasks).where(eq(tasks.id, planTask.executionTaskId)).get();
     if (existing && (
-      existing.status === "queued" ||
-      existing.status === "running" ||
-      existing.status === "pending_approval" ||
-      existing.status === "waiting_for_input"
+      existing.status === TaskStatus.QUEUED ||
+      existing.status === TaskStatus.RUNNING ||
+      existing.status === TaskStatus.PENDING_APPROVAL ||
+      existing.status === TaskStatus.WAITING_FOR_INPUT ||
+      // Rate-limited tasks are not terminal — the row owns a session_id and
+      // will resume at `resume_at`. Treat them as live so the auto-executor
+      // doesn't spawn a duplicate execution while the original is parked.
+      existing.status === TaskStatus.RATE_LIMITED
     )) {
       execTask = { id: existing.id };
     }
@@ -213,17 +244,17 @@ async function executePlanTask(state: AutoExecutorState, sliceSlug: string, task
         return;
       }
 
-      if (t.status === "done") {
+      if (t.status === TaskStatus.DONE) {
         clearInterval(checkInterval);
-        updatePlanTask(state.projectPath, state.milestoneSlug, sliceSlug, taskSlug, { status: "completed" });
+        updatePlanTask(state.projectPath, state.milestoneSlug, sliceSlug, taskSlug, { status: PlanTaskStatus.COMPLETED });
         resolve();
       /* v8 ignore start — the "cancelled"/"timed_out" alternatives live on
          the same interval-driven path as "failed"; tests exercise the
          "failed" limb plus the aborted/deleted-row limb above. The remaining
          two terminal statuses follow the identical branch. */
-      } else if (t.status === "failed" || t.status === "cancelled" || t.status === "timed_out") {
+      } else if (t.status === TaskStatus.FAILED || t.status === TaskStatus.CANCELLED || t.status === TaskStatus.TIMED_OUT) {
         clearInterval(checkInterval);
-        updatePlanTask(state.projectPath, state.milestoneSlug, sliceSlug, taskSlug, { status: "failed" });
+        updatePlanTask(state.projectPath, state.milestoneSlug, sliceSlug, taskSlug, { status: PlanTaskStatus.FAILED });
         reject(new Error(`Task ${t.id} ${t.status}`));
       }
       /* v8 ignore stop */
@@ -263,18 +294,18 @@ export function reconcilePlanStatuses(): number {
         try { planTasks = listPlanTasks(project.path, m.slug, s.slug); } catch { continue; }
 
         for (const pt of planTasks) {
-          if (!pt.executionTaskId || pt.status === "completed" || pt.status === "failed") continue;
+          if (!pt.executionTaskId || pt.status === PlanTaskStatus.COMPLETED || pt.status === PlanTaskStatus.FAILED) continue;
 
           const execTask = db.select().from(tasks).where(eq(tasks.id, pt.executionTaskId)).get();
           if (!execTask) continue;
 
-          if (execTask.status === "done") {
-            updatePlanTask(project.path, m.slug, s.slug, pt.slug, { status: "completed" });
+          if (execTask.status === TaskStatus.DONE) {
+            updatePlanTask(project.path, m.slug, s.slug, pt.slug, { status: PlanTaskStatus.COMPLETED });
             reconciled++;
           /* v8 ignore start — same terminal-status triple as L210; one limb
              is tested ("failed"), the other two follow the identical path. */
-          } else if (execTask.status === "failed" || execTask.status === "cancelled" || execTask.status === "timed_out") {
-            updatePlanTask(project.path, m.slug, s.slug, pt.slug, { status: "failed" });
+          } else if (execTask.status === TaskStatus.FAILED || execTask.status === TaskStatus.CANCELLED || execTask.status === TaskStatus.TIMED_OUT) {
+            updatePlanTask(project.path, m.slug, s.slug, pt.slug, { status: PlanTaskStatus.FAILED });
             reconciled++;
           }
           /* v8 ignore stop */
@@ -282,20 +313,20 @@ export function reconcilePlanStatuses(): number {
 
         // Re-check slice status after reconciling its tasks
         const updatedTasks = listPlanTasks(project.path, m.slug, s.slug);
-        const allCompleted = updatedTasks.length > 0 && updatedTasks.every(t => t.status === "completed");
-        const anyFailed = updatedTasks.some(t => t.status === "failed");
-        if (allCompleted && s.status !== "completed") {
-          updateSlice(project.path, m.slug, s.slug, { status: "completed" });
-        } else if (anyFailed && s.status !== "failed") {
-          updateSlice(project.path, m.slug, s.slug, { status: "failed" });
+        const allCompleted = updatedTasks.length > 0 && updatedTasks.every(t => t.status === PlanTaskStatus.COMPLETED);
+        const anyFailed = updatedTasks.some(t => t.status === PlanTaskStatus.FAILED);
+        if (allCompleted && s.status !== SliceStatus.COMPLETED) {
+          updateSlice(project.path, m.slug, s.slug, { status: SliceStatus.COMPLETED });
+        } else if (anyFailed && s.status !== SliceStatus.FAILED) {
+          updateSlice(project.path, m.slug, s.slug, { status: SliceStatus.FAILED });
         }
       }
 
       // Re-check milestone status
       const updatedSlices = listSlices(project.path, m.slug);
-      const allSlicesCompleted = updatedSlices.length > 0 && updatedSlices.every(s => s.status === "completed");
-      if (allSlicesCompleted && m.status !== "completed") {
-        updateMilestone(project.path, m.slug, { status: "completed" });
+      const allSlicesCompleted = updatedSlices.length > 0 && updatedSlices.every(s => s.status === SliceStatus.COMPLETED);
+      if (allSlicesCompleted && m.status !== MilestoneStatus.COMPLETED) {
+        updateMilestone(project.path, m.slug, { status: MilestoneStatus.COMPLETED });
       }
     }
   }
@@ -354,10 +385,15 @@ export function cancelOrphanedExecutionTasks(): number {
       and(
         isNotNull(tasks.promptFile),
         or(
-          eq(tasks.status, "queued"),
-          eq(tasks.status, "running"),
-          eq(tasks.status, "pending_approval"),
-          eq(tasks.status, "waiting_for_input"),
+          eq(tasks.status, TaskStatus.QUEUED),
+          eq(tasks.status, TaskStatus.RUNNING),
+          eq(tasks.status, TaskStatus.PENDING_APPROVAL),
+          eq(tasks.status, TaskStatus.WAITING_FOR_INPUT),
+          // Same rationale as the `live` check above — `rate_limited` is a
+          // non-terminal pause, so a parked execution task that gets orphaned
+          // by a plan repoint should still be cancelled rather than left as a
+          // ghost wake-up timer firing against a dead plan.
+          eq(tasks.status, TaskStatus.RATE_LIMITED),
         ),
       ),
     )
@@ -374,7 +410,7 @@ export function cancelOrphanedExecutionTasks(): number {
 
     db.update(tasks)
       .set({
-        status: "cancelled",
+        status: TaskStatus.CANCELLED,
         errorMessage: "Orphaned by plan repoint — superseded by a newer execution task",
         completedAt: new Date().toISOString(),
       })
@@ -432,16 +468,16 @@ function aggregateSliceStatus(projectPath: string, milestoneSlug: string, sliceS
   /* v8 ignore next — defensive: aggregator is only reached after a plan
      task was just updated, so the slice always has at least one task. */
   if (!planTasks.length) return;
-  const allCompleted = planTasks.every(t => t.status === "completed");
-  const anyFailed = planTasks.some(t => t.status === "failed");
-  const anyActive = planTasks.some(t => t.status === "active");
+  const allCompleted = planTasks.every(t => t.status === PlanTaskStatus.COMPLETED);
+  const anyFailed = planTasks.some(t => t.status === PlanTaskStatus.FAILED);
+  const anyActive = planTasks.some(t => t.status === PlanTaskStatus.ACTIVE);
   /* v8 ignore start — the "pending" fallback requires every task to sit
      in a non-completed/failed/active status at aggregation time, which
      tests don't stage (plan tasks are always "active" while running). */
-  const newStatus = allCompleted ? "completed"
-    : anyActive ? "active"
-    : anyFailed ? "failed"
-    : "pending";
+  const newStatus = allCompleted ? SliceStatus.COMPLETED
+    : anyActive ? SliceStatus.ACTIVE
+    : anyFailed ? SliceStatus.FAILED
+    : SliceStatus.PENDING;
   /* v8 ignore stop */
   const current = listSlices(projectPath, milestoneSlug).find(s => s.slug === sliceSlug);
   /* v8 ignore next — current is always populated (slice just updated);
@@ -453,10 +489,10 @@ function aggregateSliceStatus(projectPath: string, milestoneSlug: string, sliceS
   }
 
   const slices = listSlices(projectPath, milestoneSlug);
-  const allSlicesCompleted = slices.length > 0 && slices.every(s => s.status === "completed");
+  const allSlicesCompleted = slices.length > 0 && slices.every(s => s.status === SliceStatus.COMPLETED);
   const m = listMilestones(projectPath).find(mm => mm.slug === milestoneSlug);
-  if (allSlicesCompleted && m && m.status !== "completed") {
-    updateMilestone(projectPath, milestoneSlug, { status: "completed" });
+  if (allSlicesCompleted && m && m.status !== MilestoneStatus.COMPLETED) {
+    updateMilestone(projectPath, milestoneSlug, { status: MilestoneStatus.COMPLETED });
   }
 }
 
@@ -469,7 +505,7 @@ export function repointPlanTask(previousTaskId: number, newTaskId: number): bool
   if (!loc) return false;
   updatePlanTask(loc.projectPath, loc.milestoneSlug, loc.sliceSlug, loc.taskSlug, {
     executionTaskId: newTaskId,
-    status: "active",
+    status: PlanTaskStatus.ACTIVE,
   });
   aggregateSliceStatus(loc.projectPath, loc.milestoneSlug, loc.sliceSlug);
   return true;
@@ -487,14 +523,22 @@ export function syncPlanFromExecutionTask(taskId: number): void {
   const loc = findPlanTaskByExecutionId(taskId);
   if (!loc) return;
 
-  const planStatus = execTask.status === "done" ? "completed"
-    : execTask.status === "failed" || execTask.status === "cancelled" || execTask.status === "timed_out" ? "failed"
-    : execTask.status === "running" || execTask.status === "pending_approval" ? "active"
+  const planStatus = execTask.status === TaskStatus.DONE ? PlanTaskStatus.COMPLETED
+    : execTask.status === TaskStatus.FAILED || execTask.status === TaskStatus.CANCELLED || execTask.status === TaskStatus.TIMED_OUT ? PlanTaskStatus.FAILED
+    : execTask.status === TaskStatus.RUNNING || execTask.status === TaskStatus.PENDING_APPROVAL ? PlanTaskStatus.ACTIVE
     : null;
   if (!planStatus) return;
 
   updatePlanTask(loc.projectPath, loc.milestoneSlug, loc.sliceSlug, loc.taskSlug, { status: planStatus });
   aggregateSliceStatus(loc.projectPath, loc.milestoneSlug, loc.sliceSlug);
+
+  if (planStatus === PlanTaskStatus.COMPLETED || planStatus === PlanTaskStatus.FAILED) {
+    taskTerminalEvents.emit({
+      taskId,
+      status: execTask.status as TaskTerminalEvent["status"],
+      error: execTask.errorMessage ?? undefined,
+    });
+  }
 }
 
 /**
@@ -511,11 +555,11 @@ export function resumeStaleMilestones(): void {
     try { milestones = listMilestones(project.path); } catch { continue; }
 
     for (const m of milestones) {
-      if (m.status !== "active") continue;
+      if (m.status !== MilestoneStatus.ACTIVE) continue;
 
       // Check if there are still pending/active slices or tasks to do
       const slices = listSlices(project.path, m.slug);
-      const hasWork = slices.some(s => s.status !== "completed" && s.status !== "failed");
+      const hasWork = slices.some(s => s.status !== SliceStatus.COMPLETED && s.status !== SliceStatus.FAILED);
       if (!hasWork) continue;
 
       console.log(`Resuming auto-execution for milestone "${m.slug}" in project ${project.id}`);
