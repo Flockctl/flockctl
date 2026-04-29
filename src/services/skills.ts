@@ -15,6 +15,22 @@ export interface Skill {
   level: SkillLevel;
   sourceDir: string;
   content?: string;
+  /**
+   * `true` for skills sourced directly from the project's own
+   * `<project>/.claude/skills/<name>/SKILL.md` when the project opted in via
+   * `projects.use_project_claude_skills`. These bypass the per-project
+   * `disabledSkills` filter (the operator opted them in at create-time and
+   * cannot turn them off through the UI toggle list) and the reconciler skips
+   * symlink writes for them — the source already lives at the destination.
+   */
+  locked?: boolean;
+  /**
+   * `true` when `sourceDir` IS the path the skills reconciler would otherwise
+   * write a symlink to (i.e. `<project>/.claude/skills/<name>`). Used by
+   * `writeSymlinks()` to skip both deletion and re-creation for these
+   * entries — the directory is the user's real content, not a Flockctl link.
+   */
+  nativeInTarget?: boolean;
 }
 
 function loadSkillsFromDir(dir: string, level: SkillLevel): Skill[] {
@@ -29,6 +45,37 @@ function loadSkillsFromDir(dir: string, level: SkillLevel): Skill[] {
     }
   }
   return skills;
+}
+
+/**
+ * Walk `<projectPath>/.claude/skills/<name>/SKILL.md` and return one Skill per
+ * entry, marked locked + nativeInTarget. Used only when the project opted in
+ * via `projects.use_project_claude_skills` (see migration 0045).
+ *
+ * Symlinks inside `.claude/skills/` are deliberately ignored: those are the
+ * Flockctl-managed view written by `writeSymlinks()`, not the user's own
+ * content. Only real directories with a real `SKILL.md` count as a project
+ * source — otherwise a stale symlink would shadow the global / workspace
+ * skill of the same name and the override would be invisible to the operator.
+ */
+function loadProjectClaudeSkills(projectPath: string): Skill[] {
+  const dir = join(projectPath, ".claude", "skills");
+  if (!existsSync(dir)) return [];
+  const out: Skill[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const skillDir = join(dir, entry.name);
+    const skillFile = join(skillDir, "SKILL.md");
+    if (!existsSync(skillFile)) continue;
+    out.push({
+      name: entry.name,
+      level: "project",
+      sourceDir: skillDir,
+      locked: true,
+      nativeInTarget: true,
+    });
+  }
+  return out;
 }
 
 function disabledNamesForLevel(entries: DisableEntry[] | undefined, level: SkillLevel): Set<string> {
@@ -95,6 +142,18 @@ export function resolveSkillsForProject(projectId?: number | null): Skill[] {
     const projSkillsDir = join(project.path, ".flockctl", "skills");
     for (const s of loadSkillsFromDir(projSkillsDir, "project")) {
       if (!projDisabledProject.has(s.name)) out.set(s.name, s);
+    }
+
+    // Project-owned skills sourced from `<project>/.claude/skills/<name>/SKILL.md`.
+    // Opt-in per migration 0045: `projects.use_project_claude_skills`. Locked
+    // entries override anything at lower precedence (global / workspace /
+    // `.flockctl/skills/`) AND ignore the per-project `disabledSkills` list,
+    // so the operator's create-time opt-in cannot be silently undone via the
+    // skills toggle UI.
+    if (project.useProjectClaudeSkills) {
+      for (const s of loadProjectClaudeSkills(project.path)) {
+        out.set(s.name, s);
+      }
     }
   }
 

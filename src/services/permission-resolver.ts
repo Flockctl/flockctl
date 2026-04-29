@@ -120,9 +120,10 @@ export function isPathWithinRoots(path: string, roots: string[]): boolean {
 // - `Bash` — reliable shell-command parsing is out of scope. `Bash` remains
 //   prompt-gated in `auto` mode; users on `bypassPermissions`/`acceptEdits`
 //   can still `cat` these files. Document as a known gap in SECURITY.md.
-// - `Grep` recursive scans — `ripgrep` respects `.gitignore` and `.mcp.json`
-//   is always gitignored by `ensureGitignore()`, so recursive scans already
-//   skip it in practice. We still deny explicit `Grep(path=…/.mcp.json)`.
+// - `Grep` recursive scans — `ripgrep` respects both `.gitignore` and
+//   `.git/info/exclude`, and `.mcp.json` is always written into the latter
+//   by `ensureGitExclude()`, so recursive scans already skip it in practice.
+//   We still deny explicit `Grep(path=…/.mcp.json)`.
 
 /** Basenames denied at the top level of `flockctlRoot()`. */
 const DENIED_IN_FLOCKCTL_ROOT = new Set([

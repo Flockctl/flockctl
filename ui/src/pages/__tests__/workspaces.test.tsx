@@ -81,6 +81,7 @@ function makeProject(overrides: Partial<Project>): Project {
     gitignore_flockctl: false,
     gitignore_todo: false,
     gitignore_agents_md: false,
+    use_project_claude_skills: false,
     created_at: "2026-04-23T00:00:00.000Z",
     updated_at: "2026-04-23T00:00:00.000Z",
     ...overrides,

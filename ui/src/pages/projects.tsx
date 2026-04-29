@@ -235,6 +235,10 @@ function CreateProjectDialog() {
   const [gitignoreToggles, setGitignoreToggles] = useState<GitignoreTogglesValue>(
     DEFAULT_GITIGNORE_TOGGLES,
   );
+  // Per-project opt-in to honour `<project>/.claude/skills/` as a locked,
+  // non-disableable skill source (DB-backed; migration 0045). Default off —
+  // the user has to tick the matching checkbox in the dialog to opt in.
+  const [useProjectClaudeSkills, setUseProjectClaudeSkills] = useState(false);
   const createProject = useCreateProject();
   const { data: workspacesList } = useWorkspaces({});
   const { data: aiKeys } = useAIKeys();
@@ -255,6 +259,7 @@ function CreateProjectDialog() {
     setPickerOpen(false);
     setAllowedKeyIds([]);
     setGitignoreToggles(DEFAULT_GITIGNORE_TOGGLES);
+    setUseProjectClaudeSkills(false);
   }
 
   // Resolve the picker's starting directory: prefer whatever the user has
@@ -361,11 +366,17 @@ function CreateProjectDialog() {
       data.importActions = scan.proposedActions;
     }
 
-    // Only forward toggles the user actually enabled — omitting preserves the
-    // server-side default of `false` and keeps the wire payload minimal.
-    if (gitignoreToggles.gitignore_flockctl) data.gitignore_flockctl = true;
-    if (gitignoreToggles.gitignore_todo) data.gitignore_todo = true;
-    if (gitignoreToggles.gitignore_agents_md) data.gitignore_agents_md = true;
+    // Always forward the full toggle triplet. Now that the API defaults are
+    // (true, true, false) — see `DEFAULT_GITIGNORE_TOGGLES` — sending only
+    // the truthy fields would make "the user UNchecked the default" silently
+    // collapse to "default" on the server. Always-send keeps the server's
+    // row in lockstep with the form state regardless of the next default flip.
+    data.gitignore_flockctl = gitignoreToggles.gitignore_flockctl;
+    data.gitignore_todo = gitignoreToggles.gitignore_todo;
+    data.gitignore_agents_md = gitignoreToggles.gitignore_agents_md;
+    // Project `.claude/skills/` opt-in (locked, non-disableable). Always send
+    // so unticking persists — server defaults to `false` only when omitted.
+    data.use_project_claude_skills = useProjectClaudeSkills;
 
     try {
       await createProject.mutateAsync(data);
@@ -558,6 +569,41 @@ function CreateProjectDialog() {
             onChange={setGitignoreToggles}
             idPrefix="cp-gi"
           />
+          {/*
+            Project-owned skills opt-in. Lives directly under the gitignore
+            toggles because both are DB-backed flags reconciled into the
+            project tree on save. Unticked by default — the operator has to
+            explicitly opt in for `<project>/.claude/skills/` to count as a
+            skill source.
+          */}
+          <div className="space-y-2">
+            <Label>Project skills source</Label>
+            <label
+              htmlFor="cp-use-claude-skills"
+              className="flex items-start gap-2 rounded-md border p-3 text-sm"
+            >
+              <Checkbox
+                id="cp-use-claude-skills"
+                checked={useProjectClaudeSkills}
+                onCheckedChange={(next) =>
+                  setUseProjectClaudeSkills(next === true)
+                }
+              />
+              <span className="flex-1">
+                <span className="block leading-tight">
+                  Use skills from this project's <code>.claude/skills/</code>
+                </span>
+                <span className="block text-xs text-muted-foreground">
+                  Every <code>SKILL.md</code> under the project's{" "}
+                  <code>.claude/skills/</code> directory becomes a locked,
+                  always-on skill that overrides any same-name skill from
+                  global / workspace / <code>.flockctl/skills/</code>. Locked
+                  skills bypass the per-skill disable list — they cannot be
+                  turned off through the skills toggles.
+                </span>
+              </span>
+            </label>
+          </div>
             {formError && (
               <p className="text-sm text-destructive">{formError}</p>
             )}

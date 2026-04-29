@@ -114,7 +114,7 @@ Flockctl exposes a named key/value secrets store (scoped `global` / `workspace` 
 
 Claude Code itself cannot expand `${secret:NAME}` placeholders, so Flockctl's MCP reconciler (`src/services/claude/mcp-sync.ts`) resolves secrets and writes the substituted values directly into `<project>/.mcp.json` — the file Claude Code actually reads. This file is therefore treated as confidential:
 
-1. It is **always gitignored** by `ensureGitignore()` (adds `.mcp.json` to `.gitignore` on every reconcile).
+1. It is **always excluded** by `ensureGitExclude()` (adds `.mcp.json` to `.git/info/exclude` on every reconcile — local-only, never tracked).
 2. The **source-of-truth configs** under `.flockctl/mcp/<server>.json` keep `${secret:NAME}` placeholders — those are the files agents and humans should edit.
 3. An **agent-tool denylist** (`denyIfTouchesSensitivePath` in `src/services/permission-resolver.ts`) blocks Read/Grep/Glob/LS/Write/Edit/MultiEdit/NotebookRead/NotebookEdit on:
    - `<flockctlRoot>/secret.key`

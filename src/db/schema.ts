@@ -29,11 +29,14 @@ export const workspaces = sqliteTable("workspaces", {
   repoUrl: text("repo_url"),
   allowedKeyIds: text("allowed_key_ids"),
   // ─── Gitignore toggles (migration 0038) ───
-  // Opt-in flags consumed by `ensureGitignore()` (src/services/claude/skills-sync.ts):
+  // Opt-in flags consumed by `ensureGitExclude()` (src/services/claude/skills-sync.ts).
+  // Despite the historical `gitignore*` column names, these now drive entries
+  // in `.git/info/exclude` (local-only, never tracked) — column names are
+  // preserved to avoid a breaking schema migration:
   //   gitignoreFlockctl  → adds `.flockctl/` (and drops its granular sub-paths)
   //   gitignoreTodo      → adds root-level `TODO.md`
   //   gitignoreAgentsMd  → adds root-level `AGENTS.md` and `CLAUDE.md`
-  // All default false so existing repos keep their current .gitignore shape.
+  // All default false so existing repos keep their current exclude shape.
   gitignoreFlockctl: integer("gitignore_flockctl", { mode: "boolean" }).default(false).notNull(),
   gitignoreTodo: integer("gitignore_todo", { mode: "boolean" }).default(false).notNull(),
   gitignoreAgentsMd: integer("gitignore_agents_md", { mode: "boolean" }).default(false).notNull(),
@@ -58,10 +61,27 @@ export const projects = sqliteTable("projects", {
   allowedKeyIds: text("allowed_key_ids"),
   deniedKeyIds: text("denied_key_ids"),
   // ─── Gitignore toggles (migration 0038) ───
-  // See workspaces.gitignore* for semantics; same defaults (all false).
+  // See workspaces.gitignore* for semantics. The schema-level DEFAULTs are
+  // still 0/false (changing a SQLite column DEFAULT requires a table rebuild),
+  // but the user-facing defaults applied by the create endpoints (POST
+  // /projects, POST /workspaces/:id/projects) and the create-dialog UI are:
+  //   gitignoreFlockctl  → true  (hide `.flockctl/` from git)
+  //   gitignoreTodo      → true  (hide `TODO.md`)
+  //   gitignoreAgentsMd  → false (AGENTS.md is the only Flockctl trace
+  //                              that should remain visible in the repo)
+  // So a project created via the API ends up with the first two on by default.
   gitignoreFlockctl: integer("gitignore_flockctl", { mode: "boolean" }).default(false).notNull(),
   gitignoreTodo: integer("gitignore_todo", { mode: "boolean" }).default(false).notNull(),
   gitignoreAgentsMd: integer("gitignore_agents_md", { mode: "boolean" }).default(false).notNull(),
+  // ─── Project-owned skills opt-in (migration 0045) ───
+  // When true, `resolveSkillsForProject()` also walks
+  // `<project>/.claude/skills/<name>/SKILL.md` and treats each entry as a
+  // `level='project'` skill that overrides any same-name entry from
+  // global / workspace / `.flockctl/skills/`. Such skills are marked
+  // `locked: true` and bypass the per-project `disabledSkills` filter —
+  // the user opted into them at project-creation time, so they cannot be
+  // disabled through the regular skills toggle UI.
+  useProjectClaudeSkills: integer("use_project_claude_skills", { mode: "boolean" }).default(false).notNull(),
   createdAt: text("created_at").default(sql`(datetime('now'))`),
   updatedAt: text("updated_at").default(sql`(datetime('now'))`),
 });

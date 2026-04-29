@@ -316,6 +316,13 @@
       "when": 1754200000000,
       "tag": "0044_add_rate_limit_pause",
       "breakpoints": true
+    },
+    {
+      "idx": 45,
+      "version": "5",
+      "when": 1754300000000,
+      "tag": "0045_add_use_project_claude_skills",
+      "breakpoints": true
     }
   ]
 }

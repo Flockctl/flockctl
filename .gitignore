@@ -50,13 +50,3 @@ test-results/
 playwright-report/
 ui/test-results/
 ui/playwright-report/
-
-# ─── Flockctl (auto-managed — do not edit) ───
-.claude/skills/
-.mcp.json
-.flockctl/.skills-reconcile
-.flockctl/.mcp-reconcile
-.flockctl/.agents-reconcile
-.flockctl/import-backup/
-.flockctl/plan/
-# ─── /Flockctl ───

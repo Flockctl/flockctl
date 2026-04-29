@@ -90,6 +90,11 @@ export function ConfigTab({ projectId }: { projectId: string }) {
   const [gitignoreToggles, setGitignoreToggles] = useState<GitignoreTogglesValue>(
     DEFAULT_GITIGNORE_TOGGLES,
   );
+  // Per-project opt-in for honouring `<project>/.claude/skills/` as a locked,
+  // non-disableable skill source (DB-backed; migration 0045). Defaults to
+  // `false` until the user ticks the matching checkbox below or in the
+  // create dialog.
+  const [useProjectClaudeSkills, setUseProjectClaudeSkills] = useState(false);
 
   // --- Config fields ---
   const [postTaskCmd, setPostTaskCmd] = useState("");
@@ -115,6 +120,7 @@ export function ConfigTab({ projectId }: { projectId: string }) {
         gitignore_todo: project.gitignore_todo ?? false,
         gitignore_agents_md: project.gitignore_agents_md ?? false,
       });
+      setUseProjectClaudeSkills(project.use_project_claude_skills ?? false);
     }
   }, [project]);
 
@@ -184,6 +190,10 @@ export function ConfigTab({ projectId }: { projectId: string }) {
           gitignore_flockctl: gitignoreToggles.gitignore_flockctl,
           gitignore_todo: gitignoreToggles.gitignore_todo,
           gitignore_agents_md: gitignoreToggles.gitignore_agents_md,
+          // Always send the current value so a flip from `true` → `false`
+          // is persisted (omission would be treated as "leave unchanged" by
+          // the PATCH handler).
+          use_project_claude_skills: useProjectClaudeSkills,
         },
       });
 
@@ -295,6 +305,8 @@ export function ConfigTab({ projectId }: { projectId: string }) {
         setEnvVarsText={setEnvVarsText}
         gitignoreToggles={gitignoreToggles}
         setGitignoreToggles={setGitignoreToggles}
+        useProjectClaudeSkills={useProjectClaudeSkills}
+        setUseProjectClaudeSkills={setUseProjectClaudeSkills}
         projectPath={project.path}
       />
 

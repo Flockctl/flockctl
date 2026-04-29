@@ -20,6 +20,8 @@ import {
   ChevronRight,
   Menu,
   X,
+  PanelLeftClose,
+  PanelLeftOpen,
 } from "lucide-react";
 import { useTheme } from "@/components/theme-provider";
 import { ServerSwitcher } from "@/components/server-switcher";
@@ -27,12 +29,17 @@ import { SidebarFooter } from "@/components/sidebar-footer";
 import { ConnectionBanner } from "@/components/connection-banner";
 import { useAttention } from "@/lib/hooks";
 import { AttentionNotificationsRunner } from "@/lib/hooks/use-attention-notifications";
+import { ChatReplyNotificationsRunner } from "@/lib/hooks/use-chat-reply-notifications";
 import { NotificationClickRouterRunner } from "@/lib/hooks/use-notification-click-router";
 import { TaskTerminalNotificationsRunner } from "@/lib/hooks/use-task-terminal-notifications";
 import {
   toggleGroupCollapsed,
   useGroupCollapsed,
 } from "@/lib/sidebar-collapse-store";
+import {
+  toggleSidebarRailCollapsed,
+  useSidebarRailCollapsed,
+} from "@/lib/sidebar-rail-store";
 
 type BadgeKey = "attention";
 
@@ -90,9 +97,16 @@ const navGroups: NavGroup[] = [
 type NavGroupSectionProps = {
   group: NavGroup;
   badgeCounts: Record<BadgeKey, number>;
+  /**
+   * When true, the sidebar is in icon-only "rail" mode. Group headers are
+   * hidden, items render as centered icons with the label exposed via the
+   * native `title` tooltip, and per-group collapse is bypassed (everything
+   * is always visible because there's nothing to hide besides the icon).
+   */
+  rail?: boolean;
 };
 
-function NavGroupSection({ group, badgeCounts }: NavGroupSectionProps) {
+function NavGroupSection({ group, badgeCounts, rail = false }: NavGroupSectionProps) {
   const collapsed = useGroupCollapsed(group.id);
   const contentId = `nav-group-${group.id}`;
 
@@ -101,6 +115,43 @@ function NavGroupSection({ group, badgeCounts }: NavGroupSectionProps) {
   const rollup = group.items.reduce((sum, item) => {
     return sum + (item.badgeKey ? badgeCounts[item.badgeKey] ?? 0 : 0);
   }, 0);
+
+  // Rail mode: flat icon-only list, no group header, no per-group collapse.
+  if (rail) {
+    return (
+      <div className="flex flex-col gap-1 pt-2">
+        {group.items.map(({ to, label, icon: Icon, badgeKey }) => {
+          const count = badgeKey ? badgeCounts[badgeKey] : 0;
+          const showBadge = count > 0;
+          return (
+            <NavLink
+              key={to}
+              to={to}
+              title={label}
+              aria-label={label}
+              className={({ isActive }) =>
+                `relative flex items-center justify-center rounded-md p-2 transition-colors ${
+                  isActive
+                    ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                    : "text-sidebar-foreground/70 hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"
+                }`
+              }
+            >
+              <Icon className="h-4 w-4" />
+              {showBadge && (
+                <span
+                  aria-label={`${count} item${count === 1 ? "" : "s"} needing attention`}
+                  className="absolute -right-0.5 -top-0.5 inline-flex min-w-[16px] items-center justify-center rounded-full bg-destructive px-1 text-[9px] font-semibold leading-4 text-destructive-foreground"
+                >
+                  {count > 99 ? "99+" : count}
+                </span>
+              )}
+            </NavLink>
+          );
+        })}
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col">
@@ -185,6 +236,10 @@ export default function Layout() {
   // rendered as a slide-in overlay when `mobileNavOpen` is true. On md+ the
   // sidebar is always visible (static column) and this state is ignored.
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  // Desktop "rail" state — when true, the md+ sidebar collapses to an
+  // icon-only column. Mobile drawer always renders in full-width form
+  // because the rail layout doesn't make sense as a transient overlay.
+  const railCollapsed = useSidebarRailCollapsed();
   const location = useLocation();
 
   // Auto-close the mobile drawer whenever the route changes so a tap on a
@@ -204,20 +259,43 @@ export default function Layout() {
     };
   }, [mobileNavOpen]);
 
-  // The sidebar is identical between desktop and mobile — it's just the
-  // wrapping element that changes (static `aside` vs fixed-position drawer).
-  // Keeping the body in a render fn avoids duplicating the nav markup.
-  const renderSidebarBody = () => (
+  // The sidebar body is shared between the static desktop column and the
+  // mobile slide-in drawer. The `rail` flag is desktop-only — the mobile
+  // drawer always passes `false` because an icon-only overlay would be
+  // both confusing (no labels, but the drawer is full-screen wide) and
+  // pointless (the drawer auto-closes on navigation anyway).
+  const renderSidebarBody = (rail: boolean) => (
     <>
-      <div className="flex h-14 items-center justify-between px-4">
-        <span className="font-semibold tracking-tight">Flockctl</span>
+      <div
+        className={`flex h-14 items-center ${
+          rail ? "justify-center px-2" : "justify-between px-4"
+        }`}
+      >
+        {!rail && <span className="font-semibold tracking-tight">Flockctl</span>}
         <div className="flex items-center gap-1">
+          {!rail && (
+            <button
+              onClick={() => setTheme(nextTheme)}
+              className="rounded-md p-1.5 text-sidebar-foreground/70 transition-colors hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"
+              title={`Theme: ${theme}`}
+            >
+              <ThemeIcon className="h-4 w-4" />
+            </button>
+          )}
+          {/* Rail toggle — desktop-only. Hidden inside the mobile drawer
+              because the drawer's own close button already collapses it. */}
           <button
-            onClick={() => setTheme(nextTheme)}
-            className="rounded-md p-1.5 text-sidebar-foreground/70 transition-colors hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground"
-            title={`Theme: ${theme}`}
+            onClick={toggleSidebarRailCollapsed}
+            className="hidden rounded-md p-1.5 text-sidebar-foreground/70 transition-colors hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground md:inline-flex"
+            title={rail ? "Expand sidebar" : "Collapse sidebar"}
+            aria-label={rail ? "Expand sidebar" : "Collapse sidebar"}
+            aria-expanded={!rail}
           >
-            <ThemeIcon className="h-4 w-4" />
+            {rail ? (
+              <PanelLeftOpen className="h-4 w-4" />
+            ) : (
+              <PanelLeftClose className="h-4 w-4" />
+            )}
           </button>
           {/* Close button only shows inside the mobile drawer — on desktop
               the sidebar is always visible so there's nothing to close. */}
@@ -231,21 +309,34 @@ export default function Layout() {
         </div>
       </div>
       <Separator />
-      <div className="p-2">
-        <ServerSwitcher />
-      </div>
-      <Separator />
-      <nav className="flex flex-1 flex-col overflow-y-auto px-2 pb-2">
+      {!rail && (
+        <>
+          <div className="p-2">
+            <ServerSwitcher />
+          </div>
+          <Separator />
+        </>
+      )}
+      <nav
+        className={`flex flex-1 flex-col overflow-y-auto pb-2 ${
+          rail ? "px-1.5" : "px-2"
+        }`}
+      >
         {navGroups.map((group) => (
           <NavGroupSection
             key={group.id}
             group={group}
             badgeCounts={badgeCounts}
+            rail={rail}
           />
         ))}
       </nav>
-      <Separator />
-      <SidebarFooter />
+      {!rail && (
+        <>
+          <Separator />
+          <SidebarFooter />
+        </>
+      )}
     </>
   );
 
@@ -272,6 +363,18 @@ export default function Layout() {
       */}
       <TaskTerminalNotificationsRunner />
       {/*
+        Chat-reply → notification pump. Sibling of the attention and
+        task-terminal runners (mounted here for the same per-tab WS
+        baseline reason). Listens to global WS `chat_assistant_final`
+        frames and forwards them into the dispatcher with
+        `category: "chatReply"` so users get an OS notification when
+        the agent finishes its turn — regardless of which page they're
+        currently on. Lived inside `useChatListLiveState` until M16/01
+        but only fired while the user was on `/chats`; the bridge was
+        hoisted here so the pump survives navigation.
+      */}
+      <ChatReplyNotificationsRunner />
+      {/*
         Notification → SPA route bridge. Subscribes to the dispatcher's
         synthetic `notification-click` bus and navigates to the route
         chosen by `routeForNotification`. MUST live inside the router
@@ -280,9 +383,16 @@ export default function Layout() {
         in main.tsx would crash.
       */}
       <NotificationClickRouterRunner />
-      {/* Desktop sidebar — static column, hidden below md. */}
-      <aside className="hidden w-56 shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground md:flex">
-        {renderSidebarBody()}
+      {/* Desktop sidebar — static column, hidden below md. Width animates
+          between full (w-56) and rail (w-14) modes; transition-[width] keeps
+          the layout shift smooth without jumping the main content column. */}
+      <aside
+        className={`hidden shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground transition-[width] duration-150 ease-out md:flex ${
+          railCollapsed ? "w-14" : "w-56"
+        }`}
+        data-rail={railCollapsed ? "true" : "false"}
+      >
+        {renderSidebarBody(railCollapsed)}
       </aside>
 
       {/* Mobile drawer — fixed overlay, only mounted below md while open.
@@ -297,7 +407,7 @@ export default function Layout() {
             aria-hidden="true"
           />
           <aside className="fixed inset-y-0 left-0 z-50 flex w-64 max-w-[85vw] flex-col border-r bg-sidebar text-sidebar-foreground shadow-xl md:hidden">
-            {renderSidebarBody()}
+            {renderSidebarBody(false)}
           </aside>
         </>
       )}

@@ -15,7 +15,6 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { TodoMdDialog } from "@/components/todo-md-dialog";
 
 import { ConfigTab } from "./project-detail-components/ConfigTab";
-import { CreateTaskFromProjectDialog } from "./project-detail-components/CreateTaskFromProjectDialog";
 import { MissionControlKpiBar } from "./project-detail-components/MissionControlKpiBar";
 import { PlanTab } from "./project-detail-components/PlanTab";
 import { RunsTab } from "./project-detail-components/RunsTab";
@@ -174,11 +173,6 @@ export default function ProjectDetailPage() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <CreateTaskFromProjectDialog
-              projectId={projectId}
-              repoUrl={project?.repo_url ?? null}
-              baseBranch={baseBranch}
-            />
             {/*
               Per redesign brief: the project-level "Chat" button used to
               open a project-scoped chat; it's been folded into the Plan

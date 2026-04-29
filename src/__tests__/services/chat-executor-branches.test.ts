@@ -15,7 +15,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "events";
 import { createTestDb } from "../helpers.js";
-import { chats, agentQuestions, chatMessages } from "../../db/schema.js";
+import { chats, agentQuestions, chatMessages, tasks } from "../../db/schema.js";
 import { and, eq } from "drizzle-orm";
 
 class FakeSession extends EventEmitter {
@@ -313,6 +313,88 @@ describe("ChatExecutor — branch coverage extras", () => {
     expect(payload.name).toBe("Grep");
 
     chatExecutorModule.chatExecutor.unregister(chat.id);
+  });
+
+  it("cancel() marks pending agent_questions as 'cancelled' and broadcasts agent_question_resolved so the UI can clear the stuck card", () => {
+    const ws = { send: vi.fn(), readyState: 1 };
+    wsManagerModule.wsManager.addGlobalChatClient(ws);
+
+    const chat = db.insert(chats).values({ title: "stuck" }).returning().get()!;
+    const session = new FakeSession();
+    chatExecutorModule.chatExecutor.register(chat.id, session as any);
+
+    // Simulate two open AskUserQuestion cards on this chat.
+    session.emit("question_request", {
+      requestId: "q-stuck-1",
+      question: "What does the button do?",
+      toolUseID: "tu-stuck-1",
+    });
+    session.emit("question_request", {
+      requestId: "q-stuck-2",
+      question: "Confirm path",
+      toolUseID: "tu-stuck-2",
+    });
+    ws.send.mockClear();
+
+    // User presses Stop while the question is open.
+    const cancelled = chatExecutorModule.chatExecutor.cancel(chat.id);
+    expect(cancelled).toBe(true);
+    expect(session.abort).toHaveBeenCalledTimes(1);
+
+    // DB rows transitioned to 'cancelled' — answerQuestion would now reject
+    // them with a clean 409 instead of leaving the chat stuck.
+    const rows = db.select().from(agentQuestions)
+      .where(eq(agentQuestions.chatId, chat.id))
+      .all();
+    expect(rows).toHaveLength(2);
+    for (const r of rows) {
+      expect(r.status).toBe("cancelled");
+      expect(r.answer).toBe("(question cancelled)");
+      expect(r.answeredAt).not.toBeNull();
+    }
+
+    // Both rows broadcast `agent_question_resolved` — the UI listener filters
+    // them out of the React Query cache, removing the stuck question card.
+    const resolvedFrames = ws.send.mock.calls
+      .map((c: any[]) => JSON.parse(c[0]))
+      .filter((m: any) => m.type === "agent_question_resolved");
+    const resolvedIds = resolvedFrames.map((f: any) => f.payload.request_id).sort();
+    expect(resolvedIds).toEqual(["q-stuck-1", "q-stuck-2"]);
+
+    chatExecutorModule.chatExecutor.unregister(chat.id);
+  });
+
+  it("sweepOrphanedChatQuestions() cancels pending chat-bound rows on boot but leaves task-bound rows alone", () => {
+    const chat = db.insert(chats).values({ title: "orphan" }).returning().get()!;
+    db.insert(agentQuestions).values({
+      requestId: "q-chat-orphan",
+      chatId: chat.id,
+      taskId: null,
+      toolUseId: "tu-chat-orphan",
+      question: "stuck across restart",
+      status: "pending",
+    }).run();
+    const task = db.insert(tasks).values({ prompt: "t" }).returning().get()!;
+    db.insert(agentQuestions).values({
+      requestId: "q-task-orphan",
+      chatId: null,
+      taskId: task.id,
+      toolUseId: "tu-task-orphan",
+      question: "task has cold-resume",
+      status: "pending",
+    }).run();
+
+    const cancelled = chatExecutorModule.sweepOrphanedChatQuestions();
+    expect(cancelled).toBe(1);
+
+    const chatRow = db.select().from(agentQuestions)
+      .where(eq(agentQuestions.requestId, "q-chat-orphan")).get();
+    expect(chatRow!.status).toBe("cancelled");
+
+    // Task-bound row is untouched — tasks have a real cold-resume path.
+    const taskRow = db.select().from(agentQuestions)
+      .where(eq(agentQuestions.requestId, "q-task-orphan")).get();
+    expect(taskRow!.status).toBe("pending");
   });
 
   // Silence unused-import lints.

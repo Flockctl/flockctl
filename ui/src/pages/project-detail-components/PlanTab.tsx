@@ -7,7 +7,6 @@ import {
   useStartAutoExecuteAll,
 } from "@/lib/hooks";
 
-import { CreateMilestoneDialog } from "./CreateMilestoneDialog";
 import { GeneratePlanDialog } from "./GeneratePlanDialog";
 import { PlanEditorProvider } from "./plan-editor-context";
 import { ProjectDetailBoardView } from "./ProjectDetailBoardView";
@@ -96,7 +95,6 @@ export function PlanTab({ projectId }: { projectId: string }) {
               </Button>
             )}
             <GeneratePlanDialog projectId={projectId} />
-            <CreateMilestoneDialog projectId={projectId} />
           </div>
         </div>
 

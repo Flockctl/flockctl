@@ -351,21 +351,32 @@ export function AIAndExecutionCards({
  * Paired Environment Variables + Gitignore cards. Env vars persist to
  * `.flockctl/config.yaml`; the gitignore toggles are DB-backed and
  * reconciled into the project's `.gitignore` on save.
+ *
+ * Below the pair we render a third full-width card for the
+ * `use_project_claude_skills` opt-in (see migration 0045) — placed here
+ * because, like the gitignore toggles, it is DB-backed and triggers a
+ * reconcile when changed, but it gets its own card to make the
+ * "locked-on, can't be disabled per-skill" intent explicit.
  */
 export function EnvAndGitignoreCards({
   envVarsText,
   setEnvVarsText,
   gitignoreToggles,
   setGitignoreToggles,
+  useProjectClaudeSkills,
+  setUseProjectClaudeSkills,
   projectPath,
 }: {
   envVarsText: string;
   setEnvVarsText: Dispatch<SetStateAction<string>>;
   gitignoreToggles: GitignoreTogglesValue;
   setGitignoreToggles: Dispatch<SetStateAction<GitignoreTogglesValue>>;
+  useProjectClaudeSkills: boolean;
+  setUseProjectClaudeSkills: Dispatch<SetStateAction<boolean>>;
   projectPath: string | null | undefined;
 }) {
   return (
+    <div className="space-y-6">
     <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
       {/* Environment Variables — .flockctl/config.yaml */}
       <Card>
@@ -404,6 +415,43 @@ export function EnvAndGitignoreCards({
           />
         </CardContent>
       </Card>
+    </div>
+
+    {/* Project-owned skills opt-in — DB-backed, reconciles on save */}
+    <Card>
+      <CardHeader>
+        <CardTitle>Project skills source</CardTitle>
+        <p className="text-xs text-muted-foreground">
+          Local to this machine · controls whether the agent picks up skills
+          from this project's own <code>.claude/skills/</code> folder.
+        </p>
+      </CardHeader>
+      <CardContent>
+        <label
+          htmlFor="proj-use-claude-skills"
+          className="flex items-start gap-2 text-sm"
+        >
+          <Checkbox
+            id="proj-use-claude-skills"
+            checked={useProjectClaudeSkills}
+            onCheckedChange={(next) => setUseProjectClaudeSkills(next === true)}
+          />
+          <span className="flex-1">
+            <span className="block leading-tight">
+              Use skills from <code>.claude/skills/</code> in this project
+            </span>
+            <span className="block text-xs text-muted-foreground">
+              When enabled, every <code>SKILL.md</code> under{" "}
+              <code>{projectPath ?? "<project>"}/.claude/skills/</code> is
+              treated as a locked, always-on skill that overrides any same-name
+              skill from global / workspace / <code>.flockctl/skills/</code>.
+              These skills bypass the per-skill disable list — they cannot be
+              turned off through the toggles below.
+            </span>
+          </span>
+        </label>
+      </CardContent>
+    </Card>
     </div>
   );
 }

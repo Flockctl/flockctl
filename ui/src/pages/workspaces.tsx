@@ -154,11 +154,14 @@ function CreateWorkspaceDialog() {
     }
     // If path is empty, backend auto-derives: ~/flockctl/workspaces/<name>
 
-    // Only send toggles that the user actually enabled. Omitted fields
-    // default to `false` server-side (current behaviour).
-    if (gitignoreToggles.gitignore_flockctl) data.gitignore_flockctl = true;
-    if (gitignoreToggles.gitignore_todo) data.gitignore_todo = true;
-    if (gitignoreToggles.gitignore_agents_md) data.gitignore_agents_md = true;
+    // Always forward the full toggle triplet. Server defaults are now
+    // (true, true, false) — see `DEFAULT_GITIGNORE_TOGGLES` — so sending
+    // only the truthy fields would silently collapse a user-UNchecked
+    // value back to the server default. Always-send keeps the row in
+    // lockstep with the form state.
+    data.gitignore_flockctl = gitignoreToggles.gitignore_flockctl;
+    data.gitignore_todo = gitignoreToggles.gitignore_todo;
+    data.gitignore_agents_md = gitignoreToggles.gitignore_agents_md;
 
     try {
       await createWorkspace.mutateAsync(data);

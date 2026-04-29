@@ -71,6 +71,7 @@ export function createTestDb(): {
       gitignore_flockctl INTEGER DEFAULT 0 NOT NULL,
       gitignore_todo INTEGER DEFAULT 0 NOT NULL,
       gitignore_agents_md INTEGER DEFAULT 0 NOT NULL,
+      use_project_claude_skills INTEGER DEFAULT 0 NOT NULL,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );

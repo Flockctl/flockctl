@@ -202,12 +202,22 @@ projectRoutes.post("/", async (c) => {
     path: projectPath,
     repoUrl: resolvedRepoUrl,
     allowedKeyIds: JSON.stringify(allowedKeyIds),
-    // Omitted flags fall back to the schema default (false). Explicit `true`
-    // triggers a `.gitignore` write — even on fresh `git init` dirs — via
-    // `gitignoreOptionsFromRow` in the reconciler queued below.
-    gitignoreFlockctl: gitignoreToggles.gitignoreFlockctl ?? false,
-    gitignoreTodo: gitignoreToggles.gitignoreTodo ?? false,
+    // ─── API-level defaults for gitignore toggles ───
+    // The schema-level DEFAULT is still 0/false (changing a SQLite column
+    // DEFAULT requires a table rebuild), but on this code path we want to
+    // hide every Flockctl artefact from git EXCEPT AGENTS.md — that is the
+    // single legitimate trace operators want their teammates to see. So:
+    //   gitignoreFlockctl  → default true  (`.flockctl/` is internal state)
+    //   gitignoreTodo      → default true  (root-level scratchpad)
+    //   gitignoreAgentsMd  → default false (AGENTS.md must remain visible)
+    // The matching defaults live in `DEFAULT_GITIGNORE_TOGGLES` in the UI.
+    gitignoreFlockctl: gitignoreToggles.gitignoreFlockctl ?? true,
+    gitignoreTodo: gitignoreToggles.gitignoreTodo ?? true,
     gitignoreAgentsMd: gitignoreToggles.gitignoreAgentsMd ?? false,
+    // Opt-in flag for honouring `<project>/.claude/skills/` as a skill source.
+    // Default false (legacy behaviour); explicit `true` flips on locked
+    // project-claude skills (see migration 0045 + `resolveSkillsForProject`).
+    useProjectClaudeSkills: body.useProjectClaudeSkills === true,
   }).returning().get();
 
   // Persist config fields (including permissionMode) into <project>/.flockctl/config.json
@@ -292,6 +302,13 @@ projectRoutes.patch("/:id", async (c) => {
       ...(gitignoreToggles.gitignoreFlockctl !== undefined && { gitignoreFlockctl: gitignoreToggles.gitignoreFlockctl }),
       ...(gitignoreToggles.gitignoreTodo !== undefined && { gitignoreTodo: gitignoreToggles.gitignoreTodo }),
       ...(gitignoreToggles.gitignoreAgentsMd !== undefined && { gitignoreAgentsMd: gitignoreToggles.gitignoreAgentsMd }),
+      // Boolean coercion via `=== true` so a non-boolean payload (e.g.
+      // accidental string) is treated as "unset" rather than truthy. Only
+      // applied when the field is present so omitting it preserves the
+      // existing value — matches the gitignore toggles' patch semantics.
+      ...(body.useProjectClaudeSkills !== undefined && {
+        useProjectClaudeSkills: body.useProjectClaudeSkills === true,
+      }),
       updatedAt: new Date().toISOString(),
     })
     .where(eq(projects.id, id))
@@ -304,10 +321,15 @@ projectRoutes.patch("/:id", async (c) => {
     const patch = extractConfigFromBody(body);
     if (permissionMode !== undefined) (patch as Record<string, unknown>).permissionMode = permissionMode;
     mergeProjectConfig(updated.path, patch);
-    // Kick a reconcile whenever config OR gitignore toggles changed — the
-    // reconciler is the single path that writes `.gitignore`, so toggling a
-    // flag is meaningless until it runs.
-    if (Object.keys(patch).length > 0 || hasGitignoreToggles(gitignoreToggles)) {
+    // Kick a reconcile whenever config OR gitignore toggles OR the
+    // `.claude/skills/` opt-in changed — the reconciler is the single path
+    // that writes `.gitignore` and the skills symlink farm, so any of these
+    // flips are meaningless until it runs.
+    if (
+      Object.keys(patch).length > 0 ||
+      hasGitignoreToggles(gitignoreToggles) ||
+      body.useProjectClaudeSkills !== undefined
+    ) {
       queueProjectReconcile(id);
     }
   }

@@ -11,7 +11,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "fs";
-import { join } from "path";
+import { dirname, isAbsolute, join } from "path";
 import { eq } from "drizzle-orm";
 import { getDb } from "../../db/index.js";
 import { projects, workspaces } from "../../db/schema.js";
@@ -39,7 +39,7 @@ export function reconcileClaudeSkillsForProject(projectId: number): void {
   writeSymlinks(targetDir, skills);
   writeManifest(flockctlDir, skills);
   writeLocalReconcileMarker(flockctlDir);
-  ensureGitignore(project.path, gitignoreOptionsFromRow(project));
+  ensureGitExclude(project.path, gitExcludeOptionsFromRow(project));
 }
 
 /**
@@ -58,30 +58,27 @@ export function reconcileClaudeSkillsForWorkspace(workspaceId: number): void {
   writeSymlinks(targetDir, skills);
   writeManifest(flockctlDir, skills);
   writeLocalReconcileMarker(flockctlDir);
-  ensureGitignore(workspace.path, gitignoreOptionsFromRow(workspace));
+  ensureGitExclude(workspace.path, gitExcludeOptionsFromRow(workspace));
 }
 
 /**
- * Derive {@link GitignoreOptions} from a `projects`/`workspaces` row. Keeps
+ * Derive {@link GitExcludeOptions} from a `projects`/`workspaces` row. Keeps
  * caller sites in this file — and in `mcp-sync.ts`, which reconciles the
- * *same* `.gitignore` on behalf of other entities — from each re-implementing
- * the flag plumbing.
+ * *same* `.git/info/exclude` on behalf of other entities — from each
+ * re-implementing the flag plumbing.
+ *
+ * Note: the DB column names retain the historical `gitignore*` prefix; the
+ * flags now drive `.git/info/exclude` (local-only), but the public API
+ * contract on `projects`/`workspaces` rows is preserved to avoid a breaking
+ * schema migration. See migration 0038 for the columns themselves.
  */
-export function gitignoreOptionsFromRow(
+export function gitExcludeOptionsFromRow(
   row: { gitignoreFlockctl?: boolean | null; gitignoreTodo?: boolean | null; gitignoreAgentsMd?: boolean | null } | null | undefined,
-): GitignoreOptions {
-  const flockctl = row?.gitignoreFlockctl === true;
-  const todo = row?.gitignoreTodo === true;
-  const agentsMd = row?.gitignoreAgentsMd === true;
-  // When the user has explicitly turned on at least one flag we create
-  // `.gitignore` if missing — otherwise the preference would be silently
-  // dropped on freshly `git init`-ed checkouts that have no file yet.
-  // With all flags off the call stays a no-op in non-git dirs.
+): GitExcludeOptions {
   return {
-    flockctl,
-    todo,
-    agentsMd,
-    createIfMissing: flockctl || todo || agentsMd,
+    flockctl: row?.gitignoreFlockctl === true,
+    todo: row?.gitignoreTodo === true,
+    agentsMd: row?.gitignoreAgentsMd === true,
   };
 }
 
@@ -139,8 +136,17 @@ export function reconcileAllProjectsInWorkspace(workspaceId: number): void {
 function writeSymlinks(targetDir: string, skills: Skill[]): void {
   mkdirSync(targetDir, { recursive: true });
 
+  // Skills marked `nativeInTarget` are sourced from `<targetDir>/<name>` itself
+  // (project-owned `.claude/skills/<name>` when `use_project_claude_skills` is
+  // on). The directory IS the user's real content — the reconciler must NOT
+  // unlink it (cleanup pass below treats non-symlink entries as untouched
+  // already, but the desired-set must also exclude these so we don't try to
+  // symlink a path onto itself).
   const desired = new Map<string, string>();
-  for (const s of skills) desired.set(s.name, s.sourceDir);
+  for (const s of skills) {
+    if (s.nativeInTarget) continue;
+    desired.set(s.name, s.sourceDir);
+  }
 
   let existing: string[] = [];
   try {
@@ -239,11 +245,11 @@ function writeLocalReconcileMarker(flockctlDir: string): void {
   renameSync(tmpPath, finalPath);
 }
 
-// Base patterns always present inside the Flockctl-managed block when the
-// directory already contains a `.gitignore`. These are infrastructure files
-// Flockctl writes into the project tree that are never useful under version
-// control (symlinks, reconcile markers, auto-managed `.mcp.json`).
-const GITIGNORE_BASE_PATTERNS = [
+// Base patterns always present inside the Flockctl-managed block in
+// `.git/info/exclude`. These are infrastructure files Flockctl writes into
+// the project tree that are never useful under version control (symlinks,
+// reconcile markers, auto-managed `.mcp.json` containing resolved secrets).
+const GIT_EXCLUDE_BASE_PATTERNS = [
   ".claude/skills/",
   ".mcp.json",
   ".flockctl/.skills-reconcile",
@@ -254,111 +260,205 @@ const GITIGNORE_BASE_PATTERNS = [
 ];
 
 // Optional patterns, each gated by a dedicated DB flag. See migration 0038.
-const GITIGNORE_FLOCKCTL_PATTERN = ".flockctl/";
-const GITIGNORE_TODO_PATTERN = "TODO.md";
+const GIT_EXCLUDE_FLOCKCTL_PATTERN = ".flockctl/";
+const GIT_EXCLUDE_TODO_PATTERN = "TODO.md";
 // AGENTS.md and CLAUDE.md are paired: both are agent-guidance files and
 // Flockctl treats them as a single concept on the UI side, so one toggle
 // covers both. Order matters for byte-stability of the written block.
-const GITIGNORE_AGENTS_PATTERNS = ["AGENTS.md", "CLAUDE.md"];
+const GIT_EXCLUDE_AGENTS_PATTERNS = ["AGENTS.md", "CLAUDE.md"];
 
 // Every pattern this module has ever written into the marked block. Used by
-// the idempotency pass below to strip stale lines regardless of whether they
-// were produced by the current flag configuration or by a prior one.
+// the idempotency pass below — and by the legacy `.gitignore` cleanup pass —
+// to strip stale lines regardless of which flag combination produced them.
 const ALL_MANAGED_PATTERNS = new Set<string>([
-  ...GITIGNORE_BASE_PATTERNS,
-  GITIGNORE_FLOCKCTL_PATTERN,
-  GITIGNORE_TODO_PATTERN,
-  ...GITIGNORE_AGENTS_PATTERNS,
+  ...GIT_EXCLUDE_BASE_PATTERNS,
+  GIT_EXCLUDE_FLOCKCTL_PATTERN,
+  GIT_EXCLUDE_TODO_PATTERN,
+  ...GIT_EXCLUDE_AGENTS_PATTERNS,
 ]);
 
-const GITIGNORE_BEGIN_MARKER = "# ─── Flockctl (auto-managed — do not edit) ───";
-const GITIGNORE_END_MARKER = "# ─── /Flockctl ───";
+// Same marker text in both `.gitignore` (legacy) and `.git/info/exclude`
+// (current target). Lets the cleanup regex work across both files without
+// branching, and keeps any stray Flockctl block visually consistent if it
+// ever lands somewhere unexpected.
+const GIT_EXCLUDE_BEGIN_MARKER = "# ─── Flockctl (auto-managed — do not edit) ───";
+const GIT_EXCLUDE_END_MARKER = "# ─── /Flockctl ───";
 
-export interface GitignoreOptions {
+export interface GitExcludeOptions {
   /** Ignore the whole `.flockctl/` directory instead of listing sub-paths. */
   flockctl?: boolean;
   /** Ignore root-level `TODO.md`. */
   todo?: boolean;
   /** Ignore root-level `AGENTS.md` and `CLAUDE.md` (paired). */
   agentsMd?: boolean;
-  /**
-   * Create `<dir>/.gitignore` if it does not exist. Default `false` — stay
-   * non-invasive in directories that are not git repos. The route layer
-   * flips this to `true` when the user enables any flag explicitly so the
-   * preference is honoured even in a fresh checkout.
-   */
-  createIfMissing?: boolean;
 }
 
-function buildPatternList(opts: GitignoreOptions): string[] {
+function buildPatternList(opts: GitExcludeOptions): string[] {
   const patterns: string[] = [];
   if (opts.flockctl) {
     // When the whole `.flockctl/` tree is ignored, the granular entries
     // under it would just duplicate what the directory entry already covers,
     // so drop them for a clean block.
-    patterns.push(".claude/skills/", ".mcp.json", GITIGNORE_FLOCKCTL_PATTERN);
+    patterns.push(".claude/skills/", ".mcp.json", GIT_EXCLUDE_FLOCKCTL_PATTERN);
   } else {
-    patterns.push(...GITIGNORE_BASE_PATTERNS);
+    patterns.push(...GIT_EXCLUDE_BASE_PATTERNS);
   }
-  if (opts.todo) patterns.push(GITIGNORE_TODO_PATTERN);
-  if (opts.agentsMd) patterns.push(...GITIGNORE_AGENTS_PATTERNS);
+  if (opts.todo) patterns.push(GIT_EXCLUDE_TODO_PATTERN);
+  if (opts.agentsMd) patterns.push(...GIT_EXCLUDE_AGENTS_PATTERNS);
   return patterns;
 }
 
-function buildFlockctlBlock(opts: GitignoreOptions): string {
-  return [GITIGNORE_BEGIN_MARKER, ...buildPatternList(opts), GITIGNORE_END_MARKER].join("\n");
+function buildFlockctlBlock(opts: GitExcludeOptions): string {
+  return [GIT_EXCLUDE_BEGIN_MARKER, ...buildPatternList(opts), GIT_EXCLUDE_END_MARKER].join("\n");
 }
 
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+const MANAGED_BLOCK_REGEX = new RegExp(
+  `\\n*${escapeRegExp(GIT_EXCLUDE_BEGIN_MARKER)}[\\s\\S]*?${escapeRegExp(GIT_EXCLUDE_END_MARKER)}\\n*`,
+  "g",
+);
+
 /**
- * Append (or refresh) a marked Flockctl block in <dir>/.gitignore.
- * Migrates raw entries from prior versions into the block. No-op when
- * <dir>/.gitignore is missing unless `createIfMissing` is set — that flag
- * is only passed when the caller explicitly enables one of the user-facing
- * toggles so we never pollute non-git dirs by accident.
+ * Strip both the marked Flockctl block AND any bare managed lines from the
+ * given content. Shared by the `.git/info/exclude` writer (idempotency pass)
+ * and the `.gitignore` legacy-cleanup pass.
  */
-export function ensureGitignore(dir: string, options: GitignoreOptions = {}): void {
-  const gitignorePath = join(dir, ".gitignore");
-  const fileExists = existsSync(gitignorePath);
-  const anyToggleOn = Boolean(options.flockctl || options.todo || options.agentsMd);
-  if (!fileExists && !(options.createIfMissing && anyToggleOn)) return;
-
-  let current = "";
-  if (fileExists) {
-    try {
-      current = readFileSync(gitignorePath, "utf-8");
-    } catch {
-      /* v8 ignore next — defensive: read failure on existsSync-checked file */
-      return;
-    }
-  }
-
-  const blockRegex = new RegExp(
-    `\\n*${escapeRegExp(GITIGNORE_BEGIN_MARKER)}[\\s\\S]*?${escapeRegExp(GITIGNORE_END_MARKER)}\\n*`,
-    "g",
-  );
-  const withoutBlock = current.replace(blockRegex, "\n");
-  // Strip any bare managed lines that leaked outside the block (e.g. from
-  // older Flockctl versions, or a user hand-editing patterns we now own).
-  // Using ALL_MANAGED_PATTERNS rather than the current flag-dependent list
-  // guarantees stale entries disappear even after the user flips a flag off.
-  const cleaned = withoutBlock
+function stripManagedSections(content: string): string {
+  const withoutBlock = content.replace(MANAGED_BLOCK_REGEX, "\n");
+  return withoutBlock
     .split("\n")
     .filter((line) => !ALL_MANAGED_PATTERNS.has(line.trim()))
     .join("\n");
+}
 
+/**
+ * Resolve the path to `.git/info/exclude` for `dir`.
+ *
+ * Returns:
+ *   - `<dir>/.git/info/exclude` when `<dir>/.git` is a directory (normal repo)
+ *   - the resolved `<gitdir>/info/exclude` when `<dir>/.git` is a *file*
+ *     containing a `gitdir:` pointer (linked worktrees and submodules)
+ *   - `null` when `<dir>` is not a git checkout — caller should no-op.
+ */
+function resolveGitInfoExcludePath(dir: string): string | null {
+  const gitPath = join(dir, ".git");
+  let stat;
+  try {
+    stat = lstatSync(gitPath);
+  } catch {
+    return null; // not a git repo
+  }
+
+  if (stat.isDirectory()) {
+    return join(gitPath, "info", "exclude");
+  }
+
+  if (stat.isFile()) {
+    // Linked worktree or submodule: file content is "gitdir: <path>" —
+    // path is absolute or relative to `dir` per `gitrepository-layout(5)`.
+    let content: string;
+    try {
+      content = readFileSync(gitPath, "utf-8");
+    } catch {
+      /* v8 ignore next — defensive: read failure on lstat-checked file */
+      return null;
+    }
+    const match = content.match(/^gitdir:\s*(.+?)\s*$/m);
+    /* v8 ignore next — defensive: regex group is non-empty when the line matches */
+    if (!match || !match[1]) return null;
+    const raw = match[1].trim();
+    const gitdir = isAbsolute(raw) ? raw : join(dir, raw);
+    return join(gitdir, "info", "exclude");
+  }
+
+  /* v8 ignore next 2 — defensive: `.git` is neither dir nor file (e.g. socket) */
+  return null;
+}
+
+/**
+ * One-time migration: strip the legacy Flockctl-managed block (and any bare
+ * managed lines) from `<dir>/.gitignore`. Earlier versions of Flockctl wrote
+ * those entries into the team-tracked `.gitignore`; they now live in
+ * `.git/info/exclude` instead. Idempotent — leaves `.gitignore` untouched
+ * when no managed content is found.
+ */
+function stripLegacyGitignoreBlock(dir: string): void {
+  const gitignorePath = join(dir, ".gitignore");
+  if (!existsSync(gitignorePath)) return;
+
+  let current: string;
+  try {
+    current = readFileSync(gitignorePath, "utf-8");
+  } catch {
+    /* v8 ignore next — defensive: read failure on existsSync-checked file */
+    return;
+  }
+
+  const cleaned = stripManagedSections(current);
+  // Preserve a single trailing newline iff the file had any user content
+  // left, to keep behaviour predictable for downstream tools that expect it.
   const trimmed = cleaned.replace(/\s+$/, "");
-  const prefix = trimmed === "" ? "" : trimmed + "\n\n";
-  const next = prefix + buildFlockctlBlock(options) + "\n";
+  const next = trimmed === "" ? "" : trimmed + "\n";
 
   if (next === current) return;
 
   const tmpPath = gitignorePath + ".tmp";
   writeFileSync(tmpPath, next, "utf-8");
   renameSync(tmpPath, gitignorePath);
+}
+
+/**
+ * Write (or refresh) the marked Flockctl block in `<dir>/.git/info/exclude`.
+ *
+ * - No-op when `<dir>` is not a git checkout (no `.git` directory or file
+ *   pointer present). Writing to `.git/info/exclude` requires the file to
+ *   live inside an existing `.git/` tree; we never create one ourselves.
+ * - Idempotent: re-running with the same options leaves the file
+ *   byte-identical.
+ * - Always strips the legacy Flockctl-managed block from `<dir>/.gitignore`
+ *   on every call (one-time migration). This is cheap when the file lacks
+ *   any managed content and the on-disk state stays untouched.
+ *
+ * The base patterns (skills symlinks, `.mcp.json`, reconcile markers) are
+ * always written. The `flockctl` / `todo` / `agentsMd` options layer extra
+ * patterns on top, gated by user-facing toggles persisted on the project /
+ * workspace row (see {@link gitExcludeOptionsFromRow}).
+ */
+export function ensureGitExclude(dir: string, options: GitExcludeOptions = {}): void {
+  // Always run the legacy cleanup — even outside git checkouts the user
+  // may have a `.gitignore` they want freed of stale Flockctl lines.
+  stripLegacyGitignoreBlock(dir);
+
+  const excludePath = resolveGitInfoExcludePath(dir);
+  if (!excludePath) return; // not a git repo — silent no-op
+
+  // `.git/info/` exists by default in every `git init`-ed repo, but be
+  // tolerant of users who pruned it: it's local-only state, safe to recreate.
+  mkdirSync(dirname(excludePath), { recursive: true });
+
+  let current = "";
+  if (existsSync(excludePath)) {
+    try {
+      current = readFileSync(excludePath, "utf-8");
+    } catch {
+      /* v8 ignore next — defensive: read failure on existsSync-checked file */
+      return;
+    }
+  }
+
+  const cleaned = stripManagedSections(current);
+  const trimmed = cleaned.replace(/\s+$/, "");
+  const prefix = trimmed === "" ? "" : trimmed + "\n\n";
+  const next = prefix + buildFlockctlBlock(options) + "\n";
+
+  if (next === current) return;
+
+  const tmpPath = excludePath + ".tmp";
+  writeFileSync(tmpPath, next, "utf-8");
+  renameSync(tmpPath, excludePath);
 }
 
 // Silence unused-import lint when this file grows; statSync is reserved for

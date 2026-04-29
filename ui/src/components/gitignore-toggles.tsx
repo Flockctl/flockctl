@@ -64,9 +64,11 @@ export function GitignoreToggles({
     <div className="space-y-2">
       <Label>{title}</Label>
       <p className="text-xs text-muted-foreground">
-        Extra paths Flockctl can add to the auto-managed block in{" "}
-        <code>.gitignore</code>. All default off — toggling none keeps the
-        current behaviour.
+        Paths Flockctl writes into the auto-managed block in{" "}
+        <code>.git/info/exclude</code> (local-only — never committed). The
+        first two are on by default so a fresh project leaves no Flockctl
+        traces in git except <code>AGENTS.md</code>; uncheck any toggle to
+        let that path show up in <code>git status</code>.
       </p>
       <div className="flex flex-col gap-2 rounded-md border p-3">
         {OPTIONS.map((opt) => {
@@ -94,9 +96,19 @@ export function GitignoreToggles({
   );
 }
 
-/** Convenience default used by create dialogs — all three flags start off. */
+/**
+ * Default seed for create dialogs. Mirror of the API-level defaults applied
+ * by POST /projects and POST /workspaces:
+ *
+ *   gitignore_flockctl  → true   (hide internal `.flockctl/` from git)
+ *   gitignore_todo      → true   (root-level scratchpad — local-only)
+ *   gitignore_agents_md → false  (AGENTS.md is the single Flockctl trace
+ *                                operators want their teammates to see)
+ *
+ * The user can flip any of these in the create dialog before submitting.
+ */
 export const DEFAULT_GITIGNORE_TOGGLES: GitignoreTogglesValue = {
-  gitignore_flockctl: false,
-  gitignore_todo: false,
+  gitignore_flockctl: true,
+  gitignore_todo: true,
   gitignore_agents_md: false,
 };

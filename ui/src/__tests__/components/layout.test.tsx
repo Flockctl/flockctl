@@ -3,6 +3,7 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { __resetSidebarCollapseStoreForTests } from "@/lib/sidebar-collapse-store";
+import { __resetSidebarRailStoreForTests } from "@/lib/sidebar-rail-store";
 
 // --- Mock the heavier dependencies so the test stays focused on the accordion
 // behaviour of the sidebar itself. Each mock returns a minimal placeholder. ---
@@ -45,6 +46,12 @@ vi.mock("@/lib/hooks/use-task-terminal-notifications", () => ({
   TaskTerminalNotificationsRunner: () => null,
 }));
 
+// Same rationale: the chat-reply runner mounts a global WS subscription
+// and reads the dispatcher context. Stub it for the sidebar suite.
+vi.mock("@/lib/hooks/use-chat-reply-notifications", () => ({
+  ChatReplyNotificationsRunner: () => null,
+}));
+
 import Layout from "@/components/layout";
 
 function renderLayout() {
@@ -57,6 +64,7 @@ function renderLayout() {
 
 beforeEach(() => {
   __resetSidebarCollapseStoreForTests();
+  __resetSidebarRailStoreForTests();
   attentionMock.total = 0;
 });
 
@@ -120,6 +128,56 @@ describe("Layout sidebar — collapsible groups", () => {
     renderLayout();
     const workHeader = screen.getByRole("button", { name: /^Work/i });
     expect(within(workHeader).queryByText(/^\d+$/)).toBeNull();
+  });
+
+  it("collapses to icon-only rail when the rail toggle is clicked", async () => {
+    const user = userEvent.setup();
+    const { container } = renderLayout();
+
+    // Default state: full-width desktop sidebar — group headers visible
+    // and the desktop `aside` carries data-rail="false".
+    const desktopAside = container.querySelector(
+      'aside[data-rail]',
+    ) as HTMLElement;
+    expect(desktopAside).toBeTruthy();
+    expect(desktopAside.getAttribute("data-rail")).toBe("false");
+    expect(within(desktopAside).getByText("Flockctl")).toBeTruthy();
+    expect(within(desktopAside).getByRole("button", { name: /Overview/ })).toBeTruthy();
+
+    const railToggle = screen.getByRole("button", { name: /Collapse sidebar/i });
+    await user.click(railToggle);
+
+    // After collapse: brand label and group headers are gone from the
+    // desktop aside, but the nav links (now icon-only) remain reachable
+    // via their aria-labels. The `data-rail` flag flips to "true" and the
+    // width class swaps to w-14.
+    expect(desktopAside.getAttribute("data-rail")).toBe("true");
+    expect(desktopAside.className).toMatch(/\bw-14\b/);
+    expect(within(desktopAside).queryByText("Flockctl")).toBeNull();
+    expect(within(desktopAside).queryByRole("button", { name: /^Overview/ })).toBeNull();
+    expect(within(desktopAside).getByRole("link", { name: /Dashboard/ })).toBeTruthy();
+    expect(within(desktopAside).getByRole("link", { name: /Settings/ })).toBeTruthy();
+
+    // Toggle button now offers the inverse action.
+    expect(screen.getByRole("button", { name: /Expand sidebar/i })).toBeTruthy();
+  });
+
+  it("persists the rail state across remounts", async () => {
+    const user = userEvent.setup();
+    const first = renderLayout();
+    await user.click(screen.getByRole("button", { name: /Collapse sidebar/i }));
+    const firstAside = first.container.querySelector(
+      'aside[data-rail]',
+    ) as HTMLElement;
+    expect(firstAside.getAttribute("data-rail")).toBe("true");
+    first.unmount();
+
+    const { container } = renderLayout();
+    // Still in rail mode after a remount — preference round-trips through
+    // the store's localStorage layer.
+    const aside = container.querySelector('aside[data-rail]') as HTMLElement;
+    expect(aside.getAttribute("data-rail")).toBe("true");
+    expect(screen.getByRole("button", { name: /Expand sidebar/i })).toBeTruthy();
   });
 
   it("persists the collapsed state across remounts", async () => {

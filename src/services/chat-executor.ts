@@ -283,10 +283,54 @@ class ChatExecutor {
     // timer is armed for this chat.
     rateLimitScheduler.cancel("chat", chatId);
 
+    // Cancel any open AskUserQuestion cards before aborting the session.
+    // The session.abort() path inside AgentSession resolves the in-memory
+    // question promise with "(question cancelled)" but never updates the
+    // DB row, so the row stays `pending` forever and the UI's question card
+    // remains stuck — a follow-up POST /answer rejects with the misleading
+    // "Agent question already resolved" 409 because `answerQuestion` requires
+    // a live session. Sweeping pending rows to `cancelled` here lets the UI
+    // clear the card via the existing `agent_question_resolved` WS frame.
+    this.cancelPendingQuestions(chatId);
+
     const s = this.sessions.get(chatId);
     if (!s) return false;
     s.abort();
     return true;
+  }
+
+  /**
+   * Mark every still-pending `agent_questions` row for this chat as
+   * `cancelled` and broadcast a synthetic `agent_question_resolved` frame
+   * (answer = "(question cancelled)", same string the AgentSession's own
+   * onAbort path resolves with). The UI's chat-events handler removes the
+   * card from React Query cache on that frame, so this is the only signal
+   * needed to unstick the question prompt.
+   *
+   * Idempotent: a no-op when there are no pending rows. Safe to call on
+   * every cancel/teardown path.
+   */
+  private cancelPendingQuestions(chatId: number): void {
+    const db = getDb();
+    const rows = db
+      .select({ id: agentQuestions.id, requestId: agentQuestions.requestId })
+      .from(agentQuestions)
+      .where(and(eq(agentQuestions.chatId, chatId), eq(agentQuestions.status, "pending")))
+      .all();
+    if (rows.length === 0) return;
+
+    const now = new Date().toISOString();
+    db.update(agentQuestions)
+      .set({ status: "cancelled", answer: "(question cancelled)", answeredAt: now })
+      .where(and(eq(agentQuestions.chatId, chatId), eq(agentQuestions.status, "pending")))
+      .run();
+
+    for (const r of rows) {
+      broadcastAgentQuestionResolved({ kind: "chat", id: chatId }, r.requestId, "(question cancelled)");
+    }
+    // Single attention recompute after the batch — keeps the single-emit
+    // invariant (broadcastAgentQuestionResolved doesn't emit attention).
+    emitAttentionChanged(wsManager);
   }
 
   /** Abort every active chat session — called on daemon shutdown. */
@@ -517,3 +561,30 @@ class ChatExecutor {
 }
 
 export const chatExecutor = new ChatExecutor();
+
+/**
+ * Boot-time sweep: cancel any chat-scoped `agent_questions` left in
+ * `pending` from a previous daemon instance. Chat AgentSessions are purely
+ * in-memory (no `claudeSessionId`-style cold-resume path like tasks have),
+ * so by definition every chat-bound pending question at boot is orphaned —
+ * there's no session left to relay an answer back to. Without this sweep
+ * the chat's question card persists forever and rejects every answer
+ * attempt with the misleading "Agent question already resolved" 409.
+ *
+ * Returns the number of rows it transitioned to `cancelled`. Skips
+ * task-scoped rows (those have a real cold-resume path in
+ * `executor-questions.resolveQuestionCold`).
+ *
+ * Note: this runs BEFORE any WS clients connect, so we don't broadcast
+ * resolution frames here — UI hydration via GET /pending-questions will
+ * naturally return an empty list once the rows are cancelled.
+ */
+export function sweepOrphanedChatQuestions(): number {
+  const db = getDb();
+  const result = db
+    .update(agentQuestions)
+    .set({ status: "cancelled", answer: "(question cancelled)", answeredAt: new Date().toISOString() })
+    .where(and(eq(agentQuestions.status, "pending"), sql`${agentQuestions.chatId} IS NOT NULL`))
+    .run();
+  return Number(result.changes ?? 0);
+}

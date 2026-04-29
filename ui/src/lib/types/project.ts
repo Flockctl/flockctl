@@ -13,11 +13,16 @@ export interface Project {
   provider_fallback_chain: string[] | null;
   allowed_key_ids: number[] | null;
   // ─── Gitignore toggles (backend migration 0038) ───
-  // Opt-in flags that control what the server writes into the auto-managed
-  // block of <project>/.gitignore. All default `false` (legacy behavior).
+  // Opt-in flags controlling what the server writes into the auto-managed
+  // block of <project>/.git/info/exclude. API-level defaults applied by
+  // POST /projects: (true, true, false) — see DEFAULT_GITIGNORE_TOGGLES.
   gitignore_flockctl: boolean;
   gitignore_todo: boolean;
   gitignore_agents_md: boolean;
+  // ─── Project `.claude/skills/` opt-in (backend migration 0045) ───
+  // When `true`, `<project>/.claude/skills/<name>/SKILL.md` directories are
+  // honoured as locked, non-disableable skill sources. Default `false`.
+  use_project_claude_skills: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -60,10 +65,13 @@ export interface ProjectCreate {
    * See src/routes/_allowed-keys.ts for the exact backend contract.
    */
   allowed_key_ids: number[];
-  // ─── Gitignore toggles — optional on create (default false server-side) ───
+  // ─── Gitignore toggles — optional on create. Server applies defaults
+  // (true, true, false) when omitted; see DEFAULT_GITIGNORE_TOGGLES. ───
   gitignore_flockctl?: boolean;
   gitignore_todo?: boolean;
   gitignore_agents_md?: boolean;
+  // ─── Project `.claude/skills/` opt-in — defaults to false server-side ───
+  use_project_claude_skills?: boolean;
 }
 
 // --- Project import (scan + adopt existing .claude/AGENTS.md/.mcp.json) ---
@@ -125,6 +133,8 @@ export interface ProjectUpdate {
   gitignore_flockctl?: boolean;
   gitignore_todo?: boolean;
   gitignore_agents_md?: boolean;
+  // ─── Project `.claude/skills/` opt-in — omitted leaves the row unchanged ───
+  use_project_claude_skills?: boolean;
 }
 
 export interface ProjectTree {

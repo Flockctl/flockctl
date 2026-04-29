@@ -63,6 +63,7 @@ vi.mock("@/lib/hooks", async () => {
         gitignore_flockctl: false,
         gitignore_todo: false,
         gitignore_agents_md: false,
+        use_project_claude_skills: false,
         created_at: "2025-01-01T00:00:00Z",
         updated_at: "2025-01-01T00:00:00Z",
       },

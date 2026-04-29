@@ -111,6 +111,17 @@ export function registerChatQuestions(router: Hono): void {
     if (!ok) {
       const recheck = db.select().from(agentQuestions).where(eq(agentQuestions.requestId, requestId)).get();
       if (!recheck) throw new NotFoundError("Agent question");
+      // Distinguish "session is gone" from "row already resolved": the former
+      // happens when the user pressed Stop while the question was open
+      // (the session was torn down, but the row may still be `pending` until
+      // the cancel-cleanup hook runs). Returning the same 409 with a generic
+      // "already resolved" message used to be misleading and made stuck chats
+      // look like a UI bug. The chat-executor.cancel() path now sweeps
+      // pending rows to `cancelled`, so in steady state we should only ever
+      // hit the second branch — but keep the explicit check as a safety net.
+      if (recheck.status === "pending") {
+        throw new AppError(409, "Chat session is not running");
+      }
       throw new AppError(409, "Agent question already resolved");
     }
 

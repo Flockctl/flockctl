@@ -149,10 +149,13 @@ workspaceRoutes.post("/", async (c) => {
     path: wsPath,
     repoUrl: resolvedRepoUrl,
     allowedKeyIds: JSON.stringify(allowedKeyIds),
-    // Default to false (current behavior) when the client omits the field.
-    // Explicit `true` triggers `.gitignore` creation in the reconciler below.
-    gitignoreFlockctl: gitignoreToggles.gitignoreFlockctl ?? false,
-    gitignoreTodo: gitignoreToggles.gitignoreTodo ?? false,
+    // ─── API-level defaults for gitignore toggles ───
+    // Mirror POST /projects: hide `.flockctl/` and TODO.md by default, keep
+    // AGENTS.md visible. The same `DEFAULT_GITIGNORE_TOGGLES` constant on
+    // the UI side seeds both create dialogs, so server-side defaults stay
+    // symmetric with the form.
+    gitignoreFlockctl: gitignoreToggles.gitignoreFlockctl ?? true,
+    gitignoreTodo: gitignoreToggles.gitignoreTodo ?? true,
     gitignoreAgentsMd: gitignoreToggles.gitignoreAgentsMd ?? false,
   }).returning().get();
 
@@ -314,9 +317,14 @@ workspaceRoutes.post("/:id/projects", async (c) => {
     path: projectPath,
     repoUrl: body.repoUrl ?? null,
     allowedKeyIds: JSON.stringify(allowedKeyIds),
-    gitignoreFlockctl: projGitignoreToggles.gitignoreFlockctl ?? false,
-    gitignoreTodo: projGitignoreToggles.gitignoreTodo ?? false,
+    // ─── API-level defaults for gitignore toggles ───
+    // Mirror POST /projects: hide `.flockctl/` and TODO.md by default,
+    // keep AGENTS.md visible. See projects.ts for the rationale.
+    gitignoreFlockctl: projGitignoreToggles.gitignoreFlockctl ?? true,
+    gitignoreTodo: projGitignoreToggles.gitignoreTodo ?? true,
     gitignoreAgentsMd: projGitignoreToggles.gitignoreAgentsMd ?? false,
+    // Project `.claude/skills/` opt-in (migration 0045) — default off.
+    useProjectClaudeSkills: body.useProjectClaudeSkills === true,
   }).returning().get();
 
   // Idempotent: create <root>/CLAUDE.md -> AGENTS.md symlink iff AGENTS.md

@@ -4,7 +4,7 @@ import { startServer } from "./server.js";
 import { SchedulerService } from "./services/scheduler.js";
 import { wsManager } from "./services/ws-manager.js";
 import { taskExecutor } from "./services/task-executor/index.js";
-import { chatExecutor } from "./services/chat-executor.js";
+import { chatExecutor, sweepOrphanedChatQuestions } from "./services/chat-executor.js";
 import { rateLimitScheduler } from "./services/agents/rate-limit-scheduler.js";
 import { seedDefaultKey } from "./services/ai/key-selection.js";
 import { reconcilePlanStatuses, resumeStaleMilestones, cancelOrphanedExecutionTasks } from "./services/auto-executor.js";
@@ -135,6 +135,19 @@ reconcilePlanStatuses();
 
 // 2c. Re-queue stale tasks left running OR queued by previous daemon instance
 const requeued = taskExecutor.resetStaleTasks();
+
+// 2c-questions. Sweep chat-bound `agent_questions` rows left in `pending`
+// from a previous daemon instance. Chat AgentSessions don't persist
+// (no cold-resume path), so any pending chat question on boot is orphaned —
+// the question card in the UI would otherwise show forever and reject every
+// answer attempt with "Agent question already resolved" 409. Tasks have a
+// real cold-resume path so their pending rows are intentionally untouched.
+{
+  const cancelled = sweepOrphanedChatQuestions();
+  if (cancelled > 0) {
+    console.log(`[chat-questions] cancelled ${cancelled} orphaned pending question(s)`);
+  }
+}
 
 // 2c-rate-limit. Re-arm wake-up timers for tasks/chats parked in
 // `status='rate_limited'` from a prior daemon instance. The scheduler reads

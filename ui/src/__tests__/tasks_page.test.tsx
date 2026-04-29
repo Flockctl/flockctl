@@ -41,6 +41,7 @@ const sampleProjects: Project[] = [
     gitignore_flockctl: false,
     gitignore_todo: false,
     gitignore_agents_md: false,
+    use_project_claude_skills: false,
     created_at: "2026-04-23T00:00:00Z",
     updated_at: "2026-04-23T00:00:00Z",
   },

@@ -14,7 +14,7 @@ import {
   resolveMcpServersForWorkspace,
   type McpServer,
 } from "../mcp.js";
-import { ensureGitignore, gitignoreOptionsFromRow } from "./skills-sync.js";
+import { ensureGitExclude, gitExcludeOptionsFromRow } from "./skills-sync.js";
 import {
   resolveSecretValue,
   resolveSecretForWorkspace,
@@ -43,7 +43,7 @@ export function reconcileMcpForProject(projectId: number): void {
   writeMergedMcpJson(project.path, resolved);
   writeMcpManifest(flockctlDir, resolved);
   writeLocalMcpReconcileMarker(flockctlDir);
-  ensureGitignore(project.path, gitignoreOptionsFromRow(project));
+  ensureGitExclude(project.path, gitExcludeOptionsFromRow(project));
 }
 
 /**
@@ -62,7 +62,7 @@ export function reconcileMcpForWorkspace(workspaceId: number): void {
   writeMergedMcpJson(workspace.path, resolved);
   writeMcpManifest(flockctlDir, resolved);
   writeLocalMcpReconcileMarker(flockctlDir);
-  ensureGitignore(workspace.path, gitignoreOptionsFromRow(workspace));
+  ensureGitExclude(workspace.path, gitExcludeOptionsFromRow(workspace));
 }
 
 export function reconcileAllMcp(): void {
