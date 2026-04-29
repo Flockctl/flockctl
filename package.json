@@ -1,6 +1,6 @@
 {
   "name": "flockctl",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "AI task orchestration tool — local-first, single-user",
   "author": "Eduard Abdullin",
   "type": "module",

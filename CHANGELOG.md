@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-04-29
+
+### Added
+- Per-project opt-in for honoring `<project>/.claude/skills/` as a skill source. New `projects.use_project_claude_skills` flag (migration 0045): when on, `resolveSkillsForProject()` walks the project's own `.claude/skills/<name>/SKILL.md` files and treats each as a `level='project'` skill that overrides any same-name entry from global / workspace / `.flockctl/skills/`. Such skills are marked locked and bypass the per-project `disabledSkills` filter — the operator opted them in at create-time and cannot turn them off through the regular skills toggle UI. The reconciler's symlink writer skips these entries because the source already lives at the destination.
+- Collapsible icon-only sidebar rail. The desktop sidebar now has a rail mode that hides group headers, renders items as centered icons with the label exposed via the native `title` tooltip, and bypasses per-group collapse. State is persisted device-locally via `localStorage` (`sidebar-rail-store`) — a personal layout preference that isn't worth syncing. The mobile slide-in drawer always renders full-width.
+- Chat-reply desktop notifications with focus suppression. New `useChatReplyNotifications` hook fires a desktop notification when an agent posts a reply to a chat that isn't currently focused, and stays silent while the chat tab has focus.
+
+### Changed
+- Move Flockctl's auto-managed block (skills symlinks, `.mcp.json`, reconcile markers, `.flockctl/`, `TODO.md`, `AGENTS.md`/`CLAUDE.md`) from project / workspace `.gitignore` into `.git/info/exclude`. The block was being committed into team-tracked config — now it stays per-checkout. `ensureGitignore` is renamed to `ensureGitExclude`, resolves linked-worktree layouts (`.git` as a file with `gitdir:` pointer), and runs a one-time legacy cleanup that strips the marked block plus any bare managed lines from `.gitignore`. The DB column names (`gitignore_flockctl` / `_todo` / `_agents_md`) are preserved to avoid a breaking schema migration; only the writer's target file changes.
+- Default the create-time gitignore toggles for new projects: `gitignoreFlockctl` and `gitignoreTodo` now default to true (hide `.flockctl/` and `TODO.md`), `gitignoreAgentsMd` stays false so `AGENTS.md` remains visible in the repo. Schema-level DEFAULTs are unchanged (changing a SQLite DEFAULT requires a table rebuild); the create endpoints (`POST /projects`, `POST /workspaces/:id/projects`) and the create-dialog UI apply the new defaults.
+
+### Fixed
+- Stuck `AskUserQuestion` cards after the user pressed Stop. `chat-executor.cancel()` now sweeps every still-pending `agent_questions` row for the chat to `cancelled` and broadcasts the matching `agent_question_resolved` frame, so the UI clears the card via the existing WS path. The follow-up `POST /chats/:id/answer` no longer responds with the misleading "Agent question already resolved" 409 — the recheck branch returns "Chat session is not running" when the row is still pending, and in steady state the sweep means the row is already `cancelled` by the time the user taps Submit.
+
 ## [0.0.2] - 2026-04-28
 
 ### Added
