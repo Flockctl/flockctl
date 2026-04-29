@@ -1,6 +1,11 @@
 import type { AgentProvider } from "./types.js";
 import { ClaudeCodeProvider } from "./claude-code/provider.js";
-import { CopilotProvider } from "./copilot/provider.js";
+// GitHub Copilot is temporarily disabled — provider class still exists under
+// `./copilot/provider.ts` but is no longer auto-registered. To re-enable,
+// restore the import + `registerAgent(new CopilotProvider())` call below
+// AND restore `github_copilot` in `routes/ai-keys.ts` PROVIDERS map AND the
+// `<SelectItem value="github_copilot">` in the UI's CreateAIKeyDialog.
+// import { CopilotProvider } from "./copilot/provider.js";
 
 const registry = new Map<string, AgentProvider>();
 let defaultAgentId: string | null = null;
@@ -55,9 +60,5 @@ function ensureBuiltIns(): void {
     // Use asDefault only if no other provider has already claimed it.
     registerAgent(new ClaudeCodeProvider(), { asDefault: defaultAgentId === null });
   }
-  if (!registry.has("copilot")) {
-    // Copilot is opt-in — never claims `asDefault`. Users switch via
-    // `.flockctlrc.defaultAgent = "copilot"`.
-    registerAgent(new CopilotProvider());
-  }
+  // Copilot auto-registration is currently disabled — see top-of-file note.
 }

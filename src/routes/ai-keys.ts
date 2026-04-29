@@ -6,9 +6,14 @@ import { paginationParams } from "../lib/pagination.js";
 import { NotFoundError, ValidationError } from "../lib/errors.js";
 import { parseIdParam } from "../lib/route-params.js";
 import { getAiKeyOrThrow } from "../lib/db-helpers.js";
+// GitHub Copilot is temporarily disabled — the provider implementation still
+// lives under `services/agents/copilot/` but is not auto-registered and is
+// not exposed via this providers map. To re-enable, add back the
+// `github_copilot` entry, restore the `/copilot/status` endpoint below, and
+// restore the validation block in `POST /` and the registry entry in
+// `services/agents/registry.ts`.
 const PROVIDERS: Record<string, { name: string; apiType: string }> = {
   claude_cli: { name: "Claude Code CLI", apiType: "claude-agent-sdk" },
-  github_copilot: { name: "GitHub Copilot", apiType: "copilot-sdk" },
 };
 
 export const aiKeyRoutes = new Hono();
@@ -57,22 +62,10 @@ aiKeyRoutes.get("/claude-cli/status", async (c) => {
   }
 });
 
-// GET /keys/copilot/status — GitHub Copilot SDK readiness
-aiKeyRoutes.get("/copilot/status", async (c) => {
-  try {
-    const { getAgent } = await import("../services/agents/registry.js");
-    const provider = getAgent("copilot");
-    const readiness = provider.checkReadiness();
-    return c.json({
-      installed: readiness.installed,
-      authenticated: readiness.authenticated,
-      ready: readiness.ready,
-      models: provider.listModels().map(m => m.id),
-    });
-  } catch {
-    /* v8 ignore next — defensive: provider.checkReadiness shouldn't throw */
-    return c.json({ installed: false, authenticated: false, ready: false, models: [] });
-  }
+// GET /keys/copilot/status — Copilot is currently disabled. Endpoint kept
+// so existing UI clients don't break with a 404; always reports not-ready.
+aiKeyRoutes.get("/copilot/status", (c) => {
+  return c.json({ installed: false, authenticated: false, ready: false, models: [] });
 });
 
 // GET /keys/:id
@@ -120,10 +113,11 @@ aiKeyRoutes.post("/", async (c) => {
 
   if (!body.provider) throw new ValidationError("provider is required");
   if (!body.providerType) throw new ValidationError("providerType is required");
+  // GitHub Copilot is temporarily disabled — reject creation of new keys for
+  // it. Existing rows in the DB are left intact but won't route anywhere
+  // (the agent registry has no `copilot` provider while disabled).
   if (body.provider === "github_copilot") {
-    if (!body.keyValue || typeof body.keyValue !== "string" || body.keyValue.trim().length === 0) {
-      throw new ValidationError("keyValue (GitHub token) is required for github_copilot provider");
-    }
+    throw new ValidationError("GitHub Copilot support is currently disabled");
   }
 
   const result = db.insert(aiProviderKeys).values({

@@ -214,11 +214,12 @@ describe("ai-keys routes — branch gaps", () => {
     expect(body.reason).toContain("claude_cli");
   });
 
-  it("GET /keys/providers lists claude_cli and github_copilot", async () => {
+  it("GET /keys/providers lists claude_cli (github_copilot disabled)", async () => {
     const res = await app.request("/keys/providers");
     const body = await res.json();
     expect(body.claude_cli).toBeDefined();
-    expect(body.github_copilot).toBeDefined();
+    // GitHub Copilot is currently disabled — see services/agents/registry.ts.
+    expect(body.github_copilot).toBeUndefined();
   });
 
   it("GET /keys/claude-cli/status returns ready fields", async () => {

@@ -128,7 +128,7 @@ export function CreateAIKeyDialog({
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="claude_cli">Claude Code CLI</SelectItem>
-                <SelectItem value="github_copilot">GitHub Copilot</SelectItem>
+                {/* GitHub Copilot temporarily disabled — see registry.ts note. */}
               </SelectContent>
             </Select>
           </div>

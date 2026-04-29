@@ -46,7 +46,7 @@ export function WorkspacePlanTab({ workspaceId }: { workspaceId: string }) {
 
   return (
     <div className="space-y-4" data-testid="workspace-plan-tab">
-      <ProjectsAccordion summaries={summaries} />
+      <ProjectsAccordion workspaceId={workspaceId} summaries={summaries} />
       {hasGraph && <DependencyGraphCard graph={depGraph!} />}
     </div>
   );

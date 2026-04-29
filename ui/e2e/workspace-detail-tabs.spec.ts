@@ -378,13 +378,14 @@ test.describe("workspace-detail tab shell", () => {
     await expect(
       page.getByTestId("workspace-detail-tab-plan"),
     ).toHaveAttribute("data-state", "active");
-    // `ProjectsAccordion` returns null when `summaries.length === 0`,
-    // so the plan tab renders as an empty div with zero height —
-    // `toBeVisible` would then report it hidden even though load has
-    // resolved. Settle for an attached-in-DOM assertion instead, which
-    // still catches the pre-load skeleton state (the skeleton carries
-    // the same testid, so this waits until the dashboard query
-    // transitions to empty).
+    // `ProjectsAccordion` always renders the "Project Overview" card
+    // (with an Add Project trigger in the header and an empty-state
+    // message in the body) — that is the ONLY UI affordance for
+    // attaching the first project to a fresh workspace, so it must be
+    // reachable here. We use `toBeAttached` rather than `toBeVisible`
+    // because the same testid is also carried by the pre-load
+    // skeleton; the assertion below will only resolve once the
+    // dashboard query transitions to empty.
     await expect(page.getByTestId("workspace-plan-tab")).toBeAttached();
     // Beat the `useWorkspaceDashboard` query by waiting on its network
     // round-trip to finish; otherwise the skeleton might still be on

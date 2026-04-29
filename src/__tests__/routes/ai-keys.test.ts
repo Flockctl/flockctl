@@ -169,7 +169,10 @@ describe("AI Keys routes", () => {
     expect(body.key_suffix).toBe("2345");
   });
 
-  it("POST /keys accepts github_copilot provider with token", async () => {
+  // GitHub Copilot is currently disabled — the API rejects creation of
+  // copilot keys with 422 and the providers map omits `github_copilot`.
+  // Both branches kept as tests so re-enabling is a one-flip restore.
+  it("POST /keys rejects github_copilot while Copilot is disabled (422)", async () => {
     const res = await app.request("/keys", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -180,12 +183,10 @@ describe("AI Keys routes", () => {
         keyValue: "gho_testtoken1234567890",
       }),
     });
-    expect(res.status).toBe(201);
-    const key = await res.json();
-    expect(key.provider).toBe("github_copilot");
+    expect(res.status).toBe(422);
   });
 
-  it("POST /keys rejects github_copilot without keyValue (422)", async () => {
+  it("POST /keys still rejects github_copilot without keyValue (422)", async () => {
     const res = await app.request("/keys", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -198,12 +199,12 @@ describe("AI Keys routes", () => {
     expect(res.status).toBe(422);
   });
 
-  it("GET /keys/providers includes github_copilot", async () => {
+  it("GET /keys/providers omits github_copilot while Copilot is disabled", async () => {
     const res = await app.request("/keys/providers");
     expect(res.status).toBe(200);
     const providers = await res.json();
-    expect(providers.github_copilot).toBeDefined();
-    expect(providers.github_copilot.name).toBe("GitHub Copilot");
+    expect(providers.github_copilot).toBeUndefined();
+    expect(providers.claude_cli).toBeDefined();
   });
 
   it("PATCH returns null keyValue & key_suffix when key has no value", async () => {

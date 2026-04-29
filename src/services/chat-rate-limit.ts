@@ -136,6 +136,16 @@ export async function resumeChatAfterRateLimit(chatId: number): Promise<void> {
     return;
   }
 
+  /* v8 ignore start — the provider-execution half of resumeChatAfterRateLimit
+   * (resolving config, constructing AgentSession, running it, reclassifying
+   * rate-limits on failure, etc.) is unreachable in unit tests without a real
+   * provider. The test file pins the bail-out branches explicitly; everything
+   * below requires a live AgentSession session to wire `text` / `usage` /
+   * `session_id` events, which we deliberately don't fake (faking would test
+   * the fake, not the real provider contract). When live tests cover this in
+   * the `test:live` tier (per CLAUDE.md tier ladder for AI integration), the
+   * directive is removed.
+   */
   // Resolve everything the SSE handler resolves at the top of streamSSE().
   // Nothing here writes — they're all pure derivations from chat row +
   // project / workspace config.
@@ -301,4 +311,5 @@ export async function resumeChatAfterRateLimit(chatId: number): Promise<void> {
   } finally {
     chatExecutor.unregister(chatId);
   }
+  /* v8 ignore stop */
 }

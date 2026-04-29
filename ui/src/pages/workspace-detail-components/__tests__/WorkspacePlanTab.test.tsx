@@ -21,7 +21,7 @@
  *      empty accordion on first paint.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 import type {
   WorkspaceDashboard,
   WorkspaceDependencyGraph,
@@ -33,6 +33,10 @@ import type {
 let mockDashboard: WorkspaceDashboard | undefined;
 let mockDashboardLoading = false;
 let mockGraph: WorkspaceDependencyGraph | undefined;
+// `mockRemoveMutate` is captured by the factory closure below.
+// Declared BEFORE `vi.mock` so it exists by the time the mock
+// factory is first invoked; per-test resets happen in `beforeEach`.
+const mockRemoveMutate = vi.fn();
 
 vi.mock("@/lib/hooks", () => ({
   useWorkspaceDashboard: () => ({
@@ -44,6 +48,21 @@ vi.mock("@/lib/hooks", () => ({
     data: mockGraph,
     isLoading: false,
     error: null,
+  }),
+  // ProjectsAccordion now embeds AddProjectDialog AND a per-row
+  // Remove button gated by ConfirmDialog, so it transitively pulls
+  // in three more hooks. Stub them out — these tests are not
+  // exercising the add/remove mutation flows (those have their own
+  // dedicated tests); we just need the components to render their
+  // trigger UI without throwing.
+  useProjects: () => ({ data: [], isLoading: false, error: null }),
+  useAddProjectToWorkspace: () => ({
+    mutateAsync: vi.fn(),
+    isPending: false,
+  }),
+  useRemoveProjectFromWorkspace: () => ({
+    mutate: mockRemoveMutate,
+    isPending: false,
   }),
 }));
 
@@ -119,6 +138,7 @@ beforeEach(() => {
   mockDashboard = undefined;
   mockDashboardLoading = false;
   mockGraph = undefined;
+  mockRemoveMutate.mockReset();
   document.body.innerHTML = "";
 });
 
@@ -174,6 +194,92 @@ describe("WorkspacePlanTab", () => {
     expect(screen.getByTestId("workspace-projects-accordion")).toBeTruthy();
     // "Dependency Graph" is the card title — absent when graph is empty.
     expect(screen.queryByText("Dependency Graph")).toBeNull();
+  });
+
+  it("always exposes an 'Add Project' trigger on the Plan tab — both when projects exist AND when the workspace is empty", () => {
+    // Regression guard. The Plan tab is the ONLY place in the UI that
+    // surfaces the affordance to attach a project to a workspace. A
+    // previous refactor extracted ProjectsAccordion out of the inline
+    // workspace-detail card and quietly dropped the `AddProjectDialog`
+    // mount — leaving the dialog component in the tree but unreachable
+    // from the UI, with `flockctl workspace link` as the only escape
+    // hatch. Assert the button is reachable in BOTH the populated and
+    // empty cases so we catch any future split that loses one branch.
+
+    // Case 1: workspace has projects → button still present in header.
+    mockDashboard = makeDashboard([makeSummary()]);
+    const populated = render(<WorkspacePlanTab workspaceId="ws-1" />);
+    expect(
+      screen.getAllByRole("button", { name: /add project/i }).length,
+    ).toBeGreaterThan(0);
+    populated.unmount();
+
+    // Case 2: workspace has zero projects → without the button there
+    // is no UI path to attach the FIRST project. This is the
+    // regression we are guarding against.
+    mockDashboard = makeDashboard([]);
+    render(<WorkspacePlanTab workspaceId="ws-1" />);
+    expect(
+      screen.getAllByRole("button", { name: /add project/i }).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it("exposes a 'Remove' trigger on every project row", () => {
+    // Regression guard, mirror of the Add Project test above. The
+    // Plan tab is also the ONLY UI affordance for detaching a project
+    // from a workspace. Assert every row carries its own removal
+    // trigger, scoped by project_id so a future single-button
+    // refactor that loses per-row scoping fails this test.
+    mockDashboard = makeDashboard([
+      makeSummary({ project_id: "p-1", project_name: "Project One" }),
+      makeSummary({ project_id: "p-2", project_name: "Project Two" }),
+    ]);
+
+    render(<WorkspacePlanTab workspaceId="ws-1" />);
+
+    expect(screen.getByTestId("workspace-project-remove-p-1")).toBeTruthy();
+    expect(screen.getByTestId("workspace-project-remove-p-2")).toBeTruthy();
+  });
+
+  it("clicking 'Remove' opens a confirmation dialog and only fires the mutation after confirm", () => {
+    // Integration-style: walks the full detach flow. The confirm
+    // gate is critical because the Remove button lives inside a
+    // <summary> row and a single click could plausibly be intended
+    // as "expand the project". If this test passes with mutate fired
+    // on the first click, we have lost the confirmation gate.
+    mockDashboard = makeDashboard([
+      makeSummary({ project_id: "p-1", project_name: "Project One" }),
+    ]);
+
+    render(<WorkspacePlanTab workspaceId="ws-1" />);
+
+    // First click on the row Remove button should NOT fire the
+    // mutation — it should only request confirmation.
+    fireEvent.click(screen.getByTestId("workspace-project-remove-p-1"));
+    expect(mockRemoveMutate).not.toHaveBeenCalled();
+
+    // The ConfirmDialog now renders. Its body must reference the
+    // project name so users know what they are detaching. We match
+    // partial because the description has surrounding copy.
+    expect(
+      screen.getByText(/Project One.*detached from this workspace/),
+    ).toBeTruthy();
+
+    // The confirm button is the destructive-variant one labelled
+    // "Remove" — distinct from the row trigger above. We pick it via
+    // role+name to avoid collision with the row trigger.
+    const confirmButtons = screen.getAllByRole("button", { name: /^remove$/i });
+    // Two buttons share the name: the per-row trigger AND the
+    // dialog confirm. Click the dialog one (the last in DOM order
+    // since the dialog is appended at the end).
+    const dialogConfirm = confirmButtons[confirmButtons.length - 1];
+    expect(dialogConfirm).toBeDefined();
+    fireEvent.click(dialogConfirm!);
+
+    expect(mockRemoveMutate).toHaveBeenCalledTimes(1);
+    const firstCall = mockRemoveMutate.mock.calls[0];
+    expect(firstCall).toBeDefined();
+    expect(firstCall![0]).toEqual({ workspaceId: "ws-1", projectId: "p-1" });
   });
 
   it("renders a skeleton while the dashboard is loading and no data is cached", () => {
