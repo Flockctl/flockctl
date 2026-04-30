@@ -43,6 +43,7 @@ import {
   initTodoFile,
   TODO_FILE_MAX_BYTES,
 } from "../services/todo-file.js";
+import { runGitPull } from "../services/git-operations.js";
 
 const CONFIG_KEYS = [
   "model",
@@ -746,4 +747,29 @@ projectRoutes.put("/:id/todo", async (c) => {
   }
 
   return c.json(saveTodoFile(project.path, content));
+});
+
+// POST /projects/:id/git-pull — fast-forward pull from origin.
+//
+// Wraps `git pull --ff-only` with a set of pre-flight guardrails (working
+// tree must be clean, branch must have an upstream, project must be a git
+// repo) and structured error reporting. See `src/services/git-operations.ts`
+// for the full contract — including why we deliberately refuse to merge or
+// rebase from this surface (those are terminal-grade decisions, not
+// button-grade).
+//
+// Response is *always* HTTP 200 with a discriminated `{ ok, ... }` body —
+// failures are encoded in the body, not the status code, so the UI's
+// `apiFetch` wrapper does not throw away the structured `reason` and
+// `stderr` fields when a pull legitimately fails (e.g. dirty working
+// tree). The route returns a 4xx only for project-shape errors that
+// happen *before* git is even invoked (missing project, missing path).
+projectRoutes.post("/:id/git-pull", async (c) => {
+  const id = parseIdParam(c);
+  const project = getProjectOrThrow(id);
+  if (!project.path) {
+    throw new ValidationError("Project has no path — cannot run git pull");
+  }
+  const result = await runGitPull(project.path);
+  return c.json(result);
 });

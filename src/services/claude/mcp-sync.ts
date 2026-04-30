@@ -109,11 +109,24 @@ export function reconcileAllMcpInWorkspace(workspaceId: number): void {
 }
 
 /**
- * Substitute `${secret:NAME}` placeholders in env values and top-level string
- * args using the provided lookup. Missing secrets are logged and the
- * placeholder is left intact so drift is visible in the generated `.mcp.json`.
+ * Substitute `${secret:NAME}` placeholders in env values using the provided
+ * lookup. Missing secrets are logged and the placeholder is left intact so
+ * drift is visible in the generated `.mcp.json` and the operator notices.
+ *
+ * Scope of substitution: ONLY env values. Placeholders inside `args`, `cwd`,
+ * `command`, or any other field are silently passed through unchanged. This
+ * is deliberate — env is the only field with broadly-accepted "secret-shaped"
+ * semantics, and expanding scope without an explicit design pass risks
+ * leaking secrets into argv or filesystem paths visible in `ps`.
+ *
+ * Exported because the same resolution must run at TWO different points:
+ *   1. When reconciling `.mcp.json` on disk (this file).
+ *   2. When building the per-session `mcpServers` argument that gets handed
+ *      to the Claude Agent SDK — see `agent-session/session-mcp.ts`. The SDK
+ *      option overrides `.mcp.json`, so the agent path MUST resolve too or
+ *      MCP servers receive literal "${secret:NAME}" strings in env.
  */
-function resolveServerSecrets(
+export function resolveServerSecrets(
   servers: McpServer[],
   lookup: (name: string) => string | null,
 ): McpServer[] {

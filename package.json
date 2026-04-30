@@ -1,6 +1,6 @@
 {
   "name": "flockctl",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "AI task orchestration tool — local-first, single-user",
   "author": "Eduard Abdullin",
   "type": "module",
@@ -111,6 +111,7 @@
     "vitest": "^4.1.4"
   },
   "overrides": {
-    "esbuild": "^0.25.0"
+    "esbuild": "^0.25.0",
+    "@anthropic-ai/sdk": "^0.91.1"
   }
 }

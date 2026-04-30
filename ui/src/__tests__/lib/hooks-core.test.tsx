@@ -14,6 +14,7 @@ import {
   useProject,
   useCreateProject,
   useDeleteProject,
+  useGitPullProject,
   useUpdateProject,
   useCreateWorkspace,
   useDeleteWorkspace,
@@ -217,6 +218,125 @@ describe("project hooks", () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(fetchMock.mock.calls[0]![0]).toContain("/projects/1");
     expect(fetchMock.mock.calls[0]![1].method).toBe("DELETE");
+  });
+
+  // ─── useGitPullProject ──────────────────────────────────────────────────
+  // The mutation always resolves with HTTP 200 — outcome is encoded in the
+  // body's discriminated `ok` flag — so these tests pin the cache-
+  // invalidation contract per outcome shape, not just the wire call.
+  // Pulling new commits MUST invalidate `project()` and `projectTree()`
+  // (because anything reading from disk is now stale), but already-up-
+  // to-date and structured failures MUST NOT (a refetch on no-op or on
+  // an error would just thrash the UI right when the user wants the
+  // result modal to render cleanly).
+
+  it("useGitPullProject POSTs /projects/:id/git-pull", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        ok: true,
+        alreadyUpToDate: true,
+        beforeSha: "abc",
+        afterSha: "abc",
+        branch: "main",
+        commitsPulled: 0,
+        filesChanged: 0,
+        summary: "Already up to date.",
+      }),
+    );
+    (globalThis as any).fetch = fetchMock;
+    const { Wrapper } = wrap();
+    const { result } = renderHook(() => useGitPullProject(), { wrapper: Wrapper });
+    result.current.mutate("42");
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(fetchMock.mock.calls[0]![0]).toContain("/projects/42/git-pull");
+    expect(fetchMock.mock.calls[0]![1].method).toBe("POST");
+  });
+
+  it("useGitPullProject invalidates project + projectTree when commits were pulled", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        ok: true,
+        alreadyUpToDate: false,
+        beforeSha: "a".repeat(40),
+        afterSha: "b".repeat(40),
+        branch: "main",
+        commitsPulled: 1,
+        filesChanged: 2,
+        summary: "Pulled 1 commit, 2 files changed.",
+      }),
+    );
+    (globalThis as any).fetch = fetchMock;
+    const { qc, Wrapper } = wrap();
+    const spy = vi.spyOn(qc, "invalidateQueries");
+    const { result } = renderHook(() => useGitPullProject(), { wrapper: Wrapper });
+    act(() => {
+      result.current.mutate("7");
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    // Two invalidations: project(7) and projectTree(7). We assert the
+    // count plus the queryKey shape for each, so a future renaming of
+    // either key is caught by the test.
+    expect(spy).toHaveBeenCalledTimes(2);
+    const calls = spy.mock.calls.map((c) => c[0]?.queryKey);
+    // Shapes from `queryKeys.project(id)` and `queryKeys.projectTree(id)` —
+    // both start with `["projects", "7", ...]`. We pin both the project
+    // detail key (length 2) and the tree key (length 3 with "tree" tail)
+    // so a future split of the namespace is caught.
+    expect(calls).toEqual(
+      expect.arrayContaining([
+        ["projects", "7"],
+        ["projects", "7", "tree"],
+      ]),
+    );
+  });
+
+  it("useGitPullProject does NOT invalidate when already up to date", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        ok: true,
+        alreadyUpToDate: true,
+        beforeSha: "a",
+        afterSha: "a",
+        branch: "main",
+        commitsPulled: 0,
+        filesChanged: 0,
+        summary: "Already up to date.",
+      }),
+    );
+    (globalThis as any).fetch = fetchMock;
+    const { qc, Wrapper } = wrap();
+    const spy = vi.spyOn(qc, "invalidateQueries");
+    const { result } = renderHook(() => useGitPullProject(), { wrapper: Wrapper });
+    act(() => {
+      result.current.mutate("7");
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("useGitPullProject does NOT invalidate on a structured failure (ok:false)", async () => {
+    // Server returned 200 with `{ ok: false }` — caller's mutation reports
+    // success (the HTTP request worked), but nothing changed on disk so
+    // there is nothing to refetch.
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        ok: false,
+        reason: "dirty_working_tree",
+        message: "Working tree has uncommitted changes (3 files).",
+      }),
+    );
+    (globalThis as any).fetch = fetchMock;
+    const { qc, Wrapper } = wrap();
+    const spy = vi.spyOn(qc, "invalidateQueries");
+    const { result } = renderHook(() => useGitPullProject(), { wrapper: Wrapper });
+    act(() => {
+      result.current.mutate("7");
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    // The mutation itself succeeded (HTTP 200) — the data field carries
+    // the structured failure. No invalidation should have fired.
+    expect(result.current.data?.ok).toBe(false);
+    expect(spy).not.toHaveBeenCalled();
   });
 });
 

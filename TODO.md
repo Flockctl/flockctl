@@ -1,5 +1,12 @@
 - [ ] Adopt `.claude/commands/*` during existing-directory import — introduce a project-level commands concept (like skills/agents), detect in scan preview, register in DB, reconcile via symlinks. For now imports leave the folder untouched.
 
+- [ ] **Project-level git actions: commit & push (follows the `git pull` button).** Once the pull endpoint lands, extend the same surface with:
+  - **Commit:** `POST /projects/:id/git-commit` with `{ message, paths?: string[] }`. UI: a small dialog showing `git status --porcelain` checkboxes (stage selection), commit-message textarea, and the resulting `commit` SHA on success. Reject empty index, reject empty message, reject if working tree is detached HEAD.
+  - **Push:** `POST /projects/:id/git-push` with `{ remote?: "origin", setUpstream?: boolean }`. Surface auth failures (`stderr` contains `Permission denied`, `could not read Username`, `403`) as a structured `reason: "auth_failed"` so the UI can show a "configure your git credentials" hint instead of a raw stack trace. Default to pushing the current branch only — never `--all`, never `--force`. A separate `force?: boolean` flag stays opt-in and ideally hidden behind a confirmation modal.
+  - **Shared infrastructure:** factor a `runGitCommand(projectPath, args, opts)` helper used by pull/commit/push. Centralise: timeout, sanitised stderr, mapping of common git error patterns → structured `reason` codes, audit log entry per invocation.
+  - **UI:** group pull/commit/push under a single "Git" dropdown button on the project header once there are 3+ actions, instead of 3 standalone buttons polluting the row.
+  - **Out of scope (explicit):** branch switching, merge-conflict resolution UI, interactive rebase, credential management. For those, keep directing the user to a terminal — Flockctl is not trying to replace `git`.
+
 ## Nice to have — not currently planned
 
 - [ ] **P2P file sync between Flockctl daemons.** Selective, manual sync of skills, MCP configs, and workspace/project configs between two daemons over the existing SSH-tunnel transport (see `docs/REMOTE-ACCESS.md`). Sketch:

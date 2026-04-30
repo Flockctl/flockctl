@@ -543,6 +543,122 @@ describe("claude-mcp-sync", () => {
     expect(src.env.GITHUB_TOKEN).toBe("${secret:GITHUB_TOKEN}");
   });
 
+  it("project secret shadows workspace + global with the same name during reconcile", async () => {
+    const { upsertSecret } = await import("../../services/secrets.js");
+    const wsPath = mkdtempSync(join(tmpBase, "ws-shadow-rec-"));
+    const ws = db.insert(workspaces).values({ name: "ws-shadow-rec", path: wsPath }).returning().get()!;
+    const projPath = mkdtempSync(join(tmpBase, "proj-shadow-rec-"));
+    const proj = db.insert(projects).values({ name: "p-shadow-rec", workspaceId: ws.id, path: projPath }).returning().get()!;
+
+    mkdirSync(join(projPath, ".flockctl", "mcp"), { recursive: true });
+    writeFileSync(
+      join(projPath, ".flockctl", "mcp", "srv.json"),
+      JSON.stringify({ command: "node", env: { TOKEN: "${secret:TOKEN}" } }),
+    );
+
+    upsertSecret({ scope: "global", scopeId: null, name: "TOKEN", value: "global-val" });
+    upsertSecret({ scope: "workspace", scopeId: ws.id, name: "TOKEN", value: "workspace-val" });
+    upsertSecret({ scope: "project", scopeId: proj.id, name: "TOKEN", value: "project-val" });
+
+    reconcileMcpForProject(proj.id);
+    const merged = JSON.parse(readFileSync(join(projPath, ".mcp.json"), "utf-8"));
+    expect(merged.mcpServers["srv"].env.TOKEN).toBe("project-val");
+
+    // And at workspace scope (no project), workspace wins over global.
+    reconcileMcpForWorkspace(ws.id);
+    const wsMerged = JSON.parse(readFileSync(join(wsPath, ".mcp.json"), "utf-8"));
+    // The MCP config above lives at project scope, so workspace's `.mcp.json`
+    // doesn't see it. Repeat the setup at workspace scope to assert the
+    // workspace-vs-global precedence in the reconcile path.
+    mkdirSync(join(wsPath, ".flockctl", "mcp"), { recursive: true });
+    writeFileSync(
+      join(wsPath, ".flockctl", "mcp", "wsrv.json"),
+      JSON.stringify({ command: "node", env: { TOKEN: "${secret:TOKEN}" } }),
+    );
+    reconcileMcpForWorkspace(ws.id);
+    const wsMerged2 = JSON.parse(readFileSync(join(wsPath, ".mcp.json"), "utf-8"));
+    expect(wsMerged2.mcpServers["wsrv"].env.TOKEN).toBe("workspace-val");
+    void wsMerged; // keep the early read referenced
+  });
+
+  it("substitutes multiple ${secret:NAME} placeholders + literal text in one env value", async () => {
+    const { upsertSecret } = await import("../../services/secrets.js");
+    const projPath = mkdtempSync(join(tmpBase, "proj-multi-rec-"));
+    const proj = db.insert(projects).values({ name: "p-multi-rec", path: projPath }).returning().get()!;
+
+    mkdirSync(join(projPath, ".flockctl", "mcp"), { recursive: true });
+    writeFileSync(
+      join(projPath, ".flockctl", "mcp", "db.json"),
+      JSON.stringify({
+        command: "pg-mcp",
+        env: {
+          DB_URL: "postgres://${secret:DB_USER}:${secret:DB_PASS}@db.local:5432/app",
+          // Same placeholder repeated twice — must be substituted both times.
+          REPEATED: "[${secret:DB_USER}]:[${secret:DB_USER}]",
+        },
+      }),
+    );
+    upsertSecret({ scope: "project", scopeId: proj.id, name: "DB_USER", value: "alice" });
+    upsertSecret({ scope: "project", scopeId: proj.id, name: "DB_PASS", value: "p@ssw0rd" });
+
+    reconcileMcpForProject(proj.id);
+    const merged = JSON.parse(readFileSync(join(projPath, ".mcp.json"), "utf-8"));
+    expect(merged.mcpServers["db"].env.DB_URL).toBe(
+      "postgres://alice:p@ssw0rd@db.local:5432/app",
+    );
+    expect(merged.mcpServers["db"].env.REPEATED).toBe("[alice]:[alice]");
+  });
+
+  it("does NOT substitute placeholders inside args — env-only by design", async () => {
+    const { upsertSecret } = await import("../../services/secrets.js");
+    const projPath = mkdtempSync(join(tmpBase, "proj-argsnoop-"));
+    const proj = db.insert(projects).values({ name: "p-argsnoop", path: projPath }).returning().get()!;
+
+    mkdirSync(join(projPath, ".flockctl", "mcp"), { recursive: true });
+    writeFileSync(
+      join(projPath, ".flockctl", "mcp", "srv.json"),
+      JSON.stringify({
+        command: "node",
+        args: ["--token=${secret:TOKEN}", "--mode=safe"],
+        env: { K: "${secret:TOKEN}" },
+      }),
+    );
+    upsertSecret({ scope: "project", scopeId: proj.id, name: "TOKEN", value: "must-not-leak-to-argv" });
+
+    reconcileMcpForProject(proj.id);
+    const merged = JSON.parse(readFileSync(join(projPath, ".mcp.json"), "utf-8"));
+    // env: substituted (auth-bearing).
+    expect(merged.mcpServers["srv"].env.K).toBe("must-not-leak-to-argv");
+    // args: untouched. Visible in `ps`/argv → keep placeholder for safety.
+    expect(merged.mcpServers["srv"].args).toEqual([
+      "--token=${secret:TOKEN}",
+      "--mode=safe",
+    ]);
+  });
+
+  it("emits a parseable .mcp.json when the secret value contains JSON-special chars", async () => {
+    const { upsertSecret } = await import("../../services/secrets.js");
+    const projPath = mkdtempSync(join(tmpBase, "proj-special-rec-"));
+    const proj = db.insert(projects).values({ name: "p-special-rec", path: projPath }).returning().get()!;
+
+    mkdirSync(join(projPath, ".flockctl", "mcp"), { recursive: true });
+    writeFileSync(
+      join(projPath, ".flockctl", "mcp", "srv.json"),
+      JSON.stringify({ command: "node", env: { K: "${secret:WEIRD}" } }),
+    );
+    const weird = 'line1\nline2"with-quote\\and-backslash and a $variable';
+    upsertSecret({ scope: "project", scopeId: proj.id, name: "WEIRD", value: weird });
+
+    reconcileMcpForProject(proj.id);
+    // The disk artefact must be valid JSON — JSON.stringify handles escaping
+    // automatically, but this is the canary that guards against future
+    // changes (e.g. someone manually building the JSON string with template
+    // literals would break this).
+    const raw = readFileSync(join(projPath, ".mcp.json"), "utf-8");
+    const parsed = JSON.parse(raw);
+    expect(parsed.mcpServers["srv"].env.K).toBe(weird);
+  });
+
   it("keeps placeholder intact when the secret is missing everywhere", () => {
     const projPath = mkdtempSync(join(tmpBase, "proj-mcp-missing-"));
     const proj = db.insert(projects).values({ name: "p-miss", path: projPath }).returning().get()!;

@@ -23,7 +23,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { Plus, Trash2, ChevronDown, ChevronRight } from "lucide-react";
+import { Plus, Trash2, Pencil, ChevronDown, ChevronRight } from "lucide-react";
 import { ConfirmDialog, useConfirmDialog } from "@/components/confirm-dialog";
 import { DisableToggle } from "./DisableToggle";
 import { levelColors } from "./shared";
@@ -63,8 +63,9 @@ export function McpTab({
 
   const deleteConfirm = useConfirmDialog();
   const [deleteTarget, setDeleteTarget] = useState<McpServer | null>(null);
-  const [createOpen, setCreateOpen] = useState(false);
-  const [createScope, setCreateScope] = useState<"global" | "workspace" | "project">("global");
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [dialogScope, setDialogScope] = useState<"global" | "workspace" | "project">("global");
+  const [editServer, setEditServer] = useState<McpServer | null>(null);
   const [expandedServer, setExpandedServer] = useState<string | null>(null);
 
   const allServers = useMemo(() => {
@@ -96,8 +97,20 @@ export function McpTab({
   }
 
   function openCreate(scope: "global" | "workspace" | "project") {
-    setCreateScope(scope);
-    setCreateOpen(true);
+    setEditServer(null);
+    setDialogScope(scope);
+    setDialogOpen(true);
+  }
+
+  function handleEdit(server: McpServer) {
+    setEditServer(server);
+    setDialogScope(server.level);
+    setDialogOpen(true);
+  }
+
+  function handleDialogOpenChange(open: boolean) {
+    setDialogOpen(open);
+    if (!open) setEditServer(null);
   }
 
   if (isLoading) {
@@ -215,6 +228,19 @@ export function McpTab({
                           variant="ghost"
                           size="icon"
                           className="h-7 w-7"
+                          title="Edit"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleEdit(server);
+                          }}
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7"
+                          title="Delete"
                           onClick={(e) => {
                             e.stopPropagation();
                             handleDelete(server);
@@ -240,11 +266,12 @@ export function McpTab({
       )}
 
       <McpServerDialog
-        open={createOpen}
-        onOpenChange={setCreateOpen}
-        scope={createScope}
+        open={dialogOpen}
+        onOpenChange={handleDialogOpenChange}
+        scope={dialogScope}
         workspaceId={workspaceId}
         projectId={projectId}
+        editServer={editServer}
       />
       <ConfirmDialog
         open={deleteConfirm.open}

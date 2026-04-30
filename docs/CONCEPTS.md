@@ -299,6 +299,8 @@ An **external tool the agent can call**, wired in through the [Model Context Pro
 
 Same three-tier resolution as skills (global / workspace / project), same overriding behavior, same ability to disable an inherited server you don't want in a particular project.
 
+The **source of truth** for an MCP server is a per-scope JSON file — `${FLOCKCTL_HOME}/mcp/{name}.json` (global), `<workspace>/.flockctl/mcp/{name}.json` (workspace), or `<project>/.flockctl/mcp/{name}.json` (project). The `.mcp.json` file you see at a workspace or project root is **a generated artifact** the reconciler writes by merging the three tiers and resolving `${secret:NAME}` placeholders; it is gitignored and regenerated on every MCP change. Deleting `.mcp.json` therefore won't make a server disappear from the UI — to actually remove a server, delete it through the API/UI or delete the source JSON file in the relevant scope dir. See the `mcp-add` skill for the canonical add/remove playbook.
+
 ### Agent
 
 The **AI backend** actually running a task or chat. Today that's Claude Code (via the Claude Code CLI or the Claude Agent SDK). The field exists so Flockctl can grow support for other agents later; in practice you pick Claude Code and forget about it.

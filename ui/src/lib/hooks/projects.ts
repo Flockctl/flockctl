@@ -13,8 +13,10 @@ import {
   fetchProjectTree,
   fetchProjectAllowedKeys,
   fetchAutoExecStatus,
+  gitPullProject,
 } from "../api";
 import type {
+  GitPullResult,
   Project,
   ProjectAllowedKeys,
   ProjectCreate,
@@ -115,6 +117,30 @@ export function useUpdateProject() {
       queryClient.invalidateQueries({
         queryKey: queryKeys.projectAllowedKeys(id),
       });
+    },
+  });
+}
+
+/**
+ * Run `git pull --ff-only` against the project's local clone. The
+ * mutation always resolves (HTTP 200) — caller inspects the returned
+ * `GitPullResult.ok` to distinguish success from a structured failure.
+ *
+ * On success we invalidate the project query and the project tree so any
+ * derived UI (file lists, plan-store summaries) reflects the new HEAD.
+ * On structured failure (`ok: false`) we deliberately do *not* invalidate
+ * — nothing changed on disk, and a needless refetch would just thrash
+ * the UI right when we want to show the error modal cleanly.
+ */
+export function useGitPullProject() {
+  const queryClient = useQueryClient();
+  return useMutation<GitPullResult, Error, string>({
+    mutationFn: (projectId) => gitPullProject(projectId),
+    onSuccess: (result, projectId) => {
+      if (result.ok && !result.already_up_to_date) {
+        queryClient.invalidateQueries({ queryKey: queryKeys.project(projectId) });
+        queryClient.invalidateQueries({ queryKey: queryKeys.projectTree(projectId) });
+      }
     },
   });
 }

@@ -141,6 +141,55 @@ export interface ProjectTree {
   milestones: MilestoneTree[];
 }
 
+// --- Git Pull (POST /projects/:id/git-pull) ---
+
+/**
+ * Reason codes for a failed `git pull`. Mirrors the server-side
+ * `GitPullReason` union in `src/services/git-operations.ts`. The UI
+ * switches on this to choose between toast / modal copy and to decide
+ * whether to invalidate the project query cache.
+ *
+ * - `not_a_git_repo` — the project's path has no `.git/` directory.
+ * - `no_upstream`    — current branch has no `@{u}` upstream, or
+ *                      the repo is in detached-HEAD state.
+ * - `dirty_working_tree` — there are uncommitted changes; we refuse
+ *                      to pull rather than risk a surprise merge.
+ * - `non_fast_forward`  — local and remote have diverged; `--ff-only`
+ *                      refuses to merge. The user has to resolve in a
+ *                      terminal (rebase / merge / reset).
+ * - `auth_failed`    — SSH key rejected, HTTPS creds missing, or 403.
+ * - `network_error`  — DNS / connection refused / timeout.
+ * - `unknown`        — anything we didn't recognise; surface raw stderr.
+ */
+export type GitPullReason =
+  | "not_a_git_repo"
+  | "no_upstream"
+  | "dirty_working_tree"
+  | "non_fast_forward"
+  | "auth_failed"
+  | "network_error"
+  | "unknown";
+
+export interface GitPullSuccess {
+  ok: true;
+  already_up_to_date: boolean;
+  before_sha: string;
+  after_sha: string;
+  branch: string;
+  commits_pulled: number;
+  files_changed: number;
+  summary: string;
+}
+
+export interface GitPullFailure {
+  ok: false;
+  reason: GitPullReason;
+  message: string;
+  stderr?: string;
+}
+
+export type GitPullResult = GitPullSuccess | GitPullFailure;
+
 // --- Project Allowed Keys (resolved with workspace → project inheritance) ---
 
 /**

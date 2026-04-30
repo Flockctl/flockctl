@@ -50,6 +50,17 @@ export function getAuthHeaders(): Record<string, string> {
 // --- Key conversion utilities ---
 
 function camelToSnake(str: string): string {
+  // Leave strings alone that are already in a snake-shaped form so that
+  // user-defined identifiers (env var names, secret references, header
+  // names, …) survive deep traversal in `toSnakeKeys`.
+  //
+  //   - No uppercase → already snake_case or plain lowercase → no-op.
+  //   - No lowercase → SCREAMING_SNAKE_CASE / acronym → no-op. Without
+  //     this guard, `ALBS_JWT_TOKEN` would get rewritten to
+  //     `_a_l_b_s__j_w_t__t_o_k_e_n` because the regex blindly inserts
+  //     an underscore before every uppercase letter, including ones
+  //     that are already preceded by an underscore.
+  if (!/[A-Z]/.test(str) || !/[a-z]/.test(str)) return str;
   return str.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
 }
 

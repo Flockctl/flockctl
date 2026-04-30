@@ -19,8 +19,10 @@
  * daemon validates it.
  */
 import type { Command } from "commander";
-import { readFileSync } from "fs";
-import { resolve as resolvePath } from "path";
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "fs";
+import { resolve as resolvePath, join as joinPath } from "path";
+import { tmpdir } from "os";
+import { spawnSync } from "child_process";
 import { createDaemonClient, exitWithDaemonError } from "../lib/daemon-client.js";
 import { printJson } from "./_shared.js";
 import { pickScope, resolveScopeId, scopeBucketPath, type ScopeOpts } from "./_scope.js";
@@ -117,6 +119,66 @@ export function registerMcpCommand(program: Command): void {
           const config = readJsonFromFileOrStdin(opts.configFile);
           await client.post(scopeBucketPath("mcp", scope, scopeId), { name, config });
           console.log(`Saved ${scope} MCP server: ${name}`);
+        } catch (err) {
+          exitWithDaemonError(err);
+        }
+      },
+    );
+
+  cmd
+    .command("edit <name>")
+    .description(
+      "Edit an existing MCP server config at the chosen scope. " +
+        "Without `-c` opens the current config in $EDITOR; with `-c <path>` replaces it from a file (or `-` for stdin).",
+    )
+    .option("-c, --config-file <path>", "Path to a JSON config file (or `-` for stdin)")
+    .option("-w, --workspace <idOrName>", "Workspace scope")
+    .option("-p, --project <idOrName>", "Project scope")
+    .action(
+      async (
+        name: string,
+        opts: ScopeOpts & { configFile?: string },
+      ) => {
+        try {
+          const client = createDaemonClient();
+          const scope = pickScope(opts);
+          const scopeId = await resolveScopeId(client, scope, opts);
+          const bucket = scopeBucketPath("mcp", scope, scopeId);
+
+          // Load the existing entry so we can either edit it interactively
+          // or fail fast if it does not exist (edit ≠ create).
+          const servers = await client.get<McpServerEntry[]>(bucket);
+          const existing = servers.find((s) => s.name === name);
+          if (!existing) {
+            throw new Error(
+              `MCP server "${name}" not found at ${scope} scope. Use \`flockctl mcp add\` to create it.`,
+            );
+          }
+
+          let nextConfig: unknown;
+          if (opts.configFile) {
+            nextConfig = readJsonFromFileOrStdin(opts.configFile);
+          } else {
+            // $EDITOR flow — write current config to a temp file, spawn the
+            // editor, then re-parse on close. tmp dir is cleaned up either way.
+            const editor =
+              process.env.VISUAL || process.env.EDITOR || (process.platform === "darwin" ? "vi" : "vi");
+            const dir = mkdtempSync(joinPath(tmpdir(), "flockctl-mcp-"));
+            const file = joinPath(dir, `${name}.json`);
+            writeFileSync(file, JSON.stringify(existing.config, null, 2) + "\n", "utf-8");
+            try {
+              const res = spawnSync(editor, [file], { stdio: "inherit" });
+              if (res.status !== 0) {
+                throw new Error(`Editor "${editor}" exited with status ${res.status ?? "unknown"}`);
+              }
+              nextConfig = readJsonFromFileOrStdin(file);
+            } finally {
+              rmSync(dir, { recursive: true, force: true });
+            }
+          }
+
+          await client.post(bucket, { name, config: nextConfig });
+          console.log(`Updated ${scope} MCP server: ${name}`);
         } catch (err) {
           exitWithDaemonError(err);
         }

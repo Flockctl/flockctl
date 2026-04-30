@@ -96,6 +96,51 @@ describe("apiFetch — response key conversion", () => {
     expect(res[0].key_name).toBe(1);
     expect(res[1].key_name).toBe(2);
   });
+
+  // Regression: SCREAMING_SNAKE_CASE keys nested inside response objects
+  // (env vars, header names, secret references, …) must NOT be mangled.
+  // Before the fix, `camelToSnake("ALBS_JWT_TOKEN")` produced
+  // `"_a_l_b_s__j_w_t__t_o_k_e_n"` because the regex blindly inserts an
+  // underscore before every uppercase letter — surfacing in the UI as
+  // garbled env var names on the MCP servers panel.
+  it("preserves SCREAMING_SNAKE_CASE keys nested in response (e.g. MCP env)", async () => {
+    (globalThis as any).fetch = vi.fn().mockResolvedValue(
+      jsonResponse({
+        config: {
+          command: "albs-mcp",
+          env: {
+            ALBS_JWT_TOKEN: "${secret:ALBS_JWT_TOKEN}",
+            HTTP_PROXY: "http://proxy.local:8080",
+          },
+        },
+      }),
+    );
+    const res = await apiFetch<any>("/x");
+    expect(res.config.env).toEqual({
+      ALBS_JWT_TOKEN: "${secret:ALBS_JWT_TOKEN}",
+      HTTP_PROXY: "http://proxy.local:8080",
+    });
+    // Specifically guard against the historical corruption shape.
+    expect(res.config.env).not.toHaveProperty("_a_l_b_s__j_w_t__t_o_k_e_n");
+  });
+
+  it("preserves single-word ALL_CAPS keys (acronyms)", async () => {
+    (globalThis as any).fetch = vi.fn().mockResolvedValue(
+      jsonResponse({ headers: { ETAG: "abc", URL: "http://x" } }),
+    );
+    const res = await apiFetch<any>("/x");
+    expect(res.headers).toEqual({ ETAG: "abc", URL: "http://x" });
+  });
+
+  it("still converts true camelCase keys to snake_case (mixed-case unchanged)", async () => {
+    (globalThis as any).fetch = vi.fn().mockResolvedValue(
+      jsonResponse({ fooBar: 1, alreadySnake_case: 2 }),
+    );
+    const res = await apiFetch<any>("/x");
+    expect(res.foo_bar).toBe(1);
+    // mixed camel + snake still gets normalised
+    expect(res.already_snake_case).toBe(2);
+  });
 });
 
 describe("apiFetch — request body key conversion", () => {

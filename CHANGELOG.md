@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4] - 2026-04-30
+
+### Added
+- Per-project Git pull from the project detail page. New `POST /projects/:id/git-pull` endpoint wraps `git pull --ff-only` with pre-flight guardrails (project must be a git repo, working tree must be clean, branch must have an upstream) and structured error reporting via a discriminated `{ ok, ... }` response. Failures are encoded in the body with `reason` + `stderr`, not the HTTP status, so the UI keeps the structured detail when a pull legitimately fails (dirty tree, no upstream, non-fast-forward, etc.). The endpoint deliberately refuses merge / rebase paths — those remain terminal-grade decisions, not button-grade. The project detail page surfaces a "Pull from origin" affordance and shows the failure category inline.
+- `flockctl mcp edit <name>` CLI subcommand for editing an existing MCP server config at the chosen scope. Without `-c` opens the current config in `$EDITOR` / `$VISUAL` (falls back to `vi`); with `-c <path>` replaces it from a file or `-` for stdin. Edit is strictly an update path — fails fast with a clear error if the named server doesn't exist at the chosen scope (use `flockctl mcp add` to create). Temp files are cleaned up on every exit branch including editor-non-zero.
+- MCP server edit affordance in the workspace / project Skills & MCP tab. Each MCP server row now exposes an "Edit" button alongside Remove, opening a JSON editor dialog pre-populated with the current config; saving issues an upsert against the same daemon endpoint `flockctl mcp edit -c` uses, so CLI and UI stay on a single write path.
+
+### Fixed
+- MCP server `${secret:NAME}` placeholders are now substituted on the **agent SDK code path** as well, not just at `.mcp.json` reconcile time. Background: the Claude Agent SDK does NOT auto-read `.mcp.json` — when `mcpServers` is passed via `query()` options it overrides the on-disk file entirely. Previously `resolveMcpServersForSession` handed the SDK raw configs containing literal `"${secret:GITHUB_TOKEN}"` env values, so the spawned MCP child process saw the placeholder string and any auth-bearing tool silently failed. The session resolver now runs `resolveServerSecrets` against the same project > workspace > global scope chain the reconcile path uses, with the same "missing secret stays as a visible placeholder + warns" contract — both paths stay in sync. Regression coverage in `src/__tests__/services/session-mcp.test.ts` plus a live-tier fixture (`tests/live/test-mcp-secrets.ts`).
+- `resolveServerSecrets` in `services/claude/mcp-sync.ts` is now exported and shape-stable so the agent-session resolver can call it without duplicating the substitution logic.
+
+### Security
+- Bumped transitive `@anthropic-ai/sdk` to `^0.91.1` via npm `overrides` to clear `GHSA-p7fg-763f-g4gf` (Insecure Default File Permissions in Local Filesystem Memory Tool, moderate). The vulnerable range is `0.79.0 - 0.91.0`; the nested `@anthropic-ai/claude-agent-sdk/node_modules/@anthropic-ai/sdk` was pinned at `0.81.0` until the override forced it to `0.91.1`. `npm audit --audit-level=moderate` now returns 0 findings on the root project. Non-breaking — `0.91.x` is API-compatible with `0.81.x` for the surface we use.
+
 ## [0.0.3] - 2026-04-29
 
 ### Added

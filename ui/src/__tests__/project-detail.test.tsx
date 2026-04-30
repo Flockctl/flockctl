@@ -73,6 +73,10 @@ vi.mock("@/lib/hooks", async () => {
     useProjectConfig: () => ({ data: { baseBranch: "main" } }),
     useAttention: () => ({ items: [], total: 0 }),
     useCreateChat: () => ({ isPending: false, mutateAsync: vi.fn() }),
+    // The Git Pull button on the page header calls `useGitPullProject()`
+    // unconditionally — stub it so the dispatch suite doesn't need a
+    // react-query provider.
+    useGitPullProject: () => ({ isPending: false, mutate: vi.fn() }),
   };
 });
 

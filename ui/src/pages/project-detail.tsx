@@ -1,15 +1,30 @@
 import { useMemo, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { ListChecks, MessageSquare } from "lucide-react";
+import {
+  GitPullRequestArrow,
+  ListChecks,
+  Loader2,
+  MessageSquare,
+} from "lucide-react";
 
 import {
   useAttention,
   useCreateChat,
+  useGitPullProject,
   useProject,
   useProjectConfig,
 } from "@/lib/hooks";
+import type { GitPullReason, GitPullResult } from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { TodoMdDialog } from "@/components/todo-md-dialog";
@@ -109,6 +124,34 @@ export default function ProjectDetailPage() {
 
   const [todoOpen, setTodoOpen] = useState(false);
 
+  // ─── Git Pull state ─────────────────────────────────────────────────────
+  // The mutation always resolves with HTTP 200 (failures are encoded in the
+  // body's `ok` field — see `useGitPullProject`). We surface the result via
+  // a single dialog that adapts its copy to the discriminated outcome:
+  //   - success + alreadyUpToDate → brief confirmation
+  //   - success + commits pulled  → summary + before/after SHAs
+  //   - failure                   → reason + message + raw stderr block
+  // The dialog is the only failure surface — we don't want a silent toast
+  // for `git pull` errors because the user almost always needs the stderr
+  // to diagnose (auth, divergence, etc.).
+  const gitPull = useGitPullProject();
+  const [gitPullResult, setGitPullResult] = useState<GitPullResult | null>(null);
+  const handleGitPull = () => {
+    if (!projectId) return;
+    gitPull.mutate(projectId, {
+      onSuccess: (result) => setGitPullResult(result),
+      // The mutation should not reject — apiFetch only throws on transport
+      // failure. On the rare network-level error we still want the user
+      // to see *something*, so synthesize a minimal failure result.
+      onError: (err) =>
+        setGitPullResult({
+          ok: false,
+          reason: "unknown",
+          message: err.message || "Failed to reach the daemon",
+        }),
+    });
+  };
+
   if (!projectId) {
     return <p className="text-destructive">Missing project ID.</p>;
   }
@@ -207,6 +250,33 @@ export default function ProjectDetailPage() {
               <ListChecks className="mr-1 h-4 w-4" />
               TODO
             </Button>
+            {/*
+              Git pull lives on the header (not in a dedicated tab) because
+              it's a high-frequency, click-and-go action — typically run
+              while looking at the Plan tab to refresh the local clone
+              after a teammate pushes. A future "Git" tab is planned to
+              host commit/push/status/log (see TODO.md), with this header
+              button kept around as a shortcut.
+            */}
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={gitPull.isPending || !project?.path}
+              onClick={handleGitPull}
+              data-testid="project-detail-page-git-pull"
+              title={
+                project?.path
+                  ? "git pull --ff-only from origin"
+                  : "Project has no local path"
+              }
+            >
+              {gitPull.isPending ? (
+                <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+              ) : (
+                <GitPullRequestArrow className="mr-1 h-4 w-4" />
+              )}
+              {gitPull.isPending ? "Pulling…" : "Pull"}
+            </Button>
           </div>
         </div>
 
@@ -281,7 +351,118 @@ export default function ProjectDetailPage() {
           title={project.name}
         />
       )}
+      <GitPullResultDialog
+        result={gitPullResult}
+        onClose={() => setGitPullResult(null)}
+      />
     </div>
   );
+}
+
+// ─── Git pull result dialog ────────────────────────────────────────────────
+//
+// Single dialog shared between the success and failure paths so the user
+// always lands on the same interaction shape regardless of outcome. We
+// deliberately keep the copy short — the value-add is the structured
+// summary line + the raw `stderr` block on failure (kept in a
+// monospaced <pre> so an operator can copy-paste it into a terminal
+// without losing whitespace).
+
+function GitPullResultDialog({
+  result,
+  onClose,
+}: {
+  result: GitPullResult | null;
+  onClose: () => void;
+}) {
+  return (
+    <Dialog
+      open={result !== null}
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <DialogContent
+        className="max-w-lg"
+        data-testid="git-pull-result-dialog"
+      >
+        {result?.ok ? (
+          <>
+            <DialogHeader>
+              <DialogTitle>
+                {result.already_up_to_date
+                  ? "Already up to date"
+                  : "Pull complete"}
+              </DialogTitle>
+              <DialogDescription>
+                Branch <span className="font-mono">{result.branch}</span> ·{" "}
+                {result.summary}
+              </DialogDescription>
+            </DialogHeader>
+            {!result.already_up_to_date && (
+              <div className="text-xs text-muted-foreground">
+                <span className="font-mono">
+                  {result.before_sha.slice(0, 7)}
+                </span>{" "}
+                →{" "}
+                <span className="font-mono">
+                  {result.after_sha.slice(0, 7)}
+                </span>
+              </div>
+            )}
+            <DialogFooter>
+              <Button variant="outline" size="sm" onClick={onClose}>
+                Close
+              </Button>
+            </DialogFooter>
+          </>
+        ) : result ? (
+          <>
+            <DialogHeader>
+              <DialogTitle>Pull failed</DialogTitle>
+              <DialogDescription>
+                {gitPullReasonHeadline(result.reason)}
+              </DialogDescription>
+            </DialogHeader>
+            <p className="text-sm">{result.message}</p>
+            {result.stderr && (
+              <pre
+                className="max-h-48 overflow-auto rounded bg-muted p-2 text-xs font-mono whitespace-pre-wrap"
+                data-testid="git-pull-stderr"
+              >
+                {result.stderr}
+              </pre>
+            )}
+            <DialogFooter>
+              <Button variant="outline" size="sm" onClick={onClose}>
+                Close
+              </Button>
+            </DialogFooter>
+          </>
+        ) : null}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function gitPullReasonHeadline(reason: GitPullReason): string {
+  switch (reason) {
+    case "not_a_git_repo":
+      return "Project is not a git repository.";
+    case "no_upstream":
+      return "Current branch has no upstream.";
+    case "dirty_working_tree":
+      return "Working tree has uncommitted changes.";
+    case "non_fast_forward":
+      return "Local and remote have diverged — fast-forward not possible.";
+    case "auth_failed":
+      return "Authentication with the remote failed.";
+    case "network_error":
+      return "Could not reach the remote.";
+    /* v8 ignore next 2 — unreachable; the union above is exhaustive over GitPullReason */
+    case "unknown":
+    default:
+      return "git pull failed.";
+  }
 }
 
