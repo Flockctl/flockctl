@@ -68,6 +68,15 @@ describe("Chats API — worktree isolation", () => {
   function initProjectRepo(dir: string): void {
     mkdirSync(dir, { recursive: true });
     git(dir, ["init", "-q", "-b", "main"]);
+    // Pin user identity on the project repo itself — `applyWorktreeBranch`
+    // runs `git merge` through the service's own git helper which does NOT
+    // forward the test's GIT_AUTHOR_*/GIT_COMMITTER_* env, so on CI (where
+    // no global user.email is set) the merge would fail with
+    // "Author identity unknown" and the route would mis-classify the
+    // failure as a generic merge conflict. Per-repo config is the
+    // surface that survives that env-stripping boundary.
+    git(dir, ["config", "user.email", "test@flockctl.local"]);
+    git(dir, ["config", "user.name", "Flockctl Test"]);
     writeFileSync(join(dir, "README.md"), "# fixture\n");
     git(dir, ["add", "README.md"]);
     git(dir, ["commit", "-q", "-m", "init"]);

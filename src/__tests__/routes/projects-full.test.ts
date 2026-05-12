@@ -200,7 +200,13 @@ describe("projects — POST with repoUrl (git clone)", () => {
   it("422 when repoUrl points at an existing .git directory", async () => {
     const wsPath = mkdtempSync(join(tempDir, "ws-clone-conflict-"));
     const ws = db.insert(workspaces).values({ name: "ws-clone", path: wsPath }).returning().get()!;
-    const derived = join(wsPath, "Clash");
+    // Pre-create the derived project path using the slugified name (the
+    // route runs `slugify(body.name)` to compute it). Hard-coding "Clash"
+    // worked on case-insensitive filesystems (macOS/HFS+/APFS) where
+    // `Clash` and `clash` collide, but on Linux CI the route looks at
+    // `<wsPath>/clash` while we created `<wsPath>/Clash` and the .git
+    // check missed.
+    const derived = join(wsPath, "clash");
     mkdirSync(join(derived, ".git"), { recursive: true });
 
     const res = await app.request("/projects", {
