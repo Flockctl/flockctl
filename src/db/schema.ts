@@ -1,5 +1,6 @@
 import { sqliteTable, text, integer, real, index, uniqueIndex, check } from "drizzle-orm/sqlite-core";
 import { sql, desc } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
 
 // ─── AI Provider Keys ───
 export const aiProviderKeys = sqliteTable("ai_provider_keys", {
@@ -146,6 +147,32 @@ export const tasks = sqliteTable("tasks", {
    * boot-time recovery query that reads this column.
    */
   resumeAt: integer("resume_at"),
+  /**
+   * Isolation mode for the agent session. NULL means "run in
+   * `task.workingDir` (or project path) directly" — the legacy behaviour.
+   * `'worktree'` means the executor materialises a per-task git worktree
+   * under `<project>/.flockctl/worktrees/task-<id>/` before launch, runs
+   * the agent there, and (if the worktree is clean on finalize) removes
+   * it again. Stringly-typed so future modes ('container', 'sandbox', …)
+   * can be added without a CHECK-drop migration. See migration 0060.
+   */
+  isolation: text("isolation"),
+  /**
+   * Absolute path to the per-task git worktree once it has been created
+   * (NULL until creation; NULL forever for `isolation IS NULL` tasks).
+   * Stored absolute so the value survives a project rename / move. When a
+   * task finalises with a clean worktree, the row is rewritten back to
+   * NULL by the cleanup hook; when the worktree is left behind because of
+   * uncommitted changes, this column is the operator's pointer to it.
+   */
+  worktreePath: text("worktree_path"),
+  /**
+   * Branch name created alongside the worktree (`flockctl/task-<id>`).
+   * Captured at creation time so cleanup can `git branch -D` even after
+   * the worktree directory itself is gone (e.g. removed manually). NULL
+   * iff `worktree_path` is NULL.
+   */
+  worktreeBranch: text("worktree_branch"),
   createdAt: text("created_at").default(sql`(datetime('now'))`),
   startedAt: text("started_at"),
   completedAt: text("completed_at"),
@@ -153,10 +180,34 @@ export const tasks = sqliteTable("tasks", {
 }, (table) => [
   index("idx_tasks_project_status").on(table.projectId, table.status),
   index("idx_tasks_status_created").on(table.status, table.createdAt),
+  // Added in migration 0059 — covers the dominant tasks-list query path
+  // (`WHERE project_id = ? ORDER BY created_at DESC LIMIT N`). The existing
+  // `idx_tasks_project_status` doesn't help past the WHERE because its
+  // second column is `status`, not `created_at`; the planner falls back to
+  // a sort. The DESC marker keeps the index walked in already-ordered form.
+  index("idx_tasks_project_created_desc").on(table.projectId, table.createdAt),
   // Partial index covering only currently-paused rows — keeps the
   // bootstrap-recovery query bounded by the live rate-limited population
   // rather than the full tasks table.
   index("idx_tasks_resume_at").on(table.resumeAt).where(sql`resume_at IS NOT NULL`),
+  // Added in migration 0061 — partial indexes on FK columns flagged by the
+  // audit. All three are heavily skewed to NULL (most tasks have no parent,
+  // most aren't tied to a specific AI key, most have no label), so partial
+  // indexes keep the structure small while the planner still picks them up
+  // when the filter excludes NULL.
+  //
+  //   * parentTaskId — used by tasks-list stats (failedRerunAgg,
+  //     supersededFailuresAgg, buildAfterRerunAgg in routes/tasks/crud.ts)
+  //     plus the rerun-chain lookup; scan size goes from total tasks → rows
+  //     with parent.
+  //   * assignedKeyId — used by /metrics/overview with ?ai_provider_key_id=…
+  //     and the FK SET NULL cascade when an AI key is deleted.
+  //   * label — used by GET /tasks?label=foo (currently full scan because
+  //     no index) and the schedules-by-template prefix-LIKE in
+  //     routes/schedules.ts.
+  index("idx_tasks_parent").on(table.parentTaskId).where(sql`parent_task_id IS NOT NULL`),
+  index("idx_tasks_assigned_key").on(table.assignedKeyId).where(sql`assigned_key_id IS NOT NULL`),
+  index("idx_tasks_label").on(table.label).where(sql`label IS NOT NULL`),
 ]);
 
 // ─── Task Logs ───
@@ -166,7 +217,13 @@ export const taskLogs = sqliteTable("task_logs", {
   content: text("content").notNull(),
   streamType: text("stream_type").default("stdout"),
   timestamp: text("timestamp").default(sql`(datetime('now'))`),
-});
+}, (table) => [
+  // Added in migration 0058 — covers `GET /tasks/:id/logs` (the only
+  // hot-path lookup) plus the FK constraint check fired by
+  // `DELETE FROM tasks WHERE id = ?`. Composite (task_id, timestamp)
+  // serves both the WHERE filter and the ORDER BY in one index.
+  index("idx_task_logs_task_timestamp").on(table.taskId, table.timestamp),
+]);
 
 // ─── Task Templates ───
 // Templates are file-backed (JSON on disk). See `src/services/templates.ts`.
@@ -211,6 +268,10 @@ export const schedules = sqliteTable("schedules", {
      OR (template_scope = 'project'   AND template_project_id   IS NOT NULL)`,
   ),
   index("idx_schedules_template").on(table.templateScope, table.templateName),
+  // Added in migration 0061 — speeds up the SET NULL cascade fired when an
+  // AI key is deleted (each delete previously scanned the whole schedules
+  // table). Partial because most schedules don't pin a specific key.
+  index("idx_schedules_assigned_key").on(table.assignedKeyId).where(sql`assigned_key_id IS NOT NULL`),
 ]);
 
 // ─── Chats ───
@@ -300,6 +361,33 @@ export const chats = sqliteTable("chats", {
    * 0044 for full rationale.
    */
   resumeAt: integer("resume_at"),
+  /**
+   * Isolation mode for the chat session. NULL means "run in
+   * `resolveChatCwd(chat)` (workspace > project > home) directly" — the
+   * legacy behaviour. `'worktree'` means the first message lazily
+   * materialises a per-chat git worktree under
+   * `<project>/.flockctl/worktrees/chat-<id>/`, rewrites the working
+   * directory to that path for every subsequent turn, and persists the
+   * result in `worktree_path` / `worktree_branch`. Cleanup is operator-
+   * driven (POST `/chats/:id/end-session` / DELETE `/chats/:id/worktree`)
+   * because chats have no terminal lifecycle state. See migration 0060.
+   */
+  isolation: text("isolation"),
+  /**
+   * Absolute path to the per-chat git worktree once it has been created
+   * (NULL until the first message materialises it; NULL forever for
+   * `isolation IS NULL` chats). Persisting an absolute path keeps the
+   * pointer valid across project renames and across daemon restarts —
+   * boot recovery just trusts what's already on the row.
+   */
+  worktreePath: text("worktree_path"),
+  /**
+   * Branch name created alongside the worktree (`flockctl/chat-<id>`).
+   * Captured at creation time so cleanup can `git branch -D` even after
+   * the worktree directory itself is gone. NULL iff `worktree_path` is
+   * NULL.
+   */
+  worktreeBranch: text("worktree_branch"),
   createdAt: text("created_at").default(sql`(datetime('now'))`),
   updatedAt: text("updated_at").default(sql`(datetime('now'))`),
 }, (table) => [
@@ -394,6 +482,12 @@ export const usageRecords = sqliteTable("usage_records", {
   index("idx_usage_records_created").on(table.createdAt),
   index("idx_usage_records_provider").on(table.provider),
   index("idx_usage_records_key").on(table.aiProviderKeyId),
+  // Added in migration 0057: cover the three FK columns whose hot
+  // lookups (cost-rollup-per-task, cost-rollup-per-chat-message,
+  // GET /usage/summary?project_id=X) used to scan the whole table.
+  index("idx_usage_records_task").on(table.taskId),
+  index("idx_usage_records_chat_message").on(table.chatMessageId),
+  index("idx_usage_records_project").on(table.projectId),
 ]);
 
 // ─── Budget Limits ───
@@ -432,6 +526,10 @@ export const incidents = sqliteTable("incidents", {
 }, (table) => [
   index("idx_incidents_project").on(table.projectId),
   index("idx_incidents_created").on(table.createdAt),
+  // Added in migration 0057: covers `GET /chats/:id/incidents` and the
+  // FK constraint check fired by `DELETE FROM chats WHERE id = ?`
+  // (which sets created_by_chat_id to NULL on every related incident).
+  index("idx_incidents_chat").on(table.createdByChatId),
 ]);
 
 // ─── Secrets ───
@@ -604,3 +702,287 @@ export const missionEvents = sqliteTable("mission_events", {
   ),
   index("idx_mission_events_mission_created").on(table.missionId, desc(table.createdAt)),
 ]);
+
+// ─── Git Audit Log ───
+// Append-only forensic record of every git mutation Flockctl performs on
+// behalf of a user — `pull`, `commit`, `push`. Scoped intentionally narrow:
+// this is NOT a generic audit-log framework, and adding new `action` enum
+// values requires both a CHECK-constraint amendment here and a deliberate
+// review of what data may safely be persisted.
+//
+// Why a dedicated table (not `usage_records` / `mission_events`):
+//  - usage_records is keyed by LLM cost; git operations have no token cost.
+//  - mission_events cascades on mission delete (history travels with the
+//    mission), but git audit must SURVIVE project / workspace deletion
+//    so a forensic record of "what we did to that repo" is never lost
+//    just because the row that owned the path went away.
+//
+// FK cascade rules — both `project_id` and `workspace_id` are SET NULL on
+// delete of the parent row. That intentionally orphans the audit row
+// rather than dropping it; pair this with the CHECK below so a row can
+// still be located via the surviving scope id when only one parent is
+// removed. After both parents are gone the row simply records "an
+// operation Flockctl ran against a path that no longer maps to a known
+// scope" — still auditable via the recorded `args_json` / timestamps.
+//
+// CHECK constraint (`git_audit_log_scope_check`): at least one of
+// project_id / workspace_id must be non-null *at INSERT time*. The FK
+// SET NULL behavior above can later violate this implication on parent
+// delete, but SQLite enforces CHECK only on INSERT/UPDATE of the row
+// itself, not on FK cascade — which is the desired behavior. Code MUST
+// NOT create a git audit row scoped to neither project nor workspace.
+//
+// Sensitive-data invariant (slice's security test asserts this):
+//  - `args_json` records *summaries* of opts (e.g. `{"paths_count":3,
+//    "force":false,"remote":"origin","commit_message_bytes":142}`) —
+//    NEVER the commit message body, file contents, or remote URLs that
+//    could carry credentials.
+//  - `stderr_truncated` is bounded to ≤ 4096 bytes; truncation happens
+//    in the writer (services layer), not at the DB.
+//  - `exit_code` is NULL when the operation never reached `git` (path
+//    missing, not_a_repo) — distinguishable from `0` (success).
+//
+// Indexes mirror the two dominant queries: "what did we do to project X
+// recently" and "what did we do across workspace Y recently". Both are
+// reverse-chronological (DESC on created_at) and partial — a row with
+// no project_id is NOT indexed by `idx_git_audit_log_project_created`,
+// keeping each index bounded by the live scoped population. Same for
+// workspace.
+//
+// `created_at` uses `timestamp_ms` (Date <-> INTEGER ms) instead of the
+// project-wide TEXT `datetime('now')` default. Two reasons:
+//   1. Forensic queries frequently filter by sub-second windows (a
+//      pull-then-push happens in ~50ms); ms precision is required.
+//   2. The default is a JS `$defaultFn(() => new Date())`, which means
+//      raw-SQL inserts MUST set the column explicitly — drizzle does
+//      NOT emit a SQL DEFAULT clause for `$defaultFn`. The column is
+//      `NOT NULL` so a missed insert path fails fast in tests rather
+//      than silently writing 0/epoch.
+export const gitAuditLog = sqliteTable("git_audit_log", {
+  id: text("id").primaryKey().$defaultFn(() => randomUUID()),
+  projectId: integer("project_id").references(() => projects.id, { onDelete: "set null" }),
+  workspaceId: integer("workspace_id").references(() => workspaces.id, { onDelete: "set null" }),
+  action: text("action", {
+    enum: [
+      "pull",
+      "commit",
+      "push",
+      "log",
+      "branch_list",
+      "checkout",
+      "branch_delete",
+      "diff",
+      "discard",
+      "fetch",
+      "show",
+      "stash_push",
+      "stash_list",
+      "stash_pop",
+      "stash_drop",
+    ],
+  }).notNull(),
+  argsJson: text("args_json").notNull(),
+  exitCode: integer("exit_code"),
+  reason: text("reason"),
+  stderrTruncated: text("stderr_truncated"),
+  durationMs: integer("duration_ms").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull().$defaultFn(() => new Date()),
+}, (table) => [
+  check(
+    "git_audit_log_scope_check",
+    sql`project_id IS NOT NULL OR workspace_id IS NOT NULL`,
+  ),
+  index("idx_git_audit_log_project_created")
+    .on(table.projectId, desc(table.createdAt))
+    .where(sql`project_id IS NOT NULL`),
+  index("idx_git_audit_log_workspace_created")
+    .on(table.workspaceId, desc(table.createdAt))
+    .where(sql`workspace_id IS NOT NULL`),
+]);
+
+// ─── FS Audit Log ───
+// Append-only forensic record of every project- / workspace-scoped FS
+// operation Flockctl exposes through the API. v1 is read-only
+// (`action='read'`); future slices add `write` (slice 01), then `delete` /
+// `rename` / `mkdir` (M01 slice 4). The action enum is intentionally narrow
+// — broadening it requires both a CHECK-constraint amendment in
+// `migrations/0049_fs_audit_log.sql` and a deliberate review of what data
+// may safely flow into the row.
+//
+// Dedicated table (not reusing `git_audit_log`):
+//  - git_audit_log's action enum + args_json shape are git-specific.
+//  - File reads / writes carry no git equivalent; mixing them in would
+//    force the CHECK to widen and the per-action queries to filter.
+//
+// Symmetric design with git_audit_log so operators can reason about both
+// in the same mental model:
+//  - INTEGER `ts` (epoch ms) matches `git_audit_log.created_at`.
+//  - Both `project_id` and `workspace_id` columns; CHECK requires at least
+//    one non-null at INSERT time. ON DELETE SET NULL on both FKs so the
+//    forensic row outlives parent deletion.
+//  - `entity_type` / `entity_id` carry the route-level scope (always
+//    populated by the route handler) so a row keyed only by project_id /
+//    workspace_id can still be located after the parent is deleted.
+//  - `path` records the request-supplied relative path string (UTF-8). We
+//    never persist the resolved absolute path — leaking absolute paths
+//    would expose operator filesystem layout to anyone with audit access.
+//
+// Indexes are partial reverse-chronological compounds, one per scope, so
+// "what files did Flockctl touch in project X recently" / "in workspace Y
+// recently" runs index-only without a sort step.
+export const fsAuditLog = sqliteTable("fs_audit_log", {
+  id: text("id").primaryKey().$defaultFn(() => randomUUID()),
+  /** 'project' | 'workspace' — the route surface that originated the call. */
+  entityType: text("entity_type").notNull(),
+  /** Numeric id of the entity at request time (mirrors entity_type). */
+  entityId: integer("entity_id").notNull(),
+  /** FK to projects(id); set to NULL on parent delete (forensic survival). */
+  projectId: integer("project_id").references(() => projects.id, { onDelete: "set null" }),
+  /** FK to workspaces(id); set to NULL on parent delete (forensic survival). */
+  workspaceId: integer("workspace_id").references(() => workspaces.id, { onDelete: "set null" }),
+  /** Action enum — currently just 'read'; extended in subsequent slices. */
+  action: text("action").notNull(),
+  /** Request-supplied relative path string. Never the resolved abs path. */
+  path: text("path").notNull(),
+  /** 1 on success, 0 on failure. */
+  ok: integer("ok").notNull(),
+  /** FsErrorCode discriminator on failure rows; NULL on `ok=1`. */
+  errorCode: text("error_code"),
+  /** Wall-clock timestamp in unix-epoch milliseconds. */
+  ts: integer("ts").notNull(),
+  /**
+   * SHA-256 of the on-disk content the writer overwrote. NULL when the file
+   * did not exist (allowCreate path) or for non-write actions ('read',
+   * 'mkdir', etc.). Added in migration 0056 for the write-file route's
+   * forensic trail.
+   */
+  shaBefore: text("sha_before"),
+  /**
+   * SHA-256 of the bytes that ended up on disk after the atomic temp+rename.
+   * NULL on failure rows (no rename happened) and on non-write actions.
+   */
+  shaAfter: text("sha_after"),
+  /**
+   * Number of bytes the caller posted (Buffer.byteLength, utf-8). Recorded
+   * even on failure rows so the audit table exposes "the user TRIED to write
+   * 12 MiB" cases instead of just "ok=0 fs_too_large" with no payload size.
+   * NULL for non-write actions.
+   */
+  bytes: integer("bytes"),
+}, (table) => [
+  check(
+    "fs_audit_log_entity_type_check",
+    sql`entity_type IN ('project','workspace')`,
+  ),
+  check(
+    "fs_audit_log_action_check",
+    sql`action IN ('read','write','mkdir','create','rename','delete')`,
+  ),
+  check(
+    "fs_audit_log_ok_check",
+    sql`ok IN (0,1)`,
+  ),
+  check(
+    "fs_audit_log_scope_check",
+    sql`project_id IS NOT NULL OR workspace_id IS NOT NULL`,
+  ),
+  index("idx_fs_audit_log_project_ts")
+    .on(table.projectId, desc(table.ts))
+    .where(sql`project_id IS NOT NULL`),
+  index("idx_fs_audit_log_workspace_ts")
+    .on(table.workspaceId, desc(table.ts))
+    .where(sql`workspace_id IS NOT NULL`),
+]);
+
+// ─── Scheduled Wakeups ───
+// Persists "agent asked to be resumed at T" intent — typically captured
+// from a `PostToolUse` hook on Claude Code's `ScheduleWakeup` tool — so a
+// daemon-side worker can fire the wakeup even when the originating chat
+// has no `/loop` dispatcher attached (in a vanilla chat the tool is a
+// no-op and the conversation visibly stalls).
+//
+// Lifecycle: pending → fired | cancelled | missed.
+//   - `fired`     — worker invoked the resume callback at or after
+//                   `fire_at`; `fired_at` records the actual wall clock.
+//   - `cancelled` — operator dismissed the wakeup or the owning session
+//                   ended cleanly before the timer was due.
+//   - `missed`    — daemon was down past `fire_at + grace`; row is
+//                   preserved (NOT auto-fired) so the operator sees the
+//                   missed wake in the inbox and decides what to do. This
+//                   is the explicit "we don't lose chats" guarantee.
+//
+// Scope: each row belongs to exactly one running session — a chat OR a
+// task, never both. The CHECK constraint asserts at-least-one; the
+// service layer asserts exactly-one before INSERT. Cascade is ON DELETE
+// CASCADE on both FKs because a wakeup against a deleted session has
+// nothing to resume into.
+//
+// Hot-path query is the worker tick:
+//   SELECT * FROM scheduled_wakeups
+//    WHERE status='pending' AND fire_at <= ?  ORDER BY fire_at ASC
+// covered by `idx_scheduled_wakeups_pending`, a partial index on
+// `fire_at WHERE status='pending'` so the scan size is bounded by
+// outstanding-pending rows, never the full table.
+//
+// `fire_at` / `fired_at` / `missed_at` / `cancelled_at` are unix-epoch
+// SECONDS (matching missions' `unixepoch()` convention) — wakeups don't
+// need sub-second precision; the worker tick is 10s on its own.
+export const scheduledWakeups = sqliteTable("scheduled_wakeups", {
+  id: text("id").primaryKey().$defaultFn(() => randomUUID()),
+  chatId: integer("chat_id").references(() => chats.id, { onDelete: "cascade" }),
+  taskId: integer("task_id").references(() => tasks.id, { onDelete: "cascade" }),
+  claudeSessionId: text("claude_session_id").notNull(),
+  fireAt: integer("fire_at").notNull(),
+  prompt: text("prompt").notNull(),
+  reason: text("reason"),
+  status: text("status").notNull().default("pending"),
+  firedAt: integer("fired_at"),
+  missedAt: integer("missed_at"),
+  cancelledAt: integer("cancelled_at"),
+  createdAt: integer("created_at").notNull().default(sql`(unixepoch())`),
+}, (table) => [
+  check(
+    "scheduled_wakeups_status_check",
+    sql`status IN ('pending','fired','cancelled','missed')`,
+  ),
+  check(
+    "scheduled_wakeups_scope_check",
+    sql`chat_id IS NOT NULL OR task_id IS NOT NULL`,
+  ),
+  index("idx_scheduled_wakeups_pending")
+    .on(table.fireAt)
+    .where(sql`status = 'pending'`),
+  index("idx_scheduled_wakeups_chat")
+    .on(table.chatId, desc(table.createdAt))
+    .where(sql`chat_id IS NOT NULL`),
+  index("idx_scheduled_wakeups_task")
+    .on(table.taskId, desc(table.createdAt))
+    .where(sql`task_id IS NOT NULL`),
+]);
+
+// ─── Plan-task → execution-task inverse index ───
+//
+// The plan store is FS-backed (markdown files). Resolving "which plan task
+// points at execution task #N" used to do a full O(P × M × S × T) walk;
+// this SQLite-side inverse index turns it into a PK lookup. See migration
+// 0062 for the full rationale.
+//
+// Maintained by `plan-store/tasks.ts` (write path) and the auto-executor's
+// fallback FS walk (drift-healing). Not FK-bound to anything — the
+// execution_task_id is a soft pointer, and project_id is denormalised
+// (no cascade) because the plan store can outlive the projects row in
+// some pathological flows.
+export const planTaskExecutionIndex = sqliteTable(
+  "plan_task_execution_index",
+  {
+    executionTaskId: integer("execution_task_id").primaryKey(),
+    projectId: integer("project_id").notNull(),
+    milestoneSlug: text("milestone_slug").notNull(),
+    sliceSlug: text("slice_slug").notNull(),
+    taskSlug: text("task_slug").notNull(),
+    updatedAt: text("updated_at").notNull().default(sql`(datetime('now'))`),
+  },
+  (table) => [
+    index("idx_plan_task_exec_index_project").on(table.projectId),
+  ],
+);

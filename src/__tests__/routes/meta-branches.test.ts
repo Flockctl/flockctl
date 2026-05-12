@@ -70,6 +70,12 @@ beforeEach(() => {
 describe("GET /meta/version — extra branches", () => {
   const originalFetch = globalThis.fetch;
 
+  beforeEach(async () => {
+    // Drop the version-cache between cases — see meta.test.ts for rationale.
+    const metaMod = await import("../../routes/meta.js");
+    metaMod.__resetVersionCacheForTests();
+  });
+
   afterEach(() => {
     globalThis.fetch = originalFetch;
     vi.restoreAllMocks();

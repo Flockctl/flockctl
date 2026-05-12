@@ -7,9 +7,43 @@
 // past incidents into a chat/task, so the scoring + filter logic lives in
 // the service and the HTTP route is a thin adapter.
 
+import type Database from "better-sqlite3";
 import { getDb, getRawDb } from "../../db/index.js";
 import { incidents } from "../../db/schema.js";
 import { and, desc, eq } from "drizzle-orm";
+import { jsonSafeParseStringArray } from "../../lib/json-safe-parse.js";
+
+// Per-DB prepared-statement cache. The two SQL shapes below differ only by
+// whether the `AND i.project_id = ?` clause is present, so we maintain two
+// cached statements per database handle (one per branch). Previously every
+// `searchIncidents` call built `sqlText` via string concatenation and re-
+// prepared it, which makes better-sqlite3 reparse + replan the FTS join on
+// every keystroke of the search typeahead. Pattern mirrors
+// `services/missions/supervisor.ts:69` / `wakeup-service.ts`.
+interface IncidentsStmts {
+  ftsWithProject: Database.Statement;
+  ftsNoProject: Database.Statement;
+}
+
+const incidentsStmtCache = new WeakMap<Database.Database, IncidentsStmts>();
+
+function getIncidentsStmts(sqlite: Database.Database): IncidentsStmts {
+  let cached = incidentsStmtCache.get(sqlite);
+  if (cached) return cached;
+  const baseSelect = `
+    SELECT i.*, bm25(incidents_fts) AS fts_score
+    FROM incidents_fts
+    JOIN incidents i ON i.id = incidents_fts.rowid
+    WHERE incidents_fts MATCH ?`;
+  cached = {
+    ftsWithProject: sqlite.prepare(
+      baseSelect + ` AND i.project_id = ? ORDER BY rank LIMIT ?`,
+    ),
+    ftsNoProject: sqlite.prepare(baseSelect + ` ORDER BY rank LIMIT ?`),
+  };
+  incidentsStmtCache.set(sqlite, cached);
+  return cached;
+}
 
 type IncidentRow = typeof incidents.$inferSelect;
 
@@ -44,18 +78,10 @@ const MAX_LIMIT = 100;
  *  when there is a tag hit but to stay below a strong text match. */
 const TAG_BOOST = 1.0;
 
-function parseTags(raw: string | null): string[] | null {
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed) && parsed.every((t) => typeof t === "string")) {
-      return parsed;
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
+// Tags column is stored as a JSON-encoded TEXT array. Delegate to the
+// canonical safe-parser so a corrupted blob in one row doesn't poison the
+// whole search response.
+const parseTags = jsonSafeParseStringArray;
 
 /**
  * Sanitize a free-text query into a safe FTS5 MATCH expression.
@@ -119,26 +145,17 @@ export function searchIncidents(
   if (ftsExpr) {
     // FTS path: join incidents_fts (where MATCH filters) with the base
     // table so we can pull all columns in one prepared statement and grab
-    // bm25 as fts_score for re-ranking.
+    // bm25 as fts_score for re-ranking. Use the per-DB statement cache so
+    // a search-typeahead burst doesn't re-prepare on every keystroke.
     const sqlite = getRawDb();
-    const params: unknown[] = [ftsExpr];
-    let sqlText = `
-      SELECT i.*, bm25(incidents_fts) AS fts_score
-      FROM incidents_fts
-      JOIN incidents i ON i.id = incidents_fts.rowid
-      WHERE incidents_fts MATCH ?
-    `;
-    if (hasProject) {
-      sqlText += " AND i.project_id = ?";
-      params.push(projectId);
-    }
+    const stmts = getIncidentsStmts(sqlite);
     // Over-fetch so the JS re-rank (tag boost + tag filter) has a pool
     // wider than `limit` to reorder; bounded so a pathological query with
     // matches on every row still returns quickly.
-    sqlText += " ORDER BY rank LIMIT ?";
-    params.push(Math.max(limit * 5, 25));
-
-    rawRows = sqlite.prepare(sqlText).all(...params) as RawRow[];
+    const overfetch = Math.max(limit * 5, 25);
+    rawRows = (hasProject
+      ? stmts.ftsWithProject.all(ftsExpr, projectId, overfetch)
+      : stmts.ftsNoProject.all(ftsExpr, overfetch)) as RawRow[];
   } else {
     // Fallback: no FTS match expression. Use drizzle over the base table.
     const db = getDb();

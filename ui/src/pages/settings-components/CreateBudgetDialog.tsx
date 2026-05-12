@@ -81,7 +81,7 @@ export function CreateBudgetDialog({
             Set a spending limit for a scope and period.
           </DialogDescription>
         </DialogHeader>
-        <div className="space-y-4">
+        <div className="space-y-3">
           <div className="space-y-2">
             <Label>Scope</Label>
             <Select value={scope} onValueChange={setScope}>

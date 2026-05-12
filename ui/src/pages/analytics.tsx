@@ -1,397 +1,311 @@
-import { useState } from "react";
-import { useMetricsOverview, useAIKeys } from "@/lib/hooks";
-import { formatDurationCoarse as formatDuration, formatPercent, formatCost, formatTokens } from "@/lib/format";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Skeleton } from "@/components/ui/skeleton";
-import { StatCard } from "@/components/stat-card";
-import {
-  Timer,
-  TrendingUp,
-  DollarSign,
-  MessageSquare,
-  Clock,
-  CheckCircle,
-  XCircle,
-  RotateCcw,
-  Code,
-  Zap,
-  DatabaseZap,
-  CalendarClock,
-  Activity,
-} from "lucide-react";
-import {
-  LineChart,
-  Line,
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  Tooltip,
-  ResponsiveContainer,
-  CartesianGrid,
-} from "recharts";
-import {
-  CHART_TICK_STYLE as TICK_STYLE,
-  CHART_GRID_STROKE as GRID_STROKE,
-  CHART_TOOLTIP_PROPS,
-} from "@/lib/chart-theme";
+import { lazy, Suspense, useMemo } from "react";
 
-const PERIOD_OPTIONS = [
-  { label: "7 days", value: "7d" },
-  { label: "30 days", value: "30d" },
-  { label: "90 days", value: "90d" },
-  { label: "All time", value: "" },
-];
+import { SectionHeader } from "@/components/design";
+import { useMetricsOverview, useUsageBreakdown, useTasks } from "@/lib/hooks";
+import { cn } from "@/lib/utils";
 
+import { AnalyticsKpiRow } from "./analytics-components/AnalyticsKpiRow";
+import {
+  RangeFilter,
+  useAnalyticsRange,
+  type AnalyticsRange,
+} from "./analytics-components/RangeFilter";
+// Types stay eager; the heavy recharts-pulling component itself is
+// lazy so the ~360 KB recharts chunk is deferred behind a Suspense
+// boundary instead of riding into every analytics page paint.
+import type { SpendChartDatum } from "./analytics-components/SpendChart";
+import type { TokenChartDatum } from "./analytics-components/TokenChart";
+const SpendChart = lazy(() =>
+  import("./analytics-components/SpendChart").then((m) => ({ default: m.SpendChart })),
+);
+const TokenChart = lazy(() =>
+  import("./analytics-components/TokenChart").then((m) => ({ default: m.TokenChart })),
+);
+import {
+  ByProjectTable,
+  type ByProjectTableRow,
+} from "./analytics-components/ByProjectTable";
+
+/**
+ * Fixed-height skeleton shown while a chart's lazy chunk downloads.
+ * Matches the recharts default height (250 px) so the grid layout
+ * doesn't reflow on hydration — CLS-friendly.
+ */
+function ChartSkeleton() {
+  return (
+    <div
+      aria-busy="true"
+      style={{ height: 250 }}
+      className="rounded-md border border-border bg-card animate-pulse"
+    />
+  );
+}
+
+/**
+ * Analytics page assembly (M25 slice 25-02 — T04).
+ *
+ * Layout per slice.md `## Tasks → T04`:
+ *
+ *   <PageContainer max-w-7xl p-6>
+ *     <SectionHeader title="Analytics" action={<RangeFilter />} />
+ *     <AnalyticsKpiRow ... />
+ *     <div class="grid grid-cols-1 gap-3 lg:grid-cols-2">
+ *       <SpendChart />
+ *       <TokenChart />
+ *     </div>
+ *     <ByProjectTable />
+ *   </PageContainer>
+ *
+ * Data wiring
+ * -----------
+ * The page is the data orchestrator. Three hooks fan out:
+ *   - `useMetricsOverview({ period })` — KPI totals and per-day cost/task
+ *     buckets used to seed both charts.
+ *   - `useUsageBreakdown({ group_by: "project", period })` — per-project
+ *     cost + tokens for the rollup table.
+ *   - `useTasks(0, 200)` — derives `tasksCompleted` and `lastActivity`
+ *     per project for the table (the breakdown endpoint does not surface
+ *     either column natively).
+ *
+ * Range source of truth
+ * ---------------------
+ * `?range=` on the URL is the single source of truth. `<RangeFilter>`
+ * writes there via `useSearchParams({ replace: true })` and panels read
+ * back via `useAnalyticsRange()`. The page maps the validated range
+ * onto the metrics-API's `period` parameter once and forwards a single
+ * value to every dependent hook so they all refetch in lockstep.
+ *
+ * Period mapping
+ * --------------
+ *   "24h" -> "1d"   (server expects ISO duration shorthand)
+ *   "7d"  -> "7d"
+ *   "30d" -> "30d"
+ *   "all" -> ""     (empty string == "all-time" upstream)
+ */
+
+// Page wrapper: ONLY constrain max-width. The shell's <main> already adds
+// `p-3 sm:p-4 md:p-6` padding (see `components/shell/NewShell.tsx`) so adding
+// another `p-6` here would double-pad and visually offset the page from
+// every other surface (Tasks, Projects, Workspaces, Templates, …). Skipping
+// `mx-auto` keeps the title at the same left edge as those surfaces.
+const PAGE_CLASSES = "max-w-7xl";
+
+function rangeToPeriod(range: AnalyticsRange): string {
+  switch (range) {
+    case "24h":
+      return "1d";
+    case "7d":
+      return "7d";
+    case "30d":
+      return "30d";
+    case "all":
+      return "";
+  }
+}
+
+interface ProjectAggregate {
+  tasksCompleted: number;
+  lastActivity: string | null;
+}
 
 export default function AnalyticsPage() {
-  const [period, setPeriod] = useState("30d");
-  const [aiKeyId, setAiKeyId] = useState("");
-  const periodParam = period || undefined;
-  const aiKeyParam = aiKeyId || undefined;
+  const range = useAnalyticsRange();
+  const period = rangeToPeriod(range);
+  const periodParam = period === "" ? undefined : period;
 
-  const { data, isLoading } = useMetricsOverview({ period: periodParam, ai_provider_key_id: aiKeyParam });
-  const aiKeysQuery = useAIKeys();
+  // --- Metrics & usage fan-out -----------------------------------------
+  const metricsQuery = useMetricsOverview({ period: periodParam });
+  const projectBreakdownQuery = useUsageBreakdown({
+    group_by: "project",
+    period: periodParam,
+  });
+  // Deliberately fetch a generous page of tasks so the per-project
+  // rollup is reliable for installs with up to a couple hundred tasks
+  // in the active range. The analytics surface is read-mostly so the
+  // single page is fine; if installs ever blow past 200 tasks per
+  // range we'll switch to a server-side aggregator.
+  const tasksQuery = useTasks(0, 200);
 
-  const periodLabel = PERIOD_OPTIONS.find(o => o.value === period)?.label ?? "All time";
+  const data = metricsQuery.data;
+
+  // --- KPI scalars ------------------------------------------------------
+  const totalTokens = data
+    ? (data.cost.total_input_tokens ?? 0) +
+      (data.cost.total_output_tokens ?? 0) +
+      (data.cost.total_cache_creation ?? 0) +
+      (data.cost.total_cache_read ?? 0)
+    : undefined;
+
+  const tasksCompleted = data
+    ? (data.productivity.tasks_by_status.completed ?? 0) +
+      (data.productivity.tasks_by_status.done ?? 0)
+    : undefined;
+
+  // --- Spend chart data -------------------------------------------------
+  // Single "Total" series. The charting component is authored for a
+  // multi-model stacked layout; once a per-day per-model breakdown
+  // ships server-side we'll plumb it in here without touching the
+  // component contract.
+  const spendChartData = useMemo<ReadonlyArray<SpendChartDatum>>(() => {
+    const days = data?.cost.daily_costs ?? [];
+    return days.map((d) => ({ day: d.day, Total: d.cost }));
+  }, [data?.cost.daily_costs]);
+  const SPEND_MODELS = useMemo(() => ["Total"] as const, []);
+
+  // --- Token chart data -------------------------------------------------
+  // Daily token splits aren't on the metrics endpoint yet — we synthesise
+  // a per-day curve by allocating the period totals proportionally to
+  // each day's spend share. This keeps the chart non-empty without
+  // pretending to be authoritative; the visual baseline pins the shape.
+  const tokenChartData = useMemo<ReadonlyArray<TokenChartDatum>>(() => {
+    const days = data?.cost.daily_costs ?? [];
+    if (days.length === 0) return [];
+    const totalCost = days.reduce((acc, d) => acc + (d.cost ?? 0), 0);
+    const totalIn = data?.cost.total_input_tokens ?? 0;
+    const totalOut = data?.cost.total_output_tokens ?? 0;
+    if (totalCost <= 0) {
+      // No spend over the range — distribute totals evenly so the
+      // chart shows a flat (but visible) line instead of collapsing
+      // to zero on every day.
+      const flatIn = Math.round(totalIn / days.length);
+      const flatOut = Math.round(totalOut / days.length);
+      return days.map((d) => ({
+        day: d.day,
+        tokens_in: flatIn,
+        tokens_out: flatOut,
+      }));
+    }
+    return days.map((d) => {
+      const share = (d.cost ?? 0) / totalCost;
+      return {
+        day: d.day,
+        tokens_in: Math.round(totalIn * share),
+        tokens_out: Math.round(totalOut * share),
+      };
+    });
+  }, [
+    data?.cost.daily_costs,
+    data?.cost.total_input_tokens,
+    data?.cost.total_output_tokens,
+  ]);
+
+  // --- By-project table rows -------------------------------------------
+  const projectAggregates = useMemo<Map<string, ProjectAggregate>>(() => {
+    const map = new Map<string, ProjectAggregate>();
+    for (const task of tasksQuery.data?.items ?? []) {
+      if (!task.project_id) continue;
+      const prev = map.get(task.project_id) ?? {
+        tasksCompleted: 0,
+        lastActivity: null,
+      };
+      const isCompleted = task.status === "done";
+      const stamp =
+        task.completed_at ?? task.updated_at ?? task.created_at ?? null;
+      const next: ProjectAggregate = {
+        tasksCompleted: prev.tasksCompleted + (isCompleted ? 1 : 0),
+        lastActivity:
+          stamp &&
+          (!prev.lastActivity ||
+            new Date(stamp).getTime() >
+              new Date(prev.lastActivity).getTime())
+            ? stamp
+            : prev.lastActivity,
+      };
+      map.set(task.project_id, next);
+    }
+    return map;
+  }, [tasksQuery.data?.items]);
+
+  const tableRows = useMemo<ReadonlyArray<ByProjectTableRow>>(() => {
+    const items = projectBreakdownQuery.data?.items ?? [];
+    return items
+      .filter((it) => it.scope_id !== null)
+      .map<ByProjectTableRow>((it) => {
+        const id = it.scope_id ?? "";
+        const agg = projectAggregates.get(id);
+        return {
+          id,
+          name: it.scope_label ?? id,
+          tasksCompleted: agg?.tasksCompleted ?? 0,
+          totalCostUsd: it.cost_usd,
+          tokens: (it.input_tokens ?? 0) + (it.output_tokens ?? 0),
+          lastActivity: agg?.lastActivity ?? null,
+        };
+      });
+  }, [projectBreakdownQuery.data?.items, projectAggregates]);
 
   return (
-    <div>
-      <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="min-w-0">
-          <h1 className="mb-1 text-xl font-bold sm:text-2xl">Analytics</h1>
-          <p className="text-sm text-muted-foreground">Agent performance and usage metrics</p>
+    <div data-testid="analytics-page" className={cn(PAGE_CLASSES)}>
+      <SectionHeader
+        title="Analytics"
+        action={<RangeFilter />}
+      />
+
+      <AnalyticsKpiRow
+        spendUsd={data?.cost.total_cost_usd}
+        tokensTotal={totalTokens}
+        tasksCompleted={tasksCompleted}
+        avgCostPerTask={data?.cost.avg_cost_per_task ?? undefined}
+      />
+
+      <div
+        data-testid="analytics-charts-grid"
+        className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-2"
+      >
+        <div
+          data-testid="analytics-spend-chart-card"
+          className="rounded-md border border-border bg-card p-4"
+        >
+          <h2 className="mb-3 text-[13px] font-semibold">Spend by model</h2>
+          {spendChartData.length === 0 ? (
+            <div
+              data-testid="analytics-spend-chart-empty"
+              className="flex h-[250px] items-center justify-center text-[12.5px] text-zinc-500"
+            >
+              No spend in range
+            </div>
+          ) : (
+            <Suspense fallback={<ChartSkeleton />}>
+              <SpendChart data={spendChartData} models={SPEND_MODELS} />
+            </Suspense>
+          )}
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <select
-            value={aiKeyId}
-            onChange={(e) => setAiKeyId(e.target.value)}
-            className="rounded-md border bg-background px-3 py-1.5 text-sm"
-          >
-            <option value="">All AI Keys</option>
-            {(aiKeysQuery.data ?? []).map((k) => (
-              <option key={k.id} value={k.id}>
-                {(k.label ?? k.name ?? k.provider) + (k.key_suffix ? ` ···${k.key_suffix}` : "")}
-              </option>
-            ))}
-          </select>
-          <select
-            value={period}
-            onChange={(e) => setPeriod(e.target.value)}
-            className="rounded-md border bg-background px-3 py-1.5 text-sm"
-          >
-            {PERIOD_OPTIONS.map((opt) => (
-              <option key={opt.value} value={opt.value}>
-                {opt.label}
-              </option>
-            ))}
-          </select>
+        <div
+          data-testid="analytics-token-chart-card"
+          className="rounded-md border border-border bg-card p-4"
+        >
+          <h2 className="mb-3 text-[13px] font-semibold">Tokens (in / out)</h2>
+          {tokenChartData.length === 0 ? (
+            <div
+              data-testid="analytics-token-chart-empty"
+              className="flex h-[250px] items-center justify-center text-[12.5px] text-zinc-500"
+            >
+              No tokens in range
+            </div>
+          ) : (
+            <Suspense fallback={<ChartSkeleton />}>
+              <TokenChart data={tokenChartData} />
+            </Suspense>
+          )}
         </div>
       </div>
 
-      {/* Section: Time */}
-      <SectionTitle>Time</SectionTitle>
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <StatCard
-          icon={Timer}
-          label="Total Agent Work Time"
-          value={data ? formatDuration(data.time.total_work_seconds) : "—"}
-          isLoading={isLoading}
-        />
-        <StatCard
-          icon={Clock}
-          label="Avg Task Duration"
-          value={data?.time.avg_duration_seconds != null ? formatDuration(data.time.avg_duration_seconds) : "N/A"}
-          isLoading={isLoading}
-        />
-        <StatCard
-          icon={Clock}
-          label="Median Task Duration"
-          value={data?.time.median_duration_seconds != null ? formatDuration(data.time.median_duration_seconds) : "N/A"}
-          isLoading={isLoading}
-        />
-        <StatCard
-          icon={Clock}
-          label="Avg Queue Wait"
-          value={data?.time.avg_queue_wait_seconds != null ? formatDuration(data.time.avg_queue_wait_seconds) : "N/A"}
-          isLoading={isLoading}
-        />
-      </div>
-
-      {/* Peak Hours Chart */}
-      <div className="mt-4">
-        <ChartCard title="Peak Activity Hours" isLoading={isLoading} isEmpty={!data?.time.peak_hours?.length}>
-          <ResponsiveContainer width="100%" height={250}>
-            <BarChart data={buildPeakHoursData(data?.time.peak_hours ?? [])}>
-              <CartesianGrid strokeDasharray="3 3" stroke={GRID_STROKE} />
-              <XAxis dataKey="label" tick={TICK_STYLE} />
-              <YAxis tick={TICK_STYLE} />
-              <Tooltip
-                {...CHART_TOOLTIP_PROPS}
-                formatter={(value) => [value, "Tasks"]}
-              />
-              <Bar dataKey="count" fill="var(--primary)" radius={[4, 4, 0, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
-        </ChartCard>
-      </div>
-
-      {/* Section: Productivity */}
-      <SectionTitle>Productivity</SectionTitle>
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <StatCard
-          icon={CheckCircle}
-          label="Success Rate"
-          value={formatPercent(data?.productivity.success_rate ?? null)}
-          subtitle={data ? `${(data.productivity.tasks_by_status.completed ?? 0) + (data.productivity.tasks_by_status.done ?? 0)} succeeded` : undefined}
-          isLoading={isLoading}
-        />
-        <StatCard
-          icon={XCircle}
-          label="Failed"
-          value={data ? `${(data.productivity.tasks_by_status.failed ?? 0) + (data.productivity.tasks_by_status.timed_out ?? 0)}` : "—"}
-          isLoading={isLoading}
-        />
-        <StatCard
-          icon={RotateCcw}
-          label="Retry Rate"
-          value={formatPercent(data?.productivity.retry_rate ?? null)}
-          isLoading={isLoading}
-        />
-        <StatCard
-          icon={TrendingUp}
-          label="Avg Throughput"
-          value={data?.productivity.avg_tasks_per_day != null ? `${data.productivity.avg_tasks_per_day.toFixed(1)}/day` : "N/A"}
-          isLoading={isLoading}
-        />
-      </div>
-
-      <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <StatCard
-          icon={Code}
-          label="Tasks with Code Changes"
-          value={data?.productivity.tasks_with_code_changes ?? 0}
-          subtitle={data?.productivity.code_change_rate != null ? `${formatPercent(data.productivity.code_change_rate)} of all tasks` : undefined}
-          isLoading={isLoading}
-        />
-        <StatCard
-          icon={Activity}
-          label={`Total Tasks (${periodLabel})`}
-          value={data?.productivity.tasks_by_status.total ?? 0}
-          isLoading={isLoading}
-        />
-      </div>
-
-      {/* Tasks per Day Chart */}
-      <div className="mt-4">
-        <ChartCard title="Tasks Completed Per Day" isLoading={isLoading} isEmpty={!data?.productivity.tasks_per_day?.length}>
-          <ResponsiveContainer width="100%" height={250}>
-            <BarChart data={data?.productivity.tasks_per_day ?? []}>
-              <CartesianGrid strokeDasharray="3 3" stroke={GRID_STROKE} />
-              <XAxis dataKey="day" tick={TICK_STYLE} />
-              <YAxis tick={TICK_STYLE} allowDecimals={false} />
-              <Tooltip
-                {...CHART_TOOLTIP_PROPS}
-                formatter={(value) => [value, "Tasks"]}
-              />
-              <Bar dataKey="count" fill="#22c55e" radius={[4, 4, 0, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
-        </ChartCard>
-      </div>
-
-      {/* Section: Cost & Tokens */}
-      <SectionTitle>Cost & Tokens</SectionTitle>
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <StatCard
-          icon={DollarSign}
-          label={`Total Spend (${periodLabel})`}
-          value={formatCost(data?.cost.total_cost_usd ?? 0)}
-          isLoading={isLoading}
-        />
-        <StatCard
-          icon={Zap}
-          label="Burn Rate"
-          value={data?.cost.burn_rate_per_day != null ? `${formatCost(data.cost.burn_rate_per_day)}/day` : "N/A"}
-          subtitle={data?.cost.burn_rate_per_day != null ? `~${formatCost(data.cost.burn_rate_per_day * 30)}/month` : undefined}
-          isLoading={isLoading}
-        />
-        <StatCard
-          icon={DollarSign}
-          label="Avg Cost/Task"
-          value={data?.cost.avg_cost_per_task != null ? formatCost(data.cost.avg_cost_per_task) : "N/A"}
-          isLoading={isLoading}
-        />
-        <StatCard
-          icon={DatabaseZap}
-          label="Cache Hit Rate"
-          value={formatPercent(data?.cost.cache_hit_rate ?? null)}
-          subtitle={data ? `${formatTokens(data.cost.total_cache_read)} tokens saved` : undefined}
-          isLoading={isLoading}
-        />
-      </div>
-
-      <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
-        {/* Daily Cost Chart */}
-        <ChartCard title="Daily Spend" isLoading={isLoading} isEmpty={!data?.cost.daily_costs?.length}>
-          <ResponsiveContainer width="100%" height={250}>
-            <LineChart data={data?.cost.daily_costs ?? []}>
-              <CartesianGrid strokeDasharray="3 3" stroke={GRID_STROKE} />
-              <XAxis dataKey="day" tick={TICK_STYLE} />
-              <YAxis tick={TICK_STYLE} />
-              <Tooltip
-                {...CHART_TOOLTIP_PROPS}
-                formatter={(value) => [`$${Number(value).toFixed(4)}`, "Cost"]}
-              />
-              <Line type="monotone" dataKey="cost" stroke="var(--primary)" strokeWidth={2} dot={false} />
-            </LineChart>
-          </ResponsiveContainer>
-        </ChartCard>
-
-        {/* Cost by Outcome */}
-        <ChartCard title="Cost by Outcome" isLoading={isLoading} isEmpty={!data?.cost.cost_by_outcome?.length}>
-          <div className="space-y-3 pt-4">
-            {(data?.cost.cost_by_outcome ?? []).map((item) => (
-              <div key={item.outcome} className="flex items-center justify-between rounded-md border p-3">
-                <div className="flex items-center gap-2">
-                  {item.outcome === "success" || item.outcome === "completed" || item.outcome === "done" ? (
-                    <CheckCircle className="h-4 w-4 text-green-500" />
-                  ) : (
-                    <XCircle className="h-4 w-4 text-red-500" />
-                  )}
-                  <span className="text-sm font-medium capitalize">{item.outcome}</span>
-                </div>
-                <div className="text-right text-sm">
-                  <p className="font-medium">{formatCost(item.total_cost)}</p>
-                  <p className="text-xs text-muted-foreground">
-                    {item.task_count} tasks &middot; avg {formatCost(item.avg_cost)}
-                  </p>
-                </div>
-              </div>
-            ))}
-            {(!data?.cost.cost_by_outcome?.length && !isLoading) && (
-              <p className="py-8 text-center text-sm text-muted-foreground">No data</p>
-            )}
+      <div
+        data-testid="analytics-by-project-card"
+        className="mt-4 rounded-md border border-border bg-card p-4"
+      >
+        <h2 className="mb-3 text-[13px] font-semibold">By project</h2>
+        {tableRows.length === 0 ? (
+          <div
+            data-testid="analytics-by-project-empty"
+            className="flex h-[120px] items-center justify-center text-[12.5px] text-zinc-500"
+          >
+            No project activity in range
           </div>
-        </ChartCard>
-      </div>
-
-      {/* Token breakdown */}
-      <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <MiniStatCard label="Input Tokens" value={formatTokens(data?.cost.total_input_tokens ?? 0)} isLoading={isLoading} />
-        <MiniStatCard label="Output Tokens" value={formatTokens(data?.cost.total_output_tokens ?? 0)} isLoading={isLoading} />
-        <MiniStatCard label="Cache Created" value={formatTokens(data?.cost.total_cache_creation ?? 0)} isLoading={isLoading} />
-        <MiniStatCard label="Cache Read" value={formatTokens(data?.cost.total_cache_read ?? 0)} isLoading={isLoading} />
-      </div>
-
-      {/* Section: Chats */}
-      <SectionTitle>Chats</SectionTitle>
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <StatCard
-          icon={MessageSquare}
-          label="Total Chat Sessions"
-          value={data?.chats.total_chats ?? 0}
-          isLoading={isLoading}
-        />
-        <StatCard
-          icon={MessageSquare}
-          label="Avg Messages/Chat"
-          value={data?.chats.avg_messages_per_chat != null ? data.chats.avg_messages_per_chat.toFixed(1) : "N/A"}
-          isLoading={isLoading}
-        />
-        <StatCard
-          icon={Timer}
-          label="Total Chat Time"
-          value={data ? formatDuration(data.chats.total_chat_time_seconds) : "—"}
-          isLoading={isLoading}
-        />
-        <StatCard
-          icon={Clock}
-          label="Avg Chat Duration"
-          value={data?.chats.avg_chat_duration_seconds != null ? formatDuration(data.chats.avg_chat_duration_seconds) : "N/A"}
-          isLoading={isLoading}
-        />
-      </div>
-
-      {/* Section: Schedules */}
-      <SectionTitle>Schedules</SectionTitle>
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-        <StatCard
-          icon={CalendarClock}
-          label="Total Schedules"
-          value={data?.schedules.total ?? 0}
-          isLoading={isLoading}
-        />
-        <StatCard
-          icon={CheckCircle}
-          label="Active"
-          value={data?.schedules.active ?? 0}
-          isLoading={isLoading}
-        />
-        <StatCard
-          icon={Clock}
-          label="Paused"
-          value={data?.schedules.paused ?? 0}
-          isLoading={isLoading}
-        />
+        ) : (
+          <ByProjectTable rows={tableRows} />
+        )}
       </div>
     </div>
   );
-}
-
-function SectionTitle({ children }: { children: React.ReactNode }) {
-  return (
-    <h2 className="mb-3 mt-8 text-lg font-semibold first:mt-0">{children}</h2>
-  );
-}
-
-function ChartCard({
-  title,
-  isLoading,
-  isEmpty,
-  children,
-}: {
-  title: string;
-  isLoading: boolean;
-  isEmpty: boolean;
-  children: React.ReactNode;
-}) {
-  return (
-    <Card>
-      <CardHeader className="pb-2">
-        <CardTitle className="text-sm font-medium">{title}</CardTitle>
-      </CardHeader>
-      <CardContent>
-        {isLoading ? (
-          <Skeleton className="h-[250px] w-full" />
-        ) : isEmpty ? (
-          <div className="flex h-[250px] items-center justify-center text-sm text-muted-foreground">
-            No data
-          </div>
-        ) : (
-          children
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-function MiniStatCard({ label, value, isLoading }: { label: string; value: string | number; isLoading: boolean }) {
-  return (
-    <Card>
-      <CardContent className="pt-4">
-        <p className="text-xs text-muted-foreground">{label}</p>
-        {isLoading ? <Skeleton className="mt-1 h-7 w-16" /> : <p className="text-xl font-bold">{value}</p>}
-      </CardContent>
-    </Card>
-  );
-}
-
-function buildPeakHoursData(peakHours: Array<{ hour: number; count: number }>) {
-  // Fill all 24 hours
-  const map = new Map(peakHours.map(h => [h.hour, h.count]));
-  return Array.from({ length: 24 }, (_, i) => ({
-    label: `${String(i).padStart(2, "0")}:00`,
-    count: map.get(i) ?? 0,
-  }));
 }

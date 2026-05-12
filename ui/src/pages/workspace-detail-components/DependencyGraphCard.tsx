@@ -42,7 +42,7 @@ export function DependencyGraphCard({
           Dependency Graph
         </CardTitle>
       </CardHeader>
-      <CardContent className="space-y-4">
+      <CardContent className="space-y-3">
         {graph.waves.map((waveIds, waveIdx) => (
           <div key={waveIdx}>
             <p className="mb-2 text-xs font-medium text-muted-foreground">

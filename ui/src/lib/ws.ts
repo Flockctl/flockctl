@@ -36,6 +36,13 @@ export const MessageType = {
   // cards auto-resolved by the swap disappear via the `permission_resolved`
   // frames emitted one-per-request by the backend.
   CHAT_PERMISSION_MODE_CHANGED: "chat_permission_mode_changed",
+  // Task-only: emitted when `PATCH /tasks/:id` mutates the permission mode
+  // of an in-flight session. Payload `{ task_id, previous, current }`. The
+  // UI invalidates the cached task so the dropdown reflects the new value
+  // without a follow-up GET. Pending-permission cards auto-resolved by the
+  // swap disappear via the `permission_resolved` frames emitted one-per-
+  // request by the backend (parity with chats).
+  TASK_PERMISSION_MODE_CHANGED: "task_permission_mode_changed",
   // Chat-only: emitted from the SSE stream_end branch in
   // `src/routes/chats/messages.ts` (M16/00 slice) immediately AFTER the
   // assistant chat_messages row has been committed by the
@@ -224,10 +231,20 @@ export class WebSocketClient {
   }
 
   private scheduleReconnect(): void {
-    const delay = Math.min(
+    // Exponential backoff with jitter.
+    //
+    // Without jitter, many tabs that all disconnected at the same moment
+    // (the typical daemon-restart case) try to reconnect at identical
+    // delays — a synchronised thundering herd that hammers the just-
+    // restarted server. We multiply by a random factor in [0.5, 1.0] so
+    // peer tabs spread their reconnect attempts across half the backoff
+    // window (AWS Architecture Blog calls this "decorrelated jitter").
+    const baseDelay = Math.min(
       this.opts.reconnectDelay * 2 ** this.retryCount,
       this.opts.maxReconnectDelay,
     );
+    const jitterFactor = 0.5 + Math.random() * 0.5;
+    const delay = Math.floor(baseDelay * jitterFactor);
     this.retryCount++;
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;

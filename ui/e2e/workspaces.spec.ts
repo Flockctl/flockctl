@@ -400,9 +400,11 @@ test("workspace-create Browse button opens the directory picker and fills the pa
   await page.goto("/workspaces");
   await expect(page.getByRole("heading", { name: "Workspaces" })).toBeVisible();
 
-  // Open the Create Workspace dialog.
-  await page.getByRole("button", { name: "Create Workspace" }).click();
-  await expect(page.getByRole("heading", { name: "Create Workspace" })).toBeVisible();
+  // Open the New Workspace dialog from the toolbar's "+ New workspace"
+  // button (the redesigned trigger replacing the legacy
+  // "Create Workspace" button).
+  await page.getByTestId("workspaces-new-workspace-button").click();
+  await expect(page.getByRole("heading", { name: /^New workspace$/ })).toBeVisible();
 
   // Local Directory is the default source mode — the path input should be
   // present alongside the Browse… button.
@@ -461,45 +463,6 @@ test("workspace-create Browse button opens the directory picker and fills the pa
  *   npm run e2e:update -- ui/e2e/workspaces.spec.ts
  */
 test.describe("workspaces list page (baseline protection)", () => {
-  test("row with attention renders a 3-waiting badge", async ({ page }) => {
-    // Primary Workspace owns 3 attention items via proj-1; Secondary
-    // owns none and must render WITHOUT a badge. The snapshot covers
-    // both rows so a future regression that puts the badge on the wrong
-    // row (or every row) is visible in the diff.
-    //
-    // Freeze `Date.now()` so the timeAgo() cell renders "5m ago" on
-    // every run — the "Xm ago" string is computed client-side from
-    // (Date.now() - created_at) and would otherwise drift the pixel
-    // baseline by one minute-bucket per minute of wall-clock elapsed.
-    await page.clock.install({ time: new Date(T_NOW) });
-    await routeWorkspacesListEndpoints(page, {
-      attentionByWorkspace: { "1": 3 },
-    });
-
-    await page.goto("/workspaces");
-    await expect(page.getByRole("heading", { name: "Workspaces" })).toBeVisible();
-
-    // DOM contract before the pixels: the badge must be bound to the
-    // row with 3 pending items and announced via aria-label so screen
-    // readers pick it up. The Secondary row must NOT carry a badge.
-    const primaryRow = page.getByRole("row", { name: /Primary Workspace/ });
-    const secondaryRow = page.getByRole("row", { name: /Secondary Workspace/ });
-    const badge = primaryRow.getByLabel("3 items waiting on you");
-    await expect(badge).toBeVisible();
-    await expect(badge).toHaveText("3 waiting");
-    await expect(
-      secondaryRow.getByLabel(/items? waiting on you/),
-    ).toHaveCount(0);
-
-    await freeze(page);
-    // Crop to just the row so the snapshot doesn't depend on the sidebar
-    // badge / header layout — this file's concern is row parity only.
-    await expect(primaryRow).toHaveScreenshot(
-      "workspaces-list-row-with-waiting-badge.png",
-      { maxDiffPixelRatio: 0.02 },
-    );
-  });
-
   test("create-dialog scrolls inside a 1280×600 viewport", async ({ page }) => {
     // 1280×600 is the tightest viewport the design was signed off
     // against — at this height the DialogContent's `max-h-[85vh]`
@@ -509,8 +472,8 @@ test.describe("workspaces list page (baseline protection)", () => {
     // accidentally removes `overflow-y-auto` (the form would then clip
     // the Gitignore toggles and the Create button off the bottom).
     await page.setViewportSize({ width: 1280, height: 600 });
-    // Same clock-freeze as the badge case — the dialog sits on top of
-    // the list view which renders the time-ago cells behind it.
+    // Same clock-freeze as the visual baselines — the dialog sits on
+    // top of the list view which renders the time-ago cells behind it.
     await page.clock.install({ time: new Date(T_NOW) });
     await routeWorkspacesListEndpoints(page, {
       attentionByWorkspace: { "1": 3 },
@@ -519,9 +482,9 @@ test.describe("workspaces list page (baseline protection)", () => {
     await page.goto("/workspaces");
     await expect(page.getByRole("heading", { name: "Workspaces" })).toBeVisible();
 
-    await page.getByRole("button", { name: "Create Workspace" }).click();
+    await page.getByTestId("workspaces-new-workspace-button").click();
     await expect(
-      page.getByRole("heading", { name: "Create Workspace" }),
+      page.getByRole("heading", { name: /^New workspace$/ }),
     ).toBeVisible();
 
     // The scroll container is the inner `<div class="flex-1 ...
@@ -553,6 +516,147 @@ test.describe("workspaces list page (baseline protection)", () => {
       "workspaces-create-dialog-scrolled.png",
       { maxDiffPixelRatio: 0.02 },
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Visual baselines (slice 23-03 T05).
+//
+// Page-assembly snapshots: SectionHeader → toolbar → WorkspacesGrid in
+// both light and dark themes, plus the empty state and the (open)
+// New-workspace dialog. Baselines live under
+// e2e/__screenshots__/workspaces.spec.ts/ per the
+// `snapshotPathTemplate` in playwright.config.ts.
+// ---------------------------------------------------------------------------
+
+async function pinTheme(page: Page, theme: "light" | "dark") {
+  await page.addInitScript((t) => {
+    try {
+      window.localStorage.setItem("flockctl-theme", t);
+    } catch {
+      /* private mode etc. */
+    }
+  }, theme);
+}
+
+test.describe("workspaces page — visual baselines", () => {
+  for (const theme of ["light", "dark"] as const) {
+    test(`grid layout — ${theme}`, async ({ page }) => {
+      await pinTheme(page, theme);
+      await page.clock.install({ time: new Date(T_NOW) });
+      await routeWorkspacesListEndpoints(page, {
+        attentionByWorkspace: { "1": 3 },
+      });
+
+      await page.goto("/workspaces");
+      await expect(
+        page
+          .getByTestId("workspaces-page")
+          .getByRole("heading", { name: "Workspaces", level: 1 }),
+      ).toBeVisible();
+      // Wait for the grid to settle — every card needs to be present
+      // before the snapshot, otherwise the layout will be mid-fade
+      // when Playwright takes the picture.
+      await expect(page.getByTestId("workspaces-grid-list")).toBeVisible({
+        timeout: 10_000,
+      });
+      await expect(page.getByTestId("add-workspace-card")).toBeVisible();
+
+      await freeze(page);
+      await expect(page).toHaveScreenshot(`workspaces-grid-${theme}.png`, {
+        fullPage: true,
+        threshold: 0.1,
+        maxDiffPixelRatio: 0.02,
+      });
+    });
+  }
+
+  test("empty state — no workspaces", async ({ page }) => {
+    await pinTheme(page, "light");
+    await page.clock.install({ time: new Date(T_NOW) });
+    // Empty payload from /workspaces; /projects + /attention return
+    // empty as well so the page settles into the initial-empty
+    // branch (not the filtered-empty branch which lives on a search
+    // result).
+    await page.route(/\/workspaces(\?[^/]*)?$/, async (route) => {
+      const req = route.request();
+      if (req.resourceType() === "document") return route.fallback();
+      if (req.method() !== "GET") return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [], total: 0, offset: 0, limit: 0 }),
+      });
+    });
+    await page.route(/\/projects(\?[^/]*)?$/, async (route) => {
+      const req = route.request();
+      if (req.resourceType() === "document") return route.fallback();
+      if (req.method() !== "GET") return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [], total: 0, offset: 0, limit: 0 }),
+      });
+    });
+    await page.route(/\/attention(\?[^/]*)?$/, async (route) => {
+      const req = route.request();
+      if (req.resourceType() === "document") return route.fallback();
+      if (req.method() !== "GET") return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [], total: 0 }),
+      });
+    });
+    await page.route(/\/keys(\?[^/]*)?$/, async (route) => {
+      const req = route.request();
+      if (req.resourceType() === "document") return route.fallback();
+      if (req.method() !== "GET") return route.fallback();
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [], total: 0 }),
+      });
+    });
+
+    await page.goto("/workspaces");
+    await expect(page.getByTestId("workspaces-empty-state")).toBeVisible({
+      timeout: 10_000,
+    });
+    await expect(page.getByTestId("workspaces-empty-cta")).toBeVisible();
+
+    await freeze(page);
+    await expect(page).toHaveScreenshot("workspaces-empty.png", {
+      fullPage: true,
+      threshold: 0.1,
+      maxDiffPixelRatio: 0.02,
+    });
+  });
+
+  test("new-workspace dialog (open)", async ({ page }) => {
+    await pinTheme(page, "light");
+    await page.clock.install({ time: new Date(T_NOW) });
+    await routeWorkspacesListEndpoints(page, {});
+
+    await page.goto("/workspaces");
+    await expect(
+      page
+        .getByTestId("workspaces-page")
+        .getByRole("heading", { name: "Workspaces", level: 1 }),
+    ).toBeVisible();
+    await page.getByTestId("workspaces-new-workspace-button").click();
+
+    const dialog = page.getByTestId("new-workspace-dialog");
+    await expect(dialog).toBeVisible({ timeout: 5_000 });
+    await expect(
+      dialog.getByRole("heading", { name: /^New workspace$/ }),
+    ).toBeVisible();
+
+    await freeze(page);
+    await expect(dialog).toHaveScreenshot("workspaces-new-dialog.png", {
+      threshold: 0.1,
+      maxDiffPixelRatio: 0.02,
+    });
   });
 });
 

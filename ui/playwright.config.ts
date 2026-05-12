@@ -21,6 +21,20 @@ export default defineConfig({
   // and matches the layout the tests assume on disk.
   snapshotPathTemplate: "{testDir}/__screenshots__/{testFilePath}/{arg}{ext}",
   reporter: process.env.CI ? [["github"], ["html", { open: "never" }]] : "list",
+  // Visual-baseline tolerances. `threshold` (0.1) is the per-pixel colour-distance
+  // tolerance Playwright passes to pixelmatch — small enough to catch real
+  // regressions, large enough to absorb sub-pixel font-rendering jitter and
+  // anti-aliasing differences across Chromium patch revisions. `maxDiffPixelRatio`
+  // (0.01 = 1%) caps how many pixels can legitimately differ before the
+  // assertion fails — a hard ceiling on top of the per-pixel tolerance, so a
+  // single antialiased glyph stroke does not trip CI but a re-laid-out card does.
+  // Pinned at slice 26-02-T00 alongside the @playwright/test version pin.
+  expect: {
+    toHaveScreenshot: {
+      threshold: 0.1,
+      maxDiffPixelRatio: 0.01,
+    },
+  },
   use: {
     baseURL: `http://localhost:${frontendPort}`,
     trace: "on-first-retry",

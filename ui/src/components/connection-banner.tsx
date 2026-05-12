@@ -9,7 +9,11 @@ export function ConnectionBanner() {
 
   if (connectionStatus === "checking") {
     return (
-      <div className="flex items-center gap-2 border-b bg-muted/50 px-4 py-2 text-xs text-muted-foreground">
+      <div
+        role="status"
+        aria-live="polite"
+        className="flex items-center gap-2 border-b bg-muted/50 px-4 py-2 text-xs text-muted-foreground"
+      >
         <Loader2 className="h-3.5 w-3.5 animate-spin" />
         <span>Connecting to {activeServer.name}…</span>
       </div>
@@ -19,7 +23,13 @@ export function ConnectionBanner() {
   const hostSummary = activeServer.is_local ? null : activeServer.ssh?.host ?? null;
 
   return (
-    <div className="flex items-center gap-2 border-b border-destructive/30 bg-destructive/10 px-4 py-2 text-xs text-destructive">
+    // `role="alert"` + `aria-live="assertive"` so screen readers
+    // announce the disconnection on transition (audit-round-7).
+    <div
+      role="alert"
+      aria-live="assertive"
+      className="flex items-center gap-2 border-b border-destructive/30 bg-destructive/10 px-4 py-2 text-xs text-destructive"
+    >
       <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
       <span className="flex-1">
         Cannot reach <strong>{activeServer.name}</strong>

@@ -1,38 +1,23 @@
 import { useMemo, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { FileCode2, Plus } from "lucide-react";
+
 import {
   useTemplates,
-  useCreateTemplate,
   useUpdateTemplate,
   useDeleteTemplate,
-  useProjects,
-  useWorkspaces,
+  useCreateChat,
 } from "@/lib/hooks";
-import { formatTime } from "@/lib/format";
 import type { TaskTemplate, TaskTemplateCreate, TemplateScope } from "@/lib/types";
 import { templateKey } from "@/lib/types";
-import type { TemplateFilter, TemplateRef } from "@/lib/api";
-import { TaskFormFields, defaultTaskFormValues } from "@/components/task-form-fields";
+import type { TemplateRef } from "@/lib/api";
+import { TaskFormFields } from "@/components/task-form-fields";
 import type { TaskFormValues } from "@/components/task-form-fields";
-import {
-  Table,
-  TableHeader,
-  TableBody,
-  TableRow,
-  TableHead,
-  TableCell,
-} from "@/components/ui/table";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Skeleton } from "@/components/ui/skeleton";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import {
   Dialog,
   DialogContent,
@@ -40,217 +25,113 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from "@/components/ui/dialog";
 import { ConfirmDialog, useConfirmDialog } from "@/components/confirm-dialog";
+import { EmptyState } from "@/components/EmptyState";
+import { SectionHeader } from "@/components/design";
+import { slugify } from "@/lib/utils";
 
-const PAGE_SIZE = 20;
+import {
+  TemplatesToolbar,
+  filterTemplatesByTag,
+  filterTemplatesByQuery,
+  type TemplatesToolbarTag,
+} from "./templates-components/TemplatesToolbar";
+import {
+  TemplateCard,
+  type TemplateCardData,
+} from "./templates-components/TemplateCard";
+import { NewTemplateDialog } from "./templates-components/NewTemplateDialog";
 
-type ScopeFilter = "all" | TemplateScope;
+/**
+ * `/templates` page assembly (slice
+ * `25-ui-redesign-library-surfaces/00-templates` T03).
+ *
+ * Composes the M22+ flat-primitive widgets prior tasks built in
+ * isolation:
+ *
+ *   ┌──────────────────────────────────────────────────────────────────┐
+ *   │ <SectionHeader title="Templates" subtitle="N templates"          │
+ *   │   action={<button>+ New template</button>} />                    │
+ *   │ <TemplatesToolbar totalCount tags onTagChange />                 │
+ *   │                                                                  │
+ *   │ grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 of               │
+ *   │   <TemplateCard onOpenInChat onClick=open-edit />                │
+ *   └──────────────────────────────────────────────────────────────────┘
+ *
+ * Search lives in the global ⌘K palette; the per-page search input
+ * was removed in favour of a single global search surface.  The
+ * `+ New template` CTA sits in the `SectionHeader` action slot to
+ * match the projects / chats / workspaces convention.
+ *
+ * State plumbing:
+ *
+ *   - `?tag=`   — owned by the toolbar; mirrored via `onTagChange`.
+ *
+ * Tag derivation:
+ *   The wire-level `TaskTemplate` row does NOT carry a `tags` field
+ *   (templates are file-backed). For the redesign we derive tags from
+ *   the row's structural fields — `scope` is always present, `agent`
+ *   and `model` (when set) become additional tag chips. This keeps the
+ *   tag-chip contract honest (every distinct tag corresponds to
+ *   something filterable) without inventing a new server contract.
+ *
+ * Open in chat:
+ *   The footer button creates a new chat seeded with the template's
+ *   scope/workspace/project metadata and navigates to it. The chat is
+ *   the entry point for instantiating the template — turning a saved
+ *   recipe into a live conversation.
+ */
+
+const CARDS_GRID_CLASSES =
+  "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3";
 
 function scopeLabel(s: TemplateScope): string {
   return s === "global" ? "Global" : s === "workspace" ? "Workspace" : "Project";
 }
 
-function CreateTemplateDialog({
-  defaultScope,
-  defaultWorkspaceId,
-  defaultProjectId,
-  lockScope,
-  triggerLabel,
-  triggerSize,
-}: {
-  defaultScope?: TemplateScope;
-  defaultWorkspaceId?: string;
-  defaultProjectId?: string;
-  lockScope?: boolean;
-  triggerLabel?: string;
-  triggerSize?: "default" | "sm";
-}) {
-  const [open, setOpen] = useState(false);
-  const [scope, setScope] = useState<TemplateScope>(defaultScope ?? "global");
-  const [workspaceId, setWorkspaceId] = useState<string>(defaultWorkspaceId ?? "");
-  const [projectId, setProjectId] = useState<string>(defaultProjectId ?? "");
-  const [name, setName] = useState("");
-  const [description, setDescription] = useState("");
-  const [formValues, setFormValues] = useState<TaskFormValues>(defaultTaskFormValues);
-  const [formError, setFormError] = useState("");
-
-  const { data: workspacesList } = useWorkspaces();
-  const { data: projectsList } = useProjects();
-  const createTemplate = useCreateTemplate();
-
-  function resetForm() {
-    setScope(defaultScope ?? "global");
-    setWorkspaceId(defaultWorkspaceId ?? "");
-    setProjectId(defaultProjectId ?? "");
-    setName("");
-    setDescription("");
-    setFormValues(defaultTaskFormValues);
-    setFormError("");
+/**
+ * Derive a card's tag list from the underlying `TaskTemplate` row.
+ *
+ * We deliberately keep the surface tiny (scope + agent + a model token)
+ * so the chip row never explodes past the visible band. Tags are
+ * lower-cased to match the toolbar's case-insensitive predicate.
+ */
+function deriveTags(t: TaskTemplate): string[] {
+  const tags: string[] = [t.scope];
+  if (t.agent && t.agent.trim()) tags.push(t.agent.trim().toLowerCase());
+  if (t.model && t.model.trim()) {
+    // Strip vendor prefix + date suffix so the chip stays short
+    // ("claude-sonnet-4-20250514" → "sonnet"). Falls back to the raw
+    // string when no canonical token is recognised.
+    const m = t.model.toLowerCase();
+    if (m.includes("opus")) tags.push("opus");
+    else if (m.includes("sonnet")) tags.push("sonnet");
+    else if (m.includes("haiku")) tags.push("haiku");
   }
-
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setFormError("");
-
-    const trimmedName = name.trim();
-    if (!trimmedName) {
-      setFormError("Name is required.");
-      return;
-    }
-    if (scope === "workspace" && !workspaceId) {
-      setFormError("Workspace is required for workspace-scoped templates.");
-      return;
-    }
-    if (scope === "project" && !projectId) {
-      setFormError("Project is required for project-scoped templates.");
-      return;
-    }
-
-    const data: TaskTemplateCreate = {
-      name: trimmedName,
-      scope,
-      timeout_seconds: Number(formValues.timeout) || 300,
-    };
-    if (scope === "workspace") data.workspace_id = workspaceId;
-    if (scope === "project") data.project_id = projectId;
-    if (description.trim()) data.description = description.trim();
-    if (formValues.agent.trim()) data.agent = formValues.agent.trim();
-    if (formValues.model.trim() && formValues.model !== "__default__") {
-      data.model = formValues.model.trim();
-    }
-    if (formValues.prompt.trim()) data.prompt = formValues.prompt.trim();
-
-    try {
-      await createTemplate.mutateAsync(data);
-      resetForm();
-      setOpen(false);
-    } catch (err) {
-      setFormError(err instanceof Error ? err.message : "Failed to create template");
-    }
-  }
-
-  return (
-    <Dialog open={open} onOpenChange={(v) => { setOpen(v); if (!v) resetForm(); }}>
-      <DialogTrigger asChild>
-        <Button size={triggerSize}>{triggerLabel ?? "Create Template"}</Button>
-      </DialogTrigger>
-      <DialogContent className="max-w-lg">
-        <DialogHeader>
-          <DialogTitle>Create Template</DialogTitle>
-          <DialogDescription>
-            Define a reusable task template. Name and scope are required.
-          </DialogDescription>
-        </DialogHeader>
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div className="space-y-2">
-            <Label htmlFor="tpl-scope">Scope *</Label>
-            <Select
-              value={scope}
-              onValueChange={(v) => {
-                if (lockScope) return;
-                setScope(v as TemplateScope);
-                if (v !== "workspace") setWorkspaceId("");
-                if (v !== "project") setProjectId("");
-              }}
-              disabled={lockScope}
-            >
-              <SelectTrigger id="tpl-scope">
-                <SelectValue placeholder="Select scope" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="global">Global</SelectItem>
-                <SelectItem value="workspace">Workspace</SelectItem>
-                <SelectItem value="project">Project</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-
-          {scope === "workspace" && (
-            <div className="space-y-2">
-              <Label htmlFor="tpl-workspace">Workspace *</Label>
-              <Select
-                value={workspaceId}
-                onValueChange={setWorkspaceId}
-                disabled={lockScope && !!defaultWorkspaceId}
-              >
-                <SelectTrigger id="tpl-workspace">
-                  <SelectValue placeholder="Select a workspace" />
-                </SelectTrigger>
-                <SelectContent>
-                  {(workspacesList ?? []).map((w) => (
-                    <SelectItem key={w.id} value={String(w.id)}>{w.name}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          )}
-
-          {scope === "project" && (
-            <div className="space-y-2">
-              <Label htmlFor="tpl-project">Project *</Label>
-              <Select
-                value={projectId}
-                onValueChange={setProjectId}
-                disabled={lockScope && !!defaultProjectId}
-              >
-                <SelectTrigger id="tpl-project">
-                  <SelectValue placeholder="Select a project" />
-                </SelectTrigger>
-                <SelectContent>
-                  {(projectsList ?? []).map((p) => (
-                    <SelectItem key={p.id} value={String(p.id)}>{p.name}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          )}
-
-          <div className="space-y-2">
-            <Label htmlFor="tpl-name">Name *</Label>
-            <Input
-              id="tpl-name"
-              placeholder="e.g. nightly-build"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-            />
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="tpl-description">Description</Label>
-            <Textarea
-              id="tpl-description"
-              placeholder="What this template does..."
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              rows={2}
-            />
-          </div>
-          <TaskFormFields
-            values={formValues}
-            onChange={setFormValues}
-            idPrefix="tpl"
-            hideAgent
-            hideWorkspaceProject
-            keyBeforeModel
-          />
-          <p className="text-xs text-muted-foreground">
-            Note: AI key is configured per schedule, not on the template.
-          </p>
-          {formError && (
-            <p className="text-sm text-destructive">{formError}</p>
-          )}
-          <DialogFooter>
-            <Button type="submit" disabled={createTemplate.isPending}>
-              {createTemplate.isPending ? "Creating…" : "Create"}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
-  );
+  return Array.from(new Set(tags));
 }
 
+/**
+ * Adapter from the wire row to the {@link TemplateCardData} props bag
+ * the card consumes. Centralised here so the card stays presentation-
+ * only (no react-query, no domain quirks).
+ */
+function toCardData(t: TaskTemplate): TemplateCardData {
+  return {
+    key: templateKey(t),
+    name: t.name,
+    description: t.description,
+    tags: deriveTags(t),
+    lastUsedAt: t.updated_at,
+  };
+}
+
+/**
+ * Edit dialog — mirrors the legacy in-page form. Kept here (not lifted
+ * into a separate file) because it's only mounted on the templates
+ * page and the legacy table view also relied on this exact form.
+ */
 function EditTemplateDialog({
   template,
   onClose,
@@ -268,6 +149,7 @@ function EditTemplateDialog({
     selectedWorkspaceId: template.workspace_id ?? "",
     selectedProjectId: template.project_id ?? "",
     permissionMode: null,
+    isolateWorktree: template.isolation === "worktree",
   });
   const [formError, setFormError] = useState("");
 
@@ -286,6 +168,10 @@ function EditTemplateDialog({
           : null,
       prompt: formValues.prompt.trim() || null,
       timeout_seconds: Number(formValues.timeout) || 300,
+      // Round-trip the worktree-isolation flag — `null` clears the
+      // template-level default when the operator unchecks the box,
+      // matching the wider "PATCH must be honest about clears" rule.
+      isolation: formValues.isolateWorktree ? "worktree" : null,
     };
 
     const ref: TemplateRef = {
@@ -304,14 +190,14 @@ function EditTemplateDialog({
   }
 
   return (
-    <DialogContent className="max-w-lg">
+    <DialogContent className="sm:max-w-lg">
       <DialogHeader>
         <DialogTitle>Edit Template</DialogTitle>
         <DialogDescription>
           Update template fields. Name and scope are immutable.
         </DialogDescription>
       </DialogHeader>
-      <form onSubmit={handleSubmit} className="space-y-4">
+      <form onSubmit={handleSubmit} className="space-y-3">
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div className="space-y-2">
             <Label htmlFor="edit-tpl-scope">Scope</Label>
@@ -336,12 +222,11 @@ function EditTemplateDialog({
           onChange={setFormValues}
           idPrefix="edit-tpl"
           hideAgent
+          hideModel
+          hideKey
           hideWorkspaceProject
           keyBeforeModel
         />
-        <p className="text-xs text-muted-foreground">
-          Note: AI key is configured per schedule, not on the template.
-        </p>
         {formError && <p className="text-sm text-destructive">{formError}</p>}
         <DialogFooter>
           <Button type="submit" disabled={updateTemplate.isPending}>
@@ -354,248 +239,239 @@ function EditTemplateDialog({
 }
 
 export default function TemplatesPage() {
-  const [offset, setOffset] = useState(0);
-  const [scopeFilter, setScopeFilter] = useState<ScopeFilter>("all");
-  const [workspaceFilter, setWorkspaceFilter] = useState<string>("");
-  const [projectFilter, setProjectFilter] = useState<string>("");
+  const navigate = useNavigate();
+
+  // URL-backed filter state (audit-round-3 fix). The toolbar's tag chip
+  // and search input now read from / write to `useSearchParams`, so:
+  //   - refresh / deep-link preserves the active filter
+  //   - the back button correctly walks through filter history
+  //   - bookmarks reproduce the exact filtered view
+  //
+  // The previous `useState` shape silently dropped the filter on every
+  // reload — inconsistent with `/tasks`, which uses the same pattern.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tag = searchParams.get("tag") ?? "all";
+  const query = searchParams.get("q") ?? "";
+
+  const setTag = (next: string) => {
+    setSearchParams((prev) => {
+      const sp = new URLSearchParams(prev);
+      if (!next || next === "all") sp.delete("tag");
+      else sp.set("tag", next);
+      return sp;
+    });
+  };
+  const setQuery = (next: string) => {
+    setSearchParams((prev) => {
+      const sp = new URLSearchParams(prev);
+      if (!next) sp.delete("q");
+      else sp.set("q", next);
+      return sp;
+    });
+  };
+
   const [editingTemplate, setEditingTemplate] = useState<TaskTemplate | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<TaskTemplate | null>(null);
+  const [dialogOpen, setDialogOpen] = useState(false);
 
-  const filter: TemplateFilter = useMemo(() => {
-    const f: TemplateFilter = {};
-    if (scopeFilter !== "all") f.scope = scopeFilter;
-    if (scopeFilter === "workspace" && workspaceFilter) f.workspaceId = workspaceFilter;
-    if (scopeFilter === "project" && projectFilter) f.projectId = projectFilter;
-    return f;
-  }, [scopeFilter, workspaceFilter, projectFilter]);
-
-  const { data, isLoading, error } = useTemplates(offset, PAGE_SIZE, filter);
-  const { data: projectsList } = useProjects();
-  const { data: workspacesList } = useWorkspaces();
+  // Fetch a generous page (200) — templates are typically dozens, not
+  // thousands; a single round-trip lets the page filter / search /
+  // group entirely client-side without per-keystroke refetches.
+  const { data, isLoading, error } = useTemplates(0, 200, {});
   const deleteTemplateMutation = useDeleteTemplate();
   const deleteConfirm = useConfirmDialog();
+  const createChat = useCreateChat();
 
-  const projectById = useMemo(() => {
-    const m = new Map<string, string>();
-    for (const p of projectsList ?? []) m.set(String(p.id), p.name);
-    return m;
-  }, [projectsList]);
-  const workspaceById = useMemo(() => {
-    const m = new Map<string, string>();
-    for (const w of workspacesList ?? []) m.set(String(w.id), w.name);
-    return m;
-  }, [workspacesList]);
+  const items: TaskTemplate[] = useMemo(() => data?.items ?? [], [data?.items]);
 
-  const showingFrom = data ? Math.min(offset + 1, data.total) : 0;
-  const showingTo = data ? Math.min(offset + PAGE_SIZE, data.total) : 0;
+  // Derive the distinct tag set across every template, with counts.
+  // The chip row reflects what users can actually filter to — so a tag
+  // a single template carries is a valid chip. Sorted alphabetically so
+  // chip order is stable across renders.
+  const tags: TemplatesToolbarTag[] = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const t of items) {
+      for (const tag of deriveTags(t)) {
+        counts.set(tag, (counts.get(tag) ?? 0) + 1);
+      }
+    }
+    return [...counts.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([name, count]) => ({
+        id: name,
+        slug: slugify(name),
+        name,
+        count,
+      }));
+  }, [items]);
+
+  const slugToName = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const t of tags) m.set(t.slug, t.name);
+    return m;
+  }, [tags]);
+
+  // Apply the tag predicate the toolbar contracts for, then narrow by
+  // the search query. Both helpers are exported from the toolbar so the
+  // chip row, the search input, and the grid can never disagree on
+  // what's visible.
+  const filtered = useMemo(() => {
+    const withTags = items.map((t) => ({
+      template: t,
+      tags: deriveTags(t),
+    }));
+    // Toolbar's tag setter writes the slug — translate back to the raw
+    // tag value before matching.
+    const tagValue = tag === "all" ? "all" : slugToName.get(tag) ?? tag;
+    const byTag = filterTemplatesByTag(withTags, tagValue).map(
+      (r) => r.template,
+    );
+    return filterTemplatesByQuery(byTag, query);
+  }, [items, tag, slugToName, query]);
+
+  // Render-time guards — mutually exclusive states.
+  const showLoading = isLoading;
+  const showError = !!error;
+  const showInitialEmpty = !isLoading && !error && items.length === 0;
+  const showFilteredEmpty =
+    !isLoading && !error && items.length > 0 && filtered.length === 0;
+  const showGrid = !isLoading && !error && filtered.length > 0;
+
+  const subtitle =
+    isLoading || error
+      ? undefined
+      : `${items.length} ${items.length === 1 ? "template" : "templates"}`;
+
+  /**
+   * Spin up a new chat seeded with the template's scope / workspace /
+   * project metadata and navigate to it. The seeded title carries the
+   * template name so the chat list shows what's running.
+   */
+  async function handleOpenInChat(t: TaskTemplate) {
+    try {
+      const created = await createChat.mutateAsync({
+        title: t.name,
+        projectId: t.project_id ? Number(t.project_id) : null,
+        workspaceId: t.workspace_id ? Number(t.workspace_id) : null,
+      });
+      const id = (created as { id: string | number }).id;
+      navigate(`/chats/${id}`);
+    } catch {
+      // Swallow — the mutation surfaces its own error UI elsewhere; the
+      // user can retry from the same affordance.
+    }
+  }
 
   return (
-    <div>
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="min-w-0">
-          <h1 className="text-xl font-bold sm:text-2xl">Templates</h1>
-          <p className="mt-1 text-sm text-muted-foreground sm:text-base">
-            Manage reusable task templates scoped to global, workspace, or project.
-          </p>
-        </div>
-        <CreateTemplateDialog />
-      </div>
-
-      <div className="mt-4 flex flex-wrap items-end gap-3">
-        <div className="space-y-1">
-          <Label className="text-xs text-muted-foreground">Scope</Label>
-          <Select
-            value={scopeFilter}
-            onValueChange={(v) => {
-              setScopeFilter(v as ScopeFilter);
-              setOffset(0);
-              setWorkspaceFilter("");
-              setProjectFilter("");
-            }}
-          >
-            <SelectTrigger className="w-[160px]">
-              <SelectValue placeholder="All" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">All</SelectItem>
-              <SelectItem value="global">Global</SelectItem>
-              <SelectItem value="workspace">Workspace</SelectItem>
-              <SelectItem value="project">Project</SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
-
-        {scopeFilter === "workspace" && (
-          <div className="space-y-1">
-            <Label className="text-xs text-muted-foreground">Workspace</Label>
-            <Select
-              value={workspaceFilter || "__all__"}
-              onValueChange={(v) => {
-                setWorkspaceFilter(v === "__all__" ? "" : v);
-                setOffset(0);
-              }}
+    <div data-testid="templates-page" className="max-w-7xl">
+      <SectionHeader
+        title="Templates"
+        subtitle={subtitle}
+        action={
+          !showLoading && !showError ? (
+            <Button
+              type="button"
+              size="sm"
+              onClick={() => setDialogOpen(true)}
+              data-testid="templates-new-template-button"
             >
-              <SelectTrigger className="w-[220px]">
-                <SelectValue placeholder="All workspaces" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="__all__">All workspaces</SelectItem>
-                {(workspacesList ?? []).map((w) => (
-                  <SelectItem key={w.id} value={String(w.id)}>{w.name}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-        )}
+              <Plus aria-hidden="true" />
+              New template
+            </Button>
+          ) : undefined
+        }
+      />
 
-        {scopeFilter === "project" && (
-          <div className="space-y-1">
-            <Label className="text-xs text-muted-foreground">Project</Label>
-            <Select
-              value={projectFilter || "__all__"}
-              onValueChange={(v) => {
-                setProjectFilter(v === "__all__" ? "" : v);
-                setOffset(0);
-              }}
+      {!showLoading && !showError && (
+        <div className="mb-4">
+          <TemplatesToolbar
+            totalCount={items.length}
+            tags={tags}
+            onTagChange={setTag}
+            onSearchChange={setQuery}
+          />
+        </div>
+      )}
+
+      {showLoading && (
+        <div className="space-y-2" data-testid="templates-loading">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <Skeleton key={i} className="h-32 w-full" />
+          ))}
+        </div>
+      )}
+
+      {showError && (
+        <p className="text-destructive" data-testid="templates-error">
+          Failed to load templates: {(error as Error)?.message}
+        </p>
+      )}
+
+      {showInitialEmpty && (
+        <EmptyState
+          icon={FileCode2}
+          title="No templates yet"
+          description="Save a reusable recipe — prompt, model, and tools — to spin up the same task with a single click."
+          action={
+            <Button
+              type="button"
+              size="sm"
+              onClick={() => setDialogOpen(true)}
+              data-testid="templates-empty-cta"
             >
-              <SelectTrigger className="w-[220px]">
-                <SelectValue placeholder="All projects" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="__all__">All projects</SelectItem>
-                {(projectsList ?? []).map((p) => (
-                  <SelectItem key={p.id} value={String(p.id)}>{p.name}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-        )}
-      </div>
+              <Plus aria-hidden="true" />
+              New template
+            </Button>
+          }
+          data-testid="templates-empty-state"
+        />
+      )}
 
-      <div className="mt-6">
-        {isLoading && (
-          <div className="space-y-2">
-            {Array.from({ length: 5 }).map((_, i) => (
-              <Skeleton key={i} className="h-12 w-full" />
-            ))}
-          </div>
-        )}
-        {error && (
-          <p className="text-destructive">
-            Failed to load templates: {error.message}
-          </p>
-        )}
-        {data && data.items.length === 0 && (
-          <p className="text-sm text-muted-foreground">No templates yet.</p>
-        )}
-        {data && data.items.length > 0 && (
-          <>
-            <p className="mb-4 text-sm text-muted-foreground">
-              Showing {showingFrom}–{showingTo} of {data.total} template
-              {data.total !== 1 ? "s" : ""}
-            </p>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="hidden sm:table-cell">Scope</TableHead>
-                  <TableHead>Name</TableHead>
-                  <TableHead className="hidden lg:table-cell">Description</TableHead>
-                  <TableHead className="hidden md:table-cell">Workspace</TableHead>
-                  <TableHead className="hidden md:table-cell">Project</TableHead>
-                  <TableHead className="hidden xl:table-cell">Timeout</TableHead>
-                  <TableHead className="hidden sm:table-cell">Updated</TableHead>
-                  <TableHead className="w-[80px]">Actions</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {data.items.map((tpl: TaskTemplate) => {
-                  const wsName = tpl.workspace_id
-                    ? workspaceById.get(String(tpl.workspace_id)) ?? `#${tpl.workspace_id}`
-                    : null;
-                  const projName = tpl.project_id
-                    ? projectById.get(String(tpl.project_id)) ?? `#${tpl.project_id}`
-                    : null;
-                  return (
-                    <TableRow key={templateKey(tpl)}>
-                      <TableCell className="hidden text-xs sm:table-cell">{scopeLabel(tpl.scope)}</TableCell>
-                      <TableCell className="font-medium">{tpl.name}</TableCell>
-                      <TableCell className="hidden max-w-[200px] truncate text-sm text-muted-foreground lg:table-cell">
-                        {tpl.description ?? "-"}
-                      </TableCell>
-                      <TableCell className="hidden text-sm md:table-cell">
-                        {wsName ?? <span className="text-muted-foreground">-</span>}
-                      </TableCell>
-                      <TableCell className="hidden text-sm md:table-cell">
-                        {projName ?? <span className="text-muted-foreground">-</span>}
-                      </TableCell>
-                      <TableCell className="hidden text-xs xl:table-cell">
-                        {tpl.timeout_seconds != null ? `${tpl.timeout_seconds}s` : "-"}
-                      </TableCell>
-                      <TableCell className="hidden text-xs sm:table-cell">
-                        {formatTime(tpl.updated_at)}
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex gap-1" onClick={(e) => e.stopPropagation()}>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-7 px-2 text-xs"
-                            onClick={() => setEditingTemplate(tpl)}
-                          >
-                            Edit
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-7 px-2 text-xs text-destructive hover:text-destructive"
-                            disabled={deleteTemplateMutation.isPending}
-                            onClick={() => {
-                              setDeleteTarget(tpl);
-                              deleteConfirm.requestConfirm(templateKey(tpl));
-                            }}
-                          >
-                            Delete
-                          </Button>
-                        </div>
-                      </TableCell>
-                    </TableRow>
-                  );
-                })}
-              </TableBody>
-            </Table>
+      {showFilteredEmpty && (
+        <EmptyState
+          icon={FileCode2}
+          title="No templates match your filters"
+          description="Try clearing the search or picking a different tag."
+          data-testid="templates-filtered-empty-state"
+        />
+      )}
 
-            {/* Pagination */}
-            <div className="mt-4 flex items-center justify-between">
-              <p className="text-sm text-muted-foreground">
-                Page {Math.floor(offset / PAGE_SIZE) + 1} of{" "}
-                {Math.ceil(data.total / PAGE_SIZE)}
-              </p>
-              <div className="flex gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={offset === 0}
-                  onClick={() => setOffset((o) => Math.max(0, o - PAGE_SIZE))}
-                >
-                  Previous
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={offset + PAGE_SIZE >= data.total}
-                  onClick={() => setOffset((o) => o + PAGE_SIZE)}
-                >
-                  Next
-                </Button>
-              </div>
-            </div>
-          </>
-        )}
-      </div>
+      {showGrid && (
+        <div
+          data-testid="templates-grid"
+          className={CARDS_GRID_CLASSES}
+        >
+          {filtered.map((t) => (
+            <TemplateCard
+              key={templateKey(t)}
+              template={toCardData(t)}
+              onOpenInChat={() => void handleOpenInChat(t)}
+              onClick={() => setEditingTemplate(t)}
+            />
+          ))}
+        </div>
+      )}
 
-      <Dialog open={!!editingTemplate} onOpenChange={(v) => { if (!v) setEditingTemplate(null); }}>
+      {/*
+        Mount the dialog once per page render — the SectionHeader's
+        `+ New template` button drives `dialogOpen` state directly.
+      */}
+      <NewTemplateDialog
+        open={dialogOpen}
+        onOpenChange={setDialogOpen}
+      />
+
+      <Dialog
+        open={!!editingTemplate}
+        onOpenChange={(v) => {
+          if (!v) setEditingTemplate(null);
+        }}
+      >
         {editingTemplate && (
-          <EditTemplateDialog template={editingTemplate} onClose={() => setEditingTemplate(null)} />
+          <EditTemplateDialog
+            template={editingTemplate}
+            onClose={() => setEditingTemplate(null)}
+          />
         )}
       </Dialog>
 
@@ -629,4 +505,13 @@ export default function TemplatesPage() {
   );
 }
 
-export { CreateTemplateDialog };
+/**
+ * Backwards-compat re-export so external callers
+ * (e.g. `pages/project-detail-components/ProjectTemplatesSection.tsx`)
+ * keep working after the redesign. The legacy in-page
+ * `CreateTemplateDialog` was a self-contained Dialog with a built-in
+ * trigger, identical in shape to the refreshed `NewTemplateDialog`
+ * (which now fronts the page). Aliasing them here lets the import in
+ * the project-detail tab keep working without any caller-side change.
+ */
+export { NewTemplateDialog as CreateTemplateDialog };

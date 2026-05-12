@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, type ReactNode } from "react";
 import {
   Dialog,
   DialogContent,
@@ -13,10 +13,20 @@ interface ConfirmDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   title: string;
-  description: string;
+  /**
+   * Body content. Accepts a string (renders inside Radix's
+   * `DialogDescription`) or a ReactNode for multi-paragraph layouts —
+   * e.g. {@link DiscardConfirm} prepends a "file is open in a dirty tab"
+   * warning above the path + "cannot be undone" line. We render
+   * `DialogDescription` only for the string variant so multi-paragraph
+   * bodies don't double-wrap inside a `<p>`.
+   */
+  description: ReactNode;
   confirmLabel?: string;
   cancelLabel?: string;
   isPending?: boolean;
+  /** Visual variant of the confirm button. Defaults to "destructive". */
+  confirmVariant?: "destructive" | "default";
   onConfirm: () => void;
 }
 
@@ -28,21 +38,29 @@ export function ConfirmDialog({
   confirmLabel = "Delete",
   cancelLabel = "Cancel",
   isPending = false,
+  confirmVariant = "destructive",
   onConfirm,
 }: ConfirmDialogProps) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
+      <DialogContent className="sm:max-w-sm">
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
-          <DialogDescription>{description}</DialogDescription>
+          {typeof description === "string" ? (
+            <DialogDescription>{description}</DialogDescription>
+          ) : (
+            // Non-string body — caller owns its own paragraphs / layout,
+            // and we sidestep `DialogDescription`'s implicit `<p>` wrap so
+            // a child `<p>` doesn't produce an invalid hydration nest.
+            <div className="text-sm text-muted-foreground">{description}</div>
+          )}
         </DialogHeader>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             {cancelLabel}
           </Button>
           <Button
-            variant="destructive"
+            variant={confirmVariant}
             disabled={isPending}
             onClick={onConfirm}
           >

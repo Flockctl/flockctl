@@ -16,7 +16,7 @@ import { Separator } from "@/components/ui/separator";
  */
 export function TemplatesSchedulesTab({ projectId }: { projectId: string }) {
   return (
-    <div className="space-y-6" data-testid="project-templates-schedules-tab">
+    <div className="space-y-4" data-testid="project-templates-schedules-tab">
       <ProjectTemplatesSection projectId={projectId} />
       <Separator />
       <ProjectSchedulesSection projectId={projectId} />

@@ -69,7 +69,7 @@ export function ProjectsAccordion({
           existingProjectIds={existingProjectIds}
         />
       </CardHeader>
-      <CardContent className="space-y-4">
+      <CardContent className="space-y-3">
         {summaries.length === 0 ? (
           <p className="text-sm text-muted-foreground">
             No projects in this workspace yet. Click{" "}

@@ -24,10 +24,15 @@ describe("plan-store", () => {
   // ─── Helpers ───
 
   describe("toSlug", () => {
-    it("generates order-prefixed slug", () => {
-      expect(toSlug(0, "Setup database")).toBe("00-Setup_database");
-      expect(toSlug(1, "Add API routes")).toBe("01-Add_API_routes");
-      expect(toSlug(12, "Final cleanup")).toBe("12-Final_cleanup");
+    it("generates order-prefixed kebab-case slug", () => {
+      // Slugs must be lowercase kebab-case so the UI router and the plan
+      // generator agree on what the on-disk directory name will be.
+      expect(toSlug(0, "Setup database")).toBe("00-setup-database");
+      expect(toSlug(1, "Add API routes")).toBe("01-add-api-routes");
+      expect(toSlug(12, "Final cleanup")).toBe("12-final-cleanup");
+      expect(toSlug(16, "Audit Review & Final Coverage")).toBe(
+        "16-audit-review-final-coverage",
+      );
     });
   });
 
@@ -111,7 +116,7 @@ describe("plan-store", () => {
         successCriteria: ["Tests pass"],
       });
 
-      expect(m.slug).toMatch(/^00-Phase_1/);
+      expect(m.slug).toMatch(/^00-phase-1/);
       expect(m.title).toBe("Phase 1");
       expect(m.status).toBe("pending");
       expect(m.vision).toBe("Build foundation");
@@ -206,7 +211,7 @@ describe("plan-store", () => {
         goal: "Working database",
       });
 
-      expect(s.slug).toMatch(/^00-Setup_DB/);
+      expect(s.slug).toMatch(/^00-setup-db/);
       expect(s.title).toBe("Setup DB");
       expect(s.risk).toBe("high");
       expect(s.milestoneSlug).toBe(milestoneSlug);
@@ -285,7 +290,7 @@ describe("plan-store", () => {
         verify: "npm test",
       });
 
-      expect(t.slug).toMatch(/^00-Create_schema/);
+      expect(t.slug).toMatch(/^00-create-schema/);
       expect(t.title).toBe("Create schema");
       expect(t.model).toBe("claude-opus-4-7");
       expect(t.files).toEqual(["src/db/schema.ts"]);
@@ -302,6 +307,24 @@ describe("plan-store", () => {
       expect(list).toHaveLength(2);
       expect(list[0].title).toBe("A");
       expect(list[1].title).toBe("B");
+    });
+
+    it("listPlanTasks ignores .md files without YAML frontmatter (artefacts like AUDIT.md)", () => {
+      // Real task files (frontmatter present) — must be picked up.
+      createPlanTask(projectPath, milestoneSlug, sliceSlug, { title: "Real task", order: 0 });
+
+      // Agent-emitted artefacts (no frontmatter) dropped into the slice dir —
+      // must NOT surface as pending tasks. This was the root cause of the
+      // teachersflow E2E milestone bug where AUDIT.md / MATRIX.md files showed
+      // up as un-activatable pending tasks.
+      const sliceDir = join(getPlanDir(projectPath), milestoneSlug, sliceSlug);
+      const fs = require("fs");
+      fs.writeFileSync(join(sliceDir, "AUDIT.md"), "# Audit Report\n\nPlain markdown, no frontmatter.\n", "utf-8");
+      fs.writeFileSync(join(sliceDir, "NOTES.md"), "Some scribbles.\n", "utf-8");
+
+      const list = listPlanTasks(projectPath, milestoneSlug, sliceSlug);
+      expect(list).toHaveLength(1);
+      expect(list[0].title).toBe("Real task");
     });
 
     it("getPlanTask reads back task", () => {

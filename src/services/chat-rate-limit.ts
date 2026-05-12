@@ -27,11 +27,12 @@
  * resume test fails before users do.
  */
 
-import { eq } from "drizzle-orm";
+import { eq, and, desc } from "drizzle-orm";
 import { getDb } from "../db/index.js";
 import { chats, chatMessages, usageRecords } from "../db/schema.js";
 import { wsManager } from "./ws-manager.js";
 import { rateLimitScheduler } from "./agents/rate-limit-scheduler.js";
+import { BoundedStringAccumulator } from "../lib/bounded-string.js";
 import { classifyLimit } from "./agents/rate-limit-classifier.js";
 import { AgentSession, type AgentSessionMetrics } from "./agent-session/index.js";
 import { calculateCost } from "./ai/cost.js";
@@ -118,14 +119,18 @@ export async function resumeChatAfterRateLimit(chatId: number): Promise<void> {
 
   // Find the last user message — that's what the resumed turn will replay.
   // Without one, there's nothing to send; just unpark and exit.
+  // Push the role filter and the desc-by-time ordering into SQL so we read a
+  // single row instead of materialising every chat message in memory and
+  // sorting them in JS. The previous shape (`select all → JS filter → JS
+  // sort → at(-1)`) was O(N) memory + CPU per resume; on a chat with
+  // thousands of messages that became a real cost.
   const lastUser = db
     .select()
     .from(chatMessages)
-    .where(eq(chatMessages.chatId, chatId))
-    .all()
-    .filter((m) => m.role === "user")
-    .sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""))
-    .at(-1);
+    .where(and(eq(chatMessages.chatId, chatId), eq(chatMessages.role, "user")))
+    .orderBy(desc(chatMessages.createdAt))
+    .limit(1)
+    .get();
 
   if (!lastUser) {
     db.update(chats)
@@ -213,13 +218,16 @@ export async function resumeChatAfterRateLimit(chatId: number): Promise<void> {
     projectId: chat.projectId ?? null,
     workspaceContext,
     thinkingEnabled: chat.thinkingEnabled ?? true,
-    effort: (chat.effort as "low" | "medium" | "high" | "max" | null) ?? undefined,
+    effort: (chat.effort as "low" | "medium" | "high" | "xhigh" | "max" | null) ?? undefined,
   });
 
-  let fullText = "";
+  // Bounded chunk-buffer accumulator (see lib/bounded-string.ts). Replaces
+  // a `let s = ""; s += chunk` that was O(n²) over total bytes and had no
+  // ceiling on memory if a runaway provider streamed multi-GB.
+  const fullTextAcc = new BoundedStringAccumulator();
   let finalMetrics: AgentSessionMetrics | undefined;
   session.on("text", (chunk: string) => {
-    fullText += chunk;
+    fullTextAcc.append(chunk);
     // Broadcast each text delta to any open chat-detail page so the user
     // sees the resumed turn arrive in real time. Mirrors the SSE writer in
     // routes/chats/messages.ts but routed through WS because there's no
@@ -247,6 +255,7 @@ export async function resumeChatAfterRateLimit(chatId: number): Promise<void> {
   try {
     await session.run();
 
+    const fullText = fullTextAcc.toString();
     if (fullText) {
       db.insert(chatMessages).values({
         chatId,

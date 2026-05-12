@@ -1,9 +1,10 @@
 import { readFileSync, existsSync, readdirSync } from "fs";
 import { join } from "path";
 import { getDb } from "../db/index.js";
-import { projects, workspaces } from "../db/schema.js";
+import { workspaces } from "../db/schema.js";
 import { eq } from "drizzle-orm";
 import { getGlobalSkillsDir } from "../config/index.js";
+import { getProjectById } from "../lib/db-helpers.js";
 import { loadWorkspaceConfig } from "./workspace-config.js";
 import { loadProjectConfig } from "./project-config.js";
 import type { DisableEntry } from "./workspace-config.js";
@@ -100,7 +101,7 @@ export function resolveSkillsForProject(projectId?: number | null): Skill[] {
   if (!projectId) return [...out.values()];
 
   const db = getDb();
-  const project = db.select().from(projects).where(eq(projects.id, projectId)).get();
+  const project = getProjectById(projectId);
   if (!project) return [...out.values()];
 
   let wsDisabledGlobal = new Set<string>();

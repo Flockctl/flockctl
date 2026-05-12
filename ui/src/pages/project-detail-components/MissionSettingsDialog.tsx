@@ -220,7 +220,7 @@ function MissionSettingsForm({
   }
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-4" noValidate>
+    <form onSubmit={handleSubmit} className="space-y-3" noValidate>
           <div className="space-y-2">
             <Label htmlFor="ms-objective">Objective</Label>
             <Textarea

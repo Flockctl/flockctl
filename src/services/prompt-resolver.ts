@@ -25,10 +25,13 @@ function readPromptFromFile(filePath: string): string {
 
   const { frontmatter, body } = parseMd(filePath);
 
-  // Build prompt from frontmatter + body
+  // Build prompt from frontmatter + body. `frontmatter` is now typed
+  // `Record<string, unknown>` (audit-round-8 type-safety tightening);
+  // narrow each access site with `typeof` guards so TS knows the value
+  // is a string before we concat it into the output.
   const parts: string[] = [];
 
-  if (frontmatter.title) {
+  if (typeof frontmatter.title === "string" && frontmatter.title) {
     parts.push(frontmatter.title);
   }
 
@@ -36,7 +39,7 @@ function readPromptFromFile(filePath: string): string {
     parts.push(body);
   }
 
-  if (frontmatter.verify) {
+  if (typeof frontmatter.verify === "string" && frontmatter.verify) {
     parts.push(`Verification: ${frontmatter.verify}`);
   }
 

@@ -75,7 +75,7 @@ export function ServerSwitcher() {
         ))}
         <DropdownMenuSeparator />
         <DropdownMenuItem asChild>
-          <NavLink to="/settings" className="flex items-center gap-2">
+          <NavLink to="/settings?tab=server" className="flex items-center gap-2">
             <Settings2 className="h-3.5 w-3.5" />
             Manage Servers…
           </NavLink>

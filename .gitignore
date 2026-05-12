@@ -3,6 +3,9 @@
 .gsd
 .gsd-id
 .bg-shell/
+
+# Flockctl worktrees — agent-managed local isolation, never commit.
+.flockctl/worktrees/
 .DS_Store
 Thumbs.db
 *.swp

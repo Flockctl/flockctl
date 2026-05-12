@@ -1,7 +1,45 @@
-import { useEffect, useState } from "react";
+import { useSyncExternalStore } from "react";
 import { Badge } from "@/components/ui/badge";
 import { TaskStatus } from "@/lib/types";
 import type { Task } from "@/lib/types";
+
+// Shared 1Hz "now" clock for every RateLimitedBadge on the page.
+//
+// Previously each rate-limited badge spun up its OWN setInterval — with N
+// rate-limited tasks visible the page paid N React renders per second from N
+// independent timers. The shared store keeps one global tick; every badge
+// reads the same `Date.now()` snapshot via `useSyncExternalStore`, and the
+// interval is started/stopped automatically based on subscriber count so
+// pages without rate-limited badges pay nothing.
+let nowValue = Date.now();
+const nowListeners = new Set<() => void>();
+let nowInterval: ReturnType<typeof setInterval> | null = null;
+
+function subscribeNow(fn: () => void): () => void {
+  nowListeners.add(fn);
+  if (nowInterval === null) {
+    nowInterval = setInterval(() => {
+      nowValue = Date.now();
+      for (const l of nowListeners) l();
+    }, 1000);
+  }
+  return () => {
+    nowListeners.delete(fn);
+    if (nowListeners.size === 0 && nowInterval !== null) {
+      clearInterval(nowInterval);
+      nowInterval = null;
+    }
+  };
+}
+
+function getNowSnapshot(): number {
+  return nowValue;
+}
+
+/** 1Hz "now" — single timer shared across every consumer. */
+function useNow(): number {
+  return useSyncExternalStore(subscribeNow, getNowSnapshot, getNowSnapshot);
+}
 
 /**
  * Colored status badge for tasks. Used by the tasks list, the task detail
@@ -43,12 +81,7 @@ export function TaskStatusBadge({
 }
 
 function RateLimitedBadge({ resumeAt }: { resumeAt: number | null }) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, []);
-
+  const now = useNow();
   const label = resumeAt ? formatCountdown(Math.max(0, resumeAt - now)) : null;
   return (
     <Badge

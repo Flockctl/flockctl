@@ -1,13 +1,10 @@
 import simpleGit from "simple-git";
 import { readdirSync, readFileSync, existsSync } from "fs";
 import { join } from "path";
-import { getDb } from "../db/index.js";
-import { projects } from "../db/schema.js";
-import { eq } from "drizzle-orm";
+import { getProjectById } from "../lib/db-helpers.js";
 
 export async function buildCodebaseContext(projectId: number): Promise<string> {
-  const db = getDb();
-  const project = db.select().from(projects).where(eq(projects.id, projectId)).get();
+  const project = getProjectById(projectId);
   if (!project?.path || !existsSync(project.path)) return "";
 
   const parts: string[] = [];

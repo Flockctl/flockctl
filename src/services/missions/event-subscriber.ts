@@ -59,6 +59,8 @@
 //     an `unhandledRejection` and crashes the daemon (server-entry installs
 //     a hard exit on unhandled rejections). All errors are logged + swallowed.
 
+import type Database from "better-sqlite3";
+
 import { getDb, getRawDb } from "../../db/index.js";
 import { projects } from "../../db/schema.js";
 import {
@@ -72,6 +74,107 @@ import {
 } from "../plan-store/index.js";
 import type { MissionTrigger } from "./max-depth-guard.js";
 import type { SupervisorService } from "./supervisor.js";
+
+// ─── Prepared-statement cache (audit-driven hot-path optimisation) ───
+//
+// `readActiveMission` fires once per terminal task event. Re-preparing
+// the same SELECT on every call burns cycles parsing identical SQL.
+// Mirror the WeakMap pattern from budget-enforcer.ts so the cache
+// resets cleanly across test DB swaps.
+
+const readMissionStmtCache = new WeakMap<
+  Database.Database,
+  Database.Statement<[string]>
+>();
+
+function getReadMissionStmt(sqlite: Database.Database): Database.Statement<[string]> {
+  let stmt = readMissionStmtCache.get(sqlite);
+  if (stmt) return stmt;
+  stmt = sqlite.prepare("SELECT id, status FROM missions WHERE id = ?");
+  readMissionStmtCache.set(sqlite, stmt);
+  return stmt;
+}
+
+// ─── Mission-for-task resolver cache ─────────────────────────────────────
+//
+// `resolveMissionForTask` runs on every taskTerminal event and walks
+// the entire filesystem-backed plan store (projects → milestones →
+// slices → plan-tasks). On a host with many projects that's hundreds
+// of sync readdirSync/readFileSync calls per terminal event — and
+// every chat-finishing task triggers one. Audit-round-2 finding #1.
+//
+// Cache shape:
+//   - `Map<taskId, missionId | null>` so "no mission" is cached too
+//   - Positive entries are essentially stable for the task's lifetime
+//     (plan files are append-mostly and tasks rarely move slices)
+//   - Negative entries get a short TTL so a task that joined a slice
+//     AFTER first lookup re-resolves within 60s.
+//   - Bounded at MAX_CACHE_ENTRIES with insertion-order eviction so a
+//     long-running daemon can't accumulate unbounded entries.
+//   - `clearMissionForTaskCache()` is exported so plan-store mutation
+//     paths (`milestones.ts`, `tasks.ts`) can invalidate on write —
+//     wiring is left to the plan-store writers; even without it the
+//     TTL keeps the cache eventually-consistent.
+
+const MAX_CACHE_ENTRIES = 4096;
+const NEGATIVE_TTL_MS = 60 * 1000;
+// Positive TTL added in audit-round-4: a milestone's mission_id COULD
+// change out-of-band (operator edits the plan file directly, or a
+// re-import overwrites it). The negative-TTL-only model meant a wrong
+// positive answer would stick until daemon restart. 10 min positive
+// TTL puts a hard ceiling on the staleness window while still keeping
+// the cache effective for the common case (millions of terminal events
+// per day on a single mapping).
+const POSITIVE_TTL_MS = 10 * 60 * 1000;
+
+interface CacheEntry {
+  value: string | null;
+  /** epoch ms — consulted for both positive and negative entries. */
+  insertedAt: number;
+}
+
+const missionForTaskCache = new Map<number, CacheEntry>();
+
+function readCachedMissionForTask(taskId: number): string | null | undefined {
+  const entry = missionForTaskCache.get(taskId);
+  if (!entry) return undefined;
+  const age = Date.now() - entry.insertedAt;
+  if (entry.value !== null) {
+    if (age > POSITIVE_TTL_MS) {
+      missionForTaskCache.delete(taskId);
+      return undefined;
+    }
+    return entry.value;
+  }
+  // Negative entries time out faster so a task that joined a slice AFTER its
+  // first terminal event re-resolves on the next event.
+  if (age > NEGATIVE_TTL_MS) {
+    missionForTaskCache.delete(taskId);
+    return undefined;
+  }
+  return null;
+}
+
+function writeCachedMissionForTask(taskId: number, value: string | null): void {
+  // Evict oldest (insertion order) before insert when at capacity.
+  // Map.keys() returns insertion order per spec, so the first key is
+  // the oldest. Cheap, no LRU bookkeeping needed.
+  if (missionForTaskCache.size >= MAX_CACHE_ENTRIES) {
+    const oldest = missionForTaskCache.keys().next().value;
+    if (oldest !== undefined) missionForTaskCache.delete(oldest);
+  }
+  missionForTaskCache.set(taskId, { value, insertedAt: Date.now() });
+}
+
+/**
+ * Drop every cached mission-for-task entry. Call from plan-store
+ * mutation paths (milestone create/delete, task move-to-slice) so the
+ * next resolver pass picks up the new mapping. Tests also call this in
+ * `beforeEach` to keep state hermetic.
+ */
+export function clearMissionForTaskCache(): void {
+  missionForTaskCache.clear();
+}
 
 // ─── Internals ───
 
@@ -100,9 +203,7 @@ interface MissionRow {
  */
 function readActiveMission(missionId: string): MissionRow | null {
   const sqlite = getRawDb();
-  const row = sqlite
-    .prepare("SELECT id, status FROM missions WHERE id = ?")
-    .get(missionId) as MissionRow | undefined;
+  const row = getReadMissionStmt(sqlite).get(missionId) as MissionRow | undefined;
   if (!row) return null;
   if (!ACTIVE_MISSION_STATUSES.has(row.status)) return null;
   return row;
@@ -126,6 +227,13 @@ function readActiveMission(missionId: string): MissionRow | null {
  * tasks to missions, by design — the plan files are the source of truth.
  */
 function resolveMissionForTask(taskId: number): string | null {
+  // Fast path — repeat lookups for the same task id (the common case
+  // when a slice fires a 1000-task burst, or a task emits multiple
+  // terminal-adjacent events in quick succession) hit the cache and
+  // skip the entire FS walk.
+  const cached = readCachedMissionForTask(taskId);
+  if (cached !== undefined) return cached;
+
   const db = getDb();
   // listMilestones / listSlices / listPlanTasks throw on missing dirs;
   // catch per-iteration so a half-imported project can't poison the
@@ -167,12 +275,14 @@ function resolveMissionForTask(taskId: number): string | null {
         }
         for (const pt of planTasks) {
           if (pt.executionTaskId === taskId) {
+            writeCachedMissionForTask(taskId, m.missionId);
             return m.missionId;
           }
         }
       }
     }
   }
+  writeCachedMissionForTask(taskId, null);
   return null;
 }
 

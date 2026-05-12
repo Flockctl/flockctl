@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Plus } from "lucide-react";
 import { useAddProjectToWorkspace, useProjects } from "@/lib/hooks";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
@@ -70,16 +71,19 @@ export function AddProjectDialog({ workspaceId, existingProjectIds }: { workspac
       }}
     >
       <DialogTrigger asChild>
-        <Button size="sm">Add Project</Button>
+        <Button size="sm">
+          <Plus aria-hidden="true" />
+          Add project
+        </Button>
       </DialogTrigger>
-      <DialogContent className="max-w-lg">
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Add Project</DialogTitle>
           <DialogDescription>
             Add a project to this workspace.
           </DialogDescription>
         </DialogHeader>
-        <form onSubmit={handleSubmit} className="space-y-4">
+        <form onSubmit={handleSubmit} className="space-y-3">
           <div className="space-y-2">
             <Label htmlFor="add-project-select">Project</Label>
             <Select

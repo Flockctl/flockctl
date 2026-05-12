@@ -1,9 +1,7 @@
 import { Hono } from "hono";
-import { getDb } from "../db/index.js";
-import { workspaces, projects } from "../db/schema.js";
-import { eq } from "drizzle-orm";
 import { NotFoundError, ValidationError } from "../lib/errors.js";
-import { parseIdParam } from "../lib/route-params.js";
+import { parseIdParam, parseJsonBodySafe } from "../lib/route-params.js";
+import { getProjectOrThrow, getWorkspaceOrThrow } from "../lib/db-helpers.js";
 import {
   listSecrets,
   upsertSecret,
@@ -25,13 +23,34 @@ interface SecretBody {
   description?: unknown;
 }
 
+// Length caps — keep secrets to the size of real-world tokens / API keys.
+// A 64 KiB value cap is well above any legitimate secret (the longest known
+// API keys are <4 KiB) but blocks a caller from POSTing a multi-megabyte
+// payload that would be unconditionally AES-encrypted (sync, blocks the loop)
+// and stored in SQLite.
+const MAX_NAME_BYTES = 128;
+const MAX_VALUE_BYTES = 64 * 1024;
+const MAX_DESCRIPTION_BYTES = 1024;
+
 function parseBody(body: unknown): { name: string; value: string; description: string | null } {
   if (!body || typeof body !== "object") throw new ValidationError("body required");
   const b = body as SecretBody;
   if (typeof b.name !== "string" || !b.name) throw new ValidationError("name is required");
+  if (b.name.length > MAX_NAME_BYTES)
+    throw new ValidationError(`name exceeds ${MAX_NAME_BYTES} bytes`);
   if (typeof b.value !== "string") throw new ValidationError("value is required");
-  const description =
-    b.description == null ? null : typeof b.description === "string" ? b.description : null;
+  if (b.value.length > MAX_VALUE_BYTES)
+    throw new ValidationError(`value exceeds ${MAX_VALUE_BYTES} bytes`);
+  // Description is permissive: a non-string value is normalised to null
+  // (matches the pre-existing route contract — clients sometimes send
+  // `description: 42` and expect it to be silently dropped rather than a
+  // 422). String descriptions are length-capped to bound DB row size.
+  let description: string | null = null;
+  if (typeof b.description === "string") {
+    if (b.description.length > MAX_DESCRIPTION_BYTES)
+      throw new ValidationError(`description exceeds ${MAX_DESCRIPTION_BYTES} bytes`);
+    description = b.description;
+  }
   return { name: b.name, value: b.value, description };
 }
 
@@ -42,7 +61,7 @@ secretRoutes.get("/global", (c) => {
 });
 
 secretRoutes.post("/global", async (c) => {
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
   const parsed = parseBody(body);
   const record = upsertSecret({
     scope: "global",
@@ -74,7 +93,7 @@ secretRoutes.get("/workspaces/:id", (c) => {
 secretRoutes.post("/workspaces/:id", async (c) => {
   const id = parseIdParam(c);
   requireWorkspace(id);
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
   const parsed = parseBody(body);
   const record = upsertSecret({
     scope: "workspace",
@@ -108,7 +127,7 @@ secretRoutes.get("/projects/:pid", (c) => {
 secretRoutes.post("/projects/:pid", async (c) => {
   const pid = parseIdParam(c, "pid");
   requireProject(pid);
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
   const parsed = parseBody(body);
   const record = upsertSecret({
     scope: "project",
@@ -132,17 +151,22 @@ secretRoutes.delete("/projects/:pid/:name", (c) => {
 });
 
 // ─── helpers ───
+//
+// The `requireWorkspace` / `requireProject` indirections used to wrap an
+// inline `db.select(...).get()` + 404 check. They now delegate to the shared
+// `get{Workspace,Project}OrThrow` helpers in `lib/db-helpers.ts` so the 404
+// envelope is consistent with the rest of the API. The `Number.isFinite`
+// guard stays because `parseIdParam` upstream already rejects malformed
+// segments — this is belt-and-braces against direct programmatic callers.
 
 function requireWorkspace(id: number) {
   if (!Number.isFinite(id)) throw new ValidationError("invalid workspace id");
-  const ws = getDb().select().from(workspaces).where(eq(workspaces.id, id)).get();
-  if (!ws) throw new NotFoundError("Workspace");
+  getWorkspaceOrThrow(id);
 }
 
 function requireProject(id: number) {
   if (!Number.isFinite(id)) throw new ValidationError("invalid project id");
-  const p = getDb().select().from(projects).where(eq(projects.id, id)).get();
-  if (!p) throw new NotFoundError("Project");
+  getProjectOrThrow(id);
 }
 
 function queueReconcileAll() {

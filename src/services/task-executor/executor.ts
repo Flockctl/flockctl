@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { AgentSession } from "../agent-session/index.js";
 import type { AgentSessionMetrics, PermissionRequest, QuestionRequest } from "../agent-session/index.js";
 import { getDb } from "../../db/index.js";
@@ -10,7 +11,9 @@ import { reconcileClaudeSkillsForProject } from "../claude/skills-sync.js";
 import { reconcileMcpForProject } from "../claude/mcp-sync.js";
 import { formatToolCall, formatToolResult } from "../tool-format.js";
 import { TaskStatus } from "../../lib/types.js";
-import { broadcastPermissionRequest } from "../agent-interaction.js";
+import { getTaskById } from "../../lib/db-helpers.js";
+import { broadcastPermissionRequest, broadcastPermissionResolved } from "../agent-interaction.js";
+import type { PermissionMode } from "../permission-resolver.js";
 import { checkBudget } from "../budget.js";
 import { syncPlan } from "./helpers.js";
 import {
@@ -66,7 +69,9 @@ export class TaskExecutor {
 
   async execute(taskId: number): Promise<void> {
     const db = getDb();
-    const task = db.select().from(tasks).where(eq(tasks.id, taskId)).get();
+    // Route through the shared prepared-statement cache instead of
+    // rebuilding the Drizzle AST every call (audit-round-5).
+    const task = getTaskById(taskId);
     if (!task) return;
 
     let reservation: { key: KeySelection | null; enqueue: boolean };
@@ -110,7 +115,7 @@ export class TaskExecutor {
 
   private async _run(taskId: number, selectedKey: KeySelection | null): Promise<void> {
     const db = getDb();
-    const task = db.select().from(tasks).where(eq(tasks.id, taskId)).get();
+    const task = getTaskById(taskId);
     if (!task) return;
 
     // Mark as running immediately — before any async preparation
@@ -275,11 +280,24 @@ export class TaskExecutor {
 
       finalizeError({ taskId, status, errorMessage: err.message });
 
-      // Auto-retry
+      // Auto-retry. `setTimeout(fn, 0)` is fire-and-forget — without an
+      // explicit `.catch()` on the returned Promise, a rejection from
+      // `this.execute(newTaskId)` would surface as an unhandled-promise
+      // crash inside the timer callback (process.exit on `unhandledRejection`
+      // when the strict handler is installed). Log + swallow so a bad retry
+      // doesn't take down the whole daemon — the new task row is already
+      // persisted, so the operator can re-run it from the UI.
       if (status === TaskStatus.FAILED) {
         const newTaskId = scheduleRetry(taskId);
         if (newTaskId !== null) {
-          setTimeout(() => this.execute(newTaskId), 0);
+          setTimeout(() => {
+            this.execute(newTaskId).catch((retryErr) => {
+              console.error(
+                `[task-executor] auto-retry of task ${newTaskId} (parent ${taskId}) threw:`,
+                retryErr,
+              );
+            });
+          }, 0);
         }
       }
     } finally {
@@ -343,6 +361,33 @@ export class TaskExecutor {
     session.on("permission_request", (request: PermissionRequest) => {
       this.appendLog(taskId, `🔐 Permission request: ${request.title ?? request.toolName}`, "permission");
       broadcastPermissionRequest({ kind: "task", id: taskId }, request);
+    });
+    // Live permission-mode swap (variant B, parity with chat-executor): surface
+    // every change so connected UIs update their permission switcher without a
+    // round-trip GET. Fires only on a REAL transition (no-op short-circuit
+    // lives inside AgentSession.updatePermissionMode).
+    session.on(
+      "permission_mode_changed",
+      (evt: { previous: PermissionMode; current: PermissionMode }) => {
+        wsManager.broadcast(taskId, {
+          type: "task_permission_mode_changed",
+          payload: {
+            task_id: String(taskId),
+            previous: evt.previous,
+            current: evt.current,
+          },
+        });
+      },
+    );
+    // Bulk auto-resolve after a permission-mode swap: the session fulfils the
+    // pending promises internally, so the executor never sees a
+    // `taskExecutor.resolvePermission` call. Broadcast the canonical
+    // `permission_resolved` frame here instead so UI pending-cards disappear
+    // exactly the same way they do on a manual allow. `attention_changed` is
+    // already emitted once by the session at the end of the bulk loop — do
+    // NOT re-emit here (single-emit invariant).
+    session.on("permission_auto_resolved", (requestId: string) => {
+      broadcastPermissionResolved({ kind: "task", id: taskId }, requestId, "allow");
     });
     // Agent-emitted clarification question (AskUserQuestion tool). Persist a
     // row and flip the task to waiting_for_input so the UI can surface the
@@ -443,7 +488,7 @@ export class TaskExecutor {
    */
   private async resumeFromRateLimit(taskId: number): Promise<void> {
     const db = getDb();
-    const row = db.select().from(tasks).where(eq(tasks.id, taskId)).get();
+    const row = getTaskById(taskId);
     if (!row) return;
     if (row.status !== TaskStatus.RATE_LIMITED) {
       // Status changed under us (cancel race / manual DB edit / second timer)
@@ -535,6 +580,24 @@ export class TaskExecutor {
     return this.sessions.has(taskId);
   }
 
+  /**
+   * Variant-B live permission-mode switch (parity with `chatExecutor`):
+   * mutate the running session's permission mode (which also auto-resolves
+   * any pending permission entries the new mode would have allowed).
+   * Returns false when no session is active — the DB-level PATCH still
+   * applies and the new mode takes effect on the next turn regardless.
+   *
+   * The route layer calls this AFTER persisting the new value to
+   * `tasks.permissionMode` (and resolving the inherit chain via
+   * `resolvePermissionMode`), so DB and in-memory state stay consistent.
+   */
+  updatePermissionMode(taskId: number, mode: PermissionMode): boolean {
+    const session = this.sessions.get(taskId);
+    if (!session) return false;
+    session.updatePermissionMode(mode);
+    return true;
+  }
+
   /** Full pending permission requests awaiting a UI response for this task. */
   pendingPermissions(taskId: number): PermissionRequest[] {
     const session = this.sessions.get(taskId);
@@ -577,7 +640,12 @@ export class TaskExecutor {
       /* v8 ignore next — defensive: better-sqlite3 always throws an Error
        * subclass; the `String(err)` RHS is unreachable in practice. */
       console.error("Failed to insert task log:", err instanceof Error ? err.message : String(err));
-      insertId = `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      // Synthesize a stable id for the broadcast so the UI can dedupe even
+      // though no DB row was created. `crypto.randomUUID()` is unguessable and
+      // collision-free; `Math.random()` here was harmless (the id is never
+      // checked against authority) but using crypto keeps the codebase free of
+      // weak-RNG patterns that future copy-paste might mis-apply to a token.
+      insertId = `log-${Date.now()}-${randomUUID().slice(0, 8)}`;
     }
     wsManager.broadcast(taskId, {
       type: "log_line",

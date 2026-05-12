@@ -37,12 +37,53 @@
 //     in one row must not prevent the rest of the scan from finishing.
 
 import cron from "node-cron";
+import type Database from "better-sqlite3";
 import { getRawDb } from "../../db/index.js";
 import {
   taskTerminalEvents,
   STALLED_SYNTHETIC_STATUS,
 } from "../auto-executor.js";
 import { TaskStatus } from "../../lib/types.js";
+
+// Per-handle prepared-statement cache for the scan query. The query runs
+// every cron tick (every 5 minutes) and contained two correlated subqueries
+// against `task_logs` for the same `t.id` — the rewrite below collapses them
+// into a single LEFT JOIN against a pre-aggregated lastLogPerTask derived
+// table so SQLite executes the MAX(timestamp) lookup once per row rather
+// than twice. WeakMap pattern matches `supervisor.ts:69`,
+// `wakeup-service.ts`, `heartbeat.ts`.
+interface StalledDetectorStmts {
+  scan: Database.Statement;
+}
+
+const stmtCache = new WeakMap<Database.Database, StalledDetectorStmts>();
+
+function getStalledStmts(sqlite: Database.Database): StalledDetectorStmts {
+  let cached = stmtCache.get(sqlite);
+  if (cached) return cached;
+  cached = {
+    scan: sqlite.prepare(`
+      SELECT
+        t.id        AS id,
+        t.started_at AS startedAt,
+        lastLog.ts AS lastLogTs
+      FROM tasks t
+      LEFT JOIN (
+        SELECT task_id, MAX(timestamp) AS ts
+        FROM task_logs
+        GROUP BY task_id
+      ) AS lastLog ON lastLog.task_id = t.id
+      WHERE t.status = ?
+        AND t.started_at IS NOT NULL
+        AND (julianday(?) - julianday(t.started_at)) * 86400 > ?
+        AND (
+          julianday(?) - julianday(COALESCE(lastLog.ts, t.started_at))
+        ) * 86400 > ?
+    `),
+  };
+  stmtCache.set(sqlite, cached);
+  return cached;
+}
 
 /** Cron expression for the detector tick. */
 export const STALLED_DETECTOR_CRON_EXPRESSION = "*/5 * * * *";
@@ -110,38 +151,20 @@ function defaultScanStalledTasks(now: number): StalledRow[] {
   // ISO-8601 string in UTC for `now`; SQLite's datetime() compares
   // string-wise correctly for ISO-8601 zulu timestamps.
   const nowIso = new Date(now).toISOString().replace("T", " ").slice(0, 19);
-  // Subquery picks the most recent log timestamp per task (NULL if no
-  // logs ever streamed). Outer predicate enforces the wall-time floor on
+  // Pre-aggregated last-log-per-task LEFT JOIN: SQLite executes
+  // MAX(timestamp) ONCE per task in `task_logs.task_id` order, rather
+  // than the previous shape which had it as both a SELECT projection
+  // subquery AND inside a COALESCE in the outer WHERE (= twice per row).
+  // The outer predicate still enforces the wall-time floor on
   // started_at and the idle floor on COALESCE(lastLog, started_at) — a
   // task with no logs at all is "idle since started_at".
-  const rows = sqlite
-    .prepare(
-      `
-      SELECT
-        t.id        AS id,
-        t.started_at AS startedAt,
-        (SELECT MAX(timestamp) FROM task_logs l WHERE l.task_id = t.id) AS lastLogTs
-      FROM tasks t
-      WHERE t.status = ?
-        AND t.started_at IS NOT NULL
-        AND (julianday(?) - julianday(t.started_at)) * 86400 > ?
-        AND (
-          julianday(?) - julianday(
-            COALESCE(
-              (SELECT MAX(timestamp) FROM task_logs l WHERE l.task_id = t.id),
-              t.started_at
-            )
-          )
-        ) * 86400 > ?
-      `,
-    )
-    .all(
-      TaskStatus.RUNNING,
-      nowIso,
-      wallSec,
-      nowIso,
-      idleSec,
-    ) as StalledRow[];
+  const rows = getStalledStmts(sqlite).scan.all(
+    TaskStatus.RUNNING,
+    nowIso,
+    wallSec,
+    nowIso,
+    idleSec,
+  ) as StalledRow[];
   return rows;
 }
 
@@ -160,8 +183,28 @@ let activeHandle: { stop: () => void } | null = null;
  * stays running + idle across multiple ticks would attract a fresh event
  * every 5 minutes, flooding the missions timeline. The set is reset on
  * `stopStalledDetector()` so a daemon-restart re-arms detection.
+ *
+ * ─── Bounded growth (audit-round-3 finding) ───
+ *
+ * A daemon kept alive for weeks across many task IDs accumulates entries
+ * indefinitely. Cap at MAX_FIRED_ENTRIES with insertion-order eviction
+ * (Set iteration preserves insertion order per spec). The trade-off is
+ * that very old task IDs may fire a second `stalled` event if their row
+ * stays running for so long that the entry has been evicted — vanishingly
+ * unlikely (tasks that old have either been terminal-resolved by other
+ * paths or cancelled by the operator), and the cost of a duplicate event
+ * is far smaller than unbounded memory growth.
  */
+const MAX_FIRED_TASK_IDS = 4096;
 const firedTaskIds = new Set<number>();
+
+function recordFiredTaskId(taskId: number): void {
+  if (firedTaskIds.size >= MAX_FIRED_TASK_IDS) {
+    const oldest = firedTaskIds.values().next().value;
+    if (oldest !== undefined) firedTaskIds.delete(oldest);
+  }
+  firedTaskIds.add(taskId);
+}
 
 // ─── Public API ───
 
@@ -207,7 +250,7 @@ export function startStalledDetector(
       // task (real terminal arrives, missions subscriber routes it) or
       // restarts it (fresh `started_at` → no longer matches the scan).
       if (firedTaskIds.has(row.id)) continue;
-      firedTaskIds.add(row.id);
+      recordFiredTaskId(row.id);
       try {
         emit(row.id);
       } catch (err) {

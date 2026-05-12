@@ -7,6 +7,66 @@ import type {
 } from "@anthropic-ai/sdk/resources";
 import { MAX_INLINE_TEXT_BYTES, type AttachmentRow } from "./attachments-types.js";
 
+// ─── Base64 cache for immutable attachments ─────────────────────────────
+//
+// Every chat turn re-reads + base64-encodes every attachment from disk.
+// Attachments are content-addressed (UUID-named in the FS) and immutable —
+// the same path always yields the same bytes — so caching by path is safe.
+//
+// Without this cache, a user resending a chat turn with the same 5 MB image
+// pays O(n) read + O(n) base64-encode on every send. With cache, only the
+// first send pays the cost; subsequent reuses are O(1).
+//
+// Bounded by total cached bytes (not entry count). Eviction is LRU: when
+// adding would push past the cap, drop oldest entries first. Map iteration
+// order is insertion order in JS, so a delete-then-set "refreshes" an
+// entry's LRU position.
+const BASE64_CACHE_MAX_TOTAL_BYTES = 64 * 1024 * 1024; // 64 MiB
+const base64Cache = new Map<string, string>();
+let base64CacheBytes = 0;
+
+function readBase64Cached(path: string): string | null {
+  const cached = base64Cache.get(path);
+  if (cached !== undefined) {
+    // Refresh LRU position.
+    base64Cache.delete(path);
+    base64Cache.set(path, cached);
+    return cached;
+  }
+  let bytes: Buffer;
+  try {
+    bytes = readFileSync(path);
+  } catch (err) {
+    console.warn(`[attachments] failed to read ${path}:`, err);
+    return null;
+  }
+  const encoded = bytes.toString("base64");
+  // Evict oldest until adding `encoded` fits within the cap.
+  while (
+    base64CacheBytes + encoded.length > BASE64_CACHE_MAX_TOTAL_BYTES &&
+    base64Cache.size > 0
+  ) {
+    const oldestKey = base64Cache.keys().next().value;
+    if (oldestKey === undefined) break;
+    const oldestValue = base64Cache.get(oldestKey)!;
+    base64CacheBytes -= oldestValue.length;
+    base64Cache.delete(oldestKey);
+  }
+  // Special-case: if this single attachment is larger than the cap, don't
+  // cache it (would evict everything else, then itself on the next miss).
+  if (encoded.length <= BASE64_CACHE_MAX_TOTAL_BYTES) {
+    base64Cache.set(path, encoded);
+    base64CacheBytes += encoded.length;
+  }
+  return encoded;
+}
+
+/** @internal — test seam. */
+export function __resetBase64Cache(): void {
+  base64Cache.clear();
+  base64CacheBytes = 0;
+}
+
 /**
  * MIME types supported by Anthropic's image content block. GIFs are sent as
  * whole files — we don't extract the first frame. Anthropic accepts GIF
@@ -37,19 +97,14 @@ export function attachmentToImageBlock(
   if (!ANTHROPIC_IMAGE_MIME_TYPES.has(mime)) {
     return null;
   }
-  let bytes: Buffer;
-  try {
-    bytes = readFileSync(row.path);
-  } catch (err) {
-    console.warn(`[attachments] failed to read ${row.path}:`, err);
-    return null;
-  }
+  const data = readBase64Cached(row.path);
+  if (data === null) return null;
   return {
     type: "image",
     source: {
       type: "base64",
       media_type: mime,
-      data: bytes.toString("base64"),
+      data,
     },
   };
 }
@@ -64,19 +119,14 @@ export function attachmentToPdfDocumentBlock(
   row: Pick<AttachmentRow, "path" | "mimeType" | "filename">,
 ): DocumentBlockParam | null {
   if (row.mimeType !== "application/pdf") return null;
-  let bytes: Buffer;
-  try {
-    bytes = readFileSync(row.path);
-  } catch (err) {
-    console.warn(`[attachments] failed to read ${row.path}:`, err);
-    return null;
-  }
+  const data = readBase64Cached(row.path);
+  if (data === null) return null;
   return {
     type: "document",
     source: {
       type: "base64",
       media_type: "application/pdf",
-      data: bytes.toString("base64"),
+      data,
     },
     title: row.filename,
   };

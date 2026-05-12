@@ -229,6 +229,7 @@ export function McpTab({
                           size="icon"
                           className="h-7 w-7"
                           title="Edit"
+                          aria-label={`Edit MCP server ${server.name}`}
                           onClick={(e) => {
                             e.stopPropagation();
                             handleEdit(server);
@@ -241,6 +242,7 @@ export function McpTab({
                           size="icon"
                           className="h-7 w-7"
                           title="Delete"
+                          aria-label={`Delete MCP server ${server.name}`}
                           onClick={(e) => {
                             e.stopPropagation();
                             handleDelete(server);

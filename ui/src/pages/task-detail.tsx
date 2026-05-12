@@ -1,10 +1,13 @@
 import { useParams, Link } from "react-router-dom";
 import { useEffect, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import { useTrackRecent } from "@/lib/recent-store";
 import {
   useTask,
   useTaskLogStream,
   useCancelTask,
   useRerunTask,
+  useRemoveTaskWorktree,
   useApproveTask,
   useRejectTask,
   useUsageSummary,
@@ -16,7 +19,7 @@ import {
   useAnswerAgentQuestion,
 } from "@/lib/hooks";
 import { fetchTaskDiff, respondToPermission } from "@/lib/api";
-import { formatTimestamp, formatLogTime } from "@/lib/format";
+import { formatTimestamp, formatLogTime, formatCostFine } from "@/lib/format";
 import { AgentQuestionPrompt } from "@/components/AgentQuestionPrompt";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -32,7 +35,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { PermissionModeSelect } from "@/components/permission-mode-select";
 import { TaskStatusBadge } from "@/components/task-status-badge";
-import { InlineDiff } from "@/components/InlineDiff";
+import { TaskDiffMonacoView } from "@/components/TaskDiffMonacoView";
 import { ConnectionState } from "@/lib/ws";
 import type { TaskStatus, PermissionMode } from "@/lib/types";
 import { ArrowLeft, ChevronDown } from "lucide-react";
@@ -44,7 +47,6 @@ function statusVariant(
     case "running":
       return "default";
     case "queued":
-    case "assigned":
       return "secondary";
     case "failed":
     case "timed_out":
@@ -84,13 +86,20 @@ function logLineClass(streamType: string): string {
   }
 }
 
+// Terminal task statuses — hoisted out of the render body so a fresh
+// array isn't allocated on every render (audit-round-5). `Set.has` is
+// O(1) vs `Array.includes` O(N); the set has 4 entries so the
+// difference is microbenchmark territory, but the stable reference
+// also means React Query's refetchInterval callback closes over the
+// same value every tick.
+const TERMINAL_STATUSES = new Set(["done", "failed", "cancelled", "timed_out"]);
+
 export default function TaskDetailPage() {
   const { taskId } = useParams<{ taskId: string }>();
-  const TERMINAL_STATUSES = ["done", "failed", "cancelled", "timed_out"];
   const { data: task, isLoading: taskLoading, error: taskError } = useTask(taskId ?? "", {
     refetchInterval: (query) => {
       const t = query.state.data;
-      if (t && TERMINAL_STATUSES.includes(t.status)) return false;
+      if (t && TERMINAL_STATUSES.has(t.status)) return false;
       return 5_000;
     },
   });
@@ -99,12 +108,29 @@ export default function TaskDetailPage() {
   const answerAgentQuestionMutation = useAnswerAgentQuestion();
   const cancelTaskMutation = useCancelTask();
   const rerunTaskMutation = useRerunTask();
+  const removeWorktreeMutation = useRemoveTaskWorktree();
   const approveTaskMutation = useApproveTask();
   const rejectTaskMutation = useRejectTask();
   const updateTaskMutation = useUpdateTask();
   const updateProjectMutation = useUpdateProject();
   const updateWorkspaceMutation = useUpdateWorkspace();
   const { data: project } = useProject(task?.project_id ?? "");
+
+  // Populate the new-shell sidebar Recent list (slice 02 / M17).
+  // Use the first prompt line truncated as a label — same convention
+  // as the breadcrumb handle in `lib/route-handles.ts`.
+  const taskRecentLabel =
+    typeof task?.prompt === "string" && task.prompt.length > 0
+      ? (task.prompt.split(/\r?\n/)[0] ?? "").slice(0, 60)
+      : taskId
+      ? `Task ${taskId.slice(0, 7)}`
+      : null;
+  useTrackRecent({
+    kind: "task",
+    id: taskId,
+    label: taskRecentLabel,
+    href: `/tasks/${taskId ?? ""}`,
+  });
   const [diffData, setDiffData] = useState<{ diff: string; summary: string | null; truncated: boolean } | null>(null);
   const [showDiff, setShowDiff] = useState(false);
   const [diffLoading, setDiffLoading] = useState(false);
@@ -169,9 +195,23 @@ export default function TaskDetailPage() {
     return "Default";
   })();
 
-  // Auto-scroll: scroll to bottom on new logs unless user has scrolled up
+  // Auto-scroll: scroll to bottom on new logs unless user has scrolled up.
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const userScrolledUp = useRef(false);
+
+  // Virtualised log list — `task-stream.ts` admits up to SEEN_IDS_MAX
+  // (~10k) log lines per session. Rendering every row as DOM was the
+  // dominant source of jank on long-running tasks (audit finding).
+  // useVirtualizer renders only the rows currently in view (+ overscan),
+  // so the DOM stays small regardless of `logs.length`.
+  const logVirtualizer = useVirtualizer({
+    count: logs.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => 22, // px per row; lines may wrap which the
+                            // virtualizer measures via `measureElement`
+                            // when we render the row with `ref`.
+    overscan: 30,
+  });
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -185,10 +225,12 @@ export default function TaskDetailPage() {
   }, []);
 
   useEffect(() => {
-    if (!userScrolledUp.current && scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [logs.length]);
+    if (userScrolledUp.current || logs.length === 0) return;
+    // Use the virtualizer's scroll helper so it knows about the new
+    // virtual-row offset; manual scrollTop = scrollHeight breaks once
+    // rows are absolutely positioned inside a phantom-height container.
+    logVirtualizer.scrollToIndex(logs.length - 1, { align: "end" });
+  }, [logs.length, logVirtualizer]);
 
   if (!taskId) {
     return <p className="text-destructive">Missing task ID.</p>;
@@ -231,7 +273,7 @@ export default function TaskDetailPage() {
               <span className="font-mono text-sm">{String(task.id).slice(0, 8)}</span>
               <Badge variant={statusVariant(task.status)}>{task.status}</Badge>
               <div className="ml-auto flex gap-2">
-                {(task.status === "queued" || task.status === "assigned" || task.status === "running") && (
+                {(task.status === "queued" || task.status === "running") && (
                   <Button
                     variant="destructive"
                     size="sm"
@@ -249,6 +291,43 @@ export default function TaskDetailPage() {
                     onClick={() => rerunTaskMutation.mutate(task.id)}
                   >
                     {rerunTaskMutation.isPending ? "Re-running..." : "Re-run"}
+                  </Button>
+                )}
+                {/* Worktree teardown — surfaced only when the task
+                    actually owns one (left behind on a dirty exit
+                    or still pending operator review). 409-on-dirty
+                    handshake is inlined to avoid a one-shot helper
+                    component for two button presses. */}
+                {task.worktree_path && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={removeWorktreeMutation.isPending}
+                    title={`Worktree: ${task.worktree_branch ?? "?"}\n${task.worktree_path}`}
+                    onClick={async () => {
+                      try {
+                        await removeWorktreeMutation.mutateAsync({ taskId: task.id });
+                      } catch (err: unknown) {
+                        const status =
+                          err && typeof err === "object" && "status" in err
+                            ? Number((err as { status?: number }).status)
+                            : 0;
+                        const reason =
+                          err && typeof err === "object" && "details" in err
+                            ? ((err as { details?: { reason?: string } }).details?.reason ?? "")
+                            : "";
+                        if (status === 409 && reason === "dirty") {
+                          // eslint-disable-next-line no-alert
+                          const ok = window.confirm(
+                            "This task's worktree has uncommitted changes. Discard them and remove the worktree?",
+                          );
+                          if (!ok) return;
+                          await removeWorktreeMutation.mutateAsync({ taskId: task.id, force: true });
+                        }
+                      }
+                    }}
+                  >
+                    {removeWorktreeMutation.isPending ? "Removing…" : "Remove worktree"}
                   </Button>
                 )}
               </div>
@@ -518,13 +597,16 @@ export default function TaskDetailPage() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <InlineDiff diff={diffData.diff} truncated={diffData.truncated} />
+            <TaskDiffMonacoView
+              diff={diffData.diff}
+              truncated={diffData.truncated}
+            />
           </CardContent>
         </Card>
       )}
 
       {/* Metrics card — live during execution, from DB after completion */}
-      {(task?.status === "running" || task?.status === "assigned" || metrics || (usage && usage.record_count > 0)) && (
+      {(task?.status === "running" || metrics || (usage && usage.record_count > 0)) && (
         <Card>
           <CardHeader><CardTitle className="text-base">Metrics</CardTitle></CardHeader>
           <CardContent>
@@ -544,7 +626,12 @@ export default function TaskDetailPage() {
               <div>
                 <span className="text-muted-foreground">Total cost</span>
                 <p className="font-mono">
-                  ${(metrics?.total_cost_usd ?? task?.liveMetrics?.total_cost_usd ?? usage?.total_cost_usd ?? 0).toFixed(4)}
+                  {formatCostFine(
+                    metrics?.total_cost_usd ??
+                      task?.liveMetrics?.total_cost_usd ??
+                      usage?.total_cost_usd ??
+                      0,
+                  )}
                 </p>
               </div>
               <div>
@@ -649,19 +736,47 @@ export default function TaskDetailPage() {
               ref={scrollRef}
               className="min-h-0 flex-1 overflow-auto rounded border bg-muted/30 p-3 font-mono text-sm"
             >
-              {logs.map((log) => (
-                <div
-                  key={log.id}
-                  className={`flex gap-2 py-0.5 leading-relaxed ${logLineClass(log.stream_type)}`}
-                >
-                  <span className="shrink-0 text-xs text-muted-foreground">
-                    {formatLogTime(log.timestamp)}
-                  </span>
-                  <span className="whitespace-pre-wrap break-all">
-                    {log.content}
-                  </span>
-                </div>
-              ))}
+              {/*
+                Phantom container with the total virtual height so the
+                scrollbar reflects the full log volume. Rows are
+                absolutely-positioned children whose `translateY` is
+                computed by the virtualizer; only ~30 are in the DOM
+                at any moment regardless of `logs.length`.
+              */}
+              <div
+                style={{
+                  height: logVirtualizer.getTotalSize(),
+                  width: "100%",
+                  position: "relative",
+                }}
+              >
+                {logVirtualizer.getVirtualItems().map((vItem) => {
+                  const log = logs[vItem.index];
+                  if (!log) return null;
+                  return (
+                    <div
+                      key={log.id}
+                      data-index={vItem.index}
+                      ref={logVirtualizer.measureElement}
+                      style={{
+                        position: "absolute",
+                        top: 0,
+                        left: 0,
+                        width: "100%",
+                        transform: `translateY(${vItem.start}px)`,
+                      }}
+                      className={`flex gap-2 py-0.5 leading-relaxed ${logLineClass(log.stream_type)}`}
+                    >
+                      <span className="shrink-0 text-xs text-muted-foreground">
+                        {formatLogTime(log.timestamp)}
+                      </span>
+                      <span className="whitespace-pre-wrap break-all">
+                        {log.content}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           )}
         </CardContent>

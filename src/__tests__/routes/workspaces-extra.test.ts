@@ -7,26 +7,58 @@ import { mkdtempSync, rmSync, mkdirSync, existsSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 
-// Mock child_process — `git clone` went to execFileSync (no shell) as part
-// of a security fix. Tests still key off "git clone" strings for
-// readability, so execFileSync forwards to the execSync mock implementation.
+// Routes now invoke `execa` for git operations (async). The execa mock
+// forwards to the legacy `execSync` mock impl so test stubs (return
+// Buffer / throw with .stderr) drive the same code paths; return
+// values are reshaped into execa's `{ stdout, stderr }` envelope.
 vi.mock("child_process", async () => {
   const actual = await vi.importActual<any>("child_process");
   return {
     ...actual,
     execSync: vi.fn(actual.execSync),
-    execFileSync: vi.fn((file: string, args: readonly string[], opts: unknown) => {
+  };
+});
+
+vi.mock("execa", async () => {
+  return {
+    execa: vi.fn(async (file: string, args: readonly string[]) => {
+      const fake = (execSync as unknown as { getMockImplementation?: () => (cmd: string) => unknown })
+        .getMockImplementation?.();
       const rebuiltCmd = `${file} ${args.join(" ")}`;
-      const mocked = (execSync as unknown as { getMockImplementation?: () => ((cmd: string) => unknown) | undefined });
-      const impl = mocked.getMockImplementation?.();
-      if (impl) return impl(rebuiltCmd);
-      return actual.execFileSync(file, args, opts);
+      if (!fake) return { stdout: "", stderr: "", exitCode: 0 };
+      try {
+        const result = fake(rebuiltCmd);
+        const stdout =
+          typeof result === "string"
+            ? result
+            : result && typeof (result as Buffer).toString === "function"
+              ? (result as Buffer).toString()
+              : "";
+        return { stdout, stderr: "", exitCode: 0 };
+      } catch (err) {
+        // Preserve the raw thrown shape — see projects-branches.test.ts
+        // for rationale.
+        const e = err as { stderr?: Buffer | string; message?: string };
+        const stderrText =
+          typeof e.stderr === "string"
+            ? e.stderr
+            : e.stderr
+              ? e.stderr.toString()
+              : undefined;
+        const wrapped: { stderr?: string; message?: string; exitCode: number } = {
+          exitCode: 1,
+        };
+        if (stderrText !== undefined) wrapped.stderr = stderrText;
+        if (typeof e.message === "string") wrapped.message = e.message;
+        throw wrapped;
+      }
     }),
   };
 });
 
 import { app } from "../../server.js";
-import { execSync, execFileSync } from "child_process";
+import { execSync } from "child_process";
+import { execa } from "execa";
 
 let db: FlockctlDb;
 let sqlite: Database.Database;
@@ -78,11 +110,10 @@ describe("Workspaces — git clone path", () => {
     });
 
     expect(res.status).toBe(201);
-    // `git clone` now routes through execFileSync (no shell) — check the
-    // file-exec spy instead of execSync. Other git commands (init,
-    // remote get-url) still use execSync.
-    const execFileCalls = (execFileSync as unknown as { mock: { calls: unknown[][] } }).mock.calls;
-    const cloneCall = execFileCalls.find((c) => c[0] === "git" && Array.isArray(c[1]) && (c[1] as string[]).includes("clone"));
+    // `git clone` now routes through `execa` (async, no shell). Inspect
+    // the execa spy instead of the legacy `execFileSync` one.
+    const execaCalls = (execa as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+    const cloneCall = execaCalls.find((c) => c[0] === "git" && Array.isArray(c[1]) && (c[1] as string[]).includes("clone"));
     expect(cloneCall).toBeTruthy();
   });
 

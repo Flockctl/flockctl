@@ -958,6 +958,148 @@ describe("Chats API", () => {
     });
   });
 
+  // ─── Batch delete ───────────────────────────────────────────────────────
+
+  describe("POST /chats/batch-delete", () => {
+    // Helper: insert N fresh chats and return their ids in insertion order.
+    // Uses the shared test DB so the inserted rows persist across this suite.
+    function seedChats(count: number, titlePrefix = "batch-del"): number[] {
+      const ids: number[] = [];
+      for (let i = 0; i < count; i++) {
+        const row = testDb.db
+          .insert(chatsTable)
+          .values({ title: `${titlePrefix}-${i}` })
+          .returning()
+          .get();
+        ids.push(row!.id);
+      }
+      return ids;
+    }
+
+    async function postBatch(body: unknown): Promise<Response> {
+      return app.request("/chats/batch-delete", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    }
+
+    it("deletes every requested chat and reports counts", async () => {
+      const ids = seedChats(3);
+      const res = await postBatch({ ids });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toEqual({
+        deleted: 3,
+        missing: [],
+        requested: 3,
+      });
+      // Confirm each id is gone via GET — should 404.
+      for (const id of ids) {
+        const getRes = await app.request(`/chats/${id}`);
+        expect(getRes.status).toBe(404);
+      }
+    });
+
+    it("partial success: missing ids are echoed back, present ids deleted", async () => {
+      const [a, b] = seedChats(2);
+      const ghostId = 9_999_999;
+      const res = await postBatch({ ids: [a, ghostId, b] });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.deleted).toBe(2);
+      expect(body.requested).toBe(3);
+      expect(body.missing).toEqual([ghostId]);
+      expect(
+        (await app.request(`/chats/${a}`)).status,
+      ).toBe(404);
+      expect(
+        (await app.request(`/chats/${b}`)).status,
+      ).toBe(404);
+    });
+
+    it("de-duplicates ids before counting (single mention per chat)", async () => {
+      const [id] = seedChats(1);
+      const res = await postBatch({ ids: [id, id, id] });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.deleted).toBe(1);
+      // `requested` reflects the de-duped set so the caller can reconcile
+      // its own UI without subtracting duplicates after the fact.
+      expect(body.requested).toBe(1);
+      expect(body.missing).toEqual([]);
+    });
+
+    it("returns 0 deleted when every id is already missing", async () => {
+      const res = await postBatch({ ids: [9_999_001, 9_999_002] });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toEqual({
+        deleted: 0,
+        missing: [9_999_001, 9_999_002],
+        requested: 2,
+      });
+    });
+
+    it("422 when body is missing or malformed", async () => {
+      // Missing `ids` field entirely.
+      expect((await postBatch({})).status).toBe(422);
+      // `ids` not an array.
+      expect((await postBatch({ ids: "all" })).status).toBe(422);
+      // Empty array — caller mistake, surface as 422 instead of silently OK.
+      expect((await postBatch({ ids: [] })).status).toBe(422);
+      // Non-integer entry.
+      expect((await postBatch({ ids: [1, "two"] })).status).toBe(422);
+      // Zero / negative ids.
+      expect((await postBatch({ ids: [0] })).status).toBe(422);
+      expect((await postBatch({ ids: [-5] })).status).toBe(422);
+      // Floats.
+      expect((await postBatch({ ids: [1.5] })).status).toBe(422);
+    });
+
+    it("422 when more than 200 ids are submitted", async () => {
+      const ids = Array.from({ length: 201 }, (_, i) => i + 1);
+      const res = await postBatch({ ids });
+      expect(res.status).toBe(422);
+    });
+
+    it("cascades chat_messages on batch delete", async () => {
+      const ids = seedChats(2, "cascade");
+      // Insert directly via Drizzle — driving real message inserts through
+      // the /messages endpoint would require an LLM round-trip, but the FK
+      // cascade behaviour is what we care about, not the executor path.
+      const { chatMessages } = await import("../../db/schema.js");
+      const { inArray } = await import("drizzle-orm");
+      for (const chatId of ids) {
+        testDb.db
+          .insert(chatMessages)
+          .values({ chatId, role: "assistant", content: "hi" })
+          .run();
+      }
+      const before = testDb.db
+        .select({ id: chatMessages.id })
+        .from(chatMessages)
+        .where(inArray(chatMessages.chatId, ids))
+        .all();
+      expect(before).toHaveLength(2);
+
+      const res = await postBatch({ ids });
+      expect(res.status).toBe(200);
+
+      // After the batch delete, no chat_messages row should reference any
+      // of the doomed chats — cascade fired for every id, not just the
+      // first. Catches a regression where the route handler accidentally
+      // reverts to looping `db.delete(chats).where(eq(chats.id, ...))`
+      // and skips later ids on an unexpected throw.
+      const remaining = testDb.db
+        .select({ id: chatMessages.id })
+        .from(chatMessages)
+        .where(inArray(chatMessages.chatId, ids))
+        .all();
+      expect(remaining).toHaveLength(0);
+    });
+  });
+
   // ─── Question /answer endpoints ─────────────────────────────────────────
   describe("POST /chats/:id/question/:requestId/answer", () => {
     function insertChat(title = "question-chat"): number {

@@ -6,6 +6,8 @@ export {
   parseOrder,
   parseMd,
   writeMd,
+  writeMdAsync,
+  readMdAsync,
 } from "./md-io.js";
 
 export {

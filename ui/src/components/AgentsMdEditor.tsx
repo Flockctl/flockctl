@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import type { OnMount } from "@monaco-editor/react";
 import {
   Card,
   CardContent,
@@ -8,27 +10,36 @@ import {
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
+import { CodeEditor } from "@/components/CodeEditor";
+
+// Hoisted style literal (audit-round-7): `style={{ height: 320 }}`
+// inside the JSX re-allocates the object on every parent render and
+// breaks downstream memoization of `<CodeEditor>`. Module scope makes
+// it a stable reference for the lifetime of the module.
+const EDITOR_SURFACE_STYLE = { height: 320 } as const;
 import {
-  useProjectAgentsMd,
   useProjectEffective,
   usePutProjectAgentsMd,
-  useWorkspaceAgentsMd,
   useWorkspaceEffective,
   usePutWorkspaceAgentsMd,
 } from "@/lib/hooks";
+import {
+  projectFileQueryKey,
+  useProjectFile,
+  useWorkspaceFile,
+  workspaceFileQueryKey,
+} from "@/lib/hooks/fs";
+import {
+  fetchProjectFile,
+  fetchWorkspaceFile,
+  type FsReadResponse,
+} from "@/lib/api/fs";
 import type {
   Effective,
-  LayerState,
   ProjectLayer,
   WorkspaceLayer,
 } from "@/lib/types/agents-md";
 import { Save, ChevronDown, ChevronRight, Plus } from "lucide-react";
-import { EditorView, keymap, ViewUpdate } from "@codemirror/view";
-import { EditorState } from "@codemirror/state";
-import { markdown } from "@codemirror/lang-markdown";
-import { languages } from "@codemirror/language-data";
-import { oneDark } from "@codemirror/theme-one-dark";
-import { basicSetup } from "codemirror";
 
 // --- AgentsMdEditor ---
 //
@@ -41,6 +52,11 @@ import { basicSetup } from "codemirror";
 // Save is always explicit (no autosave). The byte counter turns yellow at
 // 200 KiB and red at 256 KiB; the Save button is hard-disabled above the
 // 256 KiB boundary to match the server-side limit (PUT returns 413).
+//
+// Read path uses the entity's `/fs/file?path=AGENTS.md` endpoint via
+// `useProjectFile` / `useWorkspaceFile` — the editor renders Monaco with
+// the file's live UTF-8 contents. Save still flows through the legacy
+// `usePut*AgentsMd` mutations (slice 01 owns the unified write path).
 
 // --- Byte-limit constants (match backend) ---
 
@@ -60,6 +76,8 @@ const EMPTY_HINT: Record<Scope, string> = {
   project: "committed to the repo for this project",
   workspace: "shared across every project in the workspace",
 };
+
+const AGENTS_MD_PATH = "AGENTS.md";
 
 // --- Helpers ---
 
@@ -86,91 +104,75 @@ export function extractStatus(err: unknown): number | null {
   return null;
 }
 
-// --- CodeMirror editor surface ---
+// --- Read-state derivation -------------------------------------------------
+//
+// `useProjectFile` / `useWorkspaceFile` resolve to a discriminated envelope
+// (`{ ok: true | false }`). Collapse that into a single load-state the rest
+// of the component renders against. `creating new` is the legitimate "no
+// file on disk yet" branch — the daemon answers HTTP 200 with
+// `{ ok: false, error_code: "fs_not_found" }`, NOT a thrown 404.
 
-function LayerEditor({
-  value,
-  onChange,
-  onSave,
-  readOnly,
-}: {
-  value: string;
-  onChange: (next: string) => void;
-  onSave: () => void;
-  readOnly?: boolean;
-}) {
-  const hostRef = useRef<HTMLDivElement | null>(null);
-  const viewRef = useRef<EditorView | null>(null);
-  const onChangeRef = useRef(onChange);
-  onChangeRef.current = onChange;
-  const onSaveRef = useRef(onSave);
-  onSaveRef.current = onSave;
+type LoadStatus = "loading" | "loaded" | "creating new" | "error" | "forbidden";
 
-  const isDark = useMemo(() => {
-    if (typeof window === "undefined") return false;
-    return (
-      document.documentElement.classList.contains("dark") ||
-      window.matchMedia?.("(prefers-color-scheme: dark)").matches
-    );
-  }, []);
-
-  useEffect(() => {
-    if (!hostRef.current) return;
-
-    const exts = [
-      basicSetup,
-      markdown({ codeLanguages: languages }),
-      EditorView.lineWrapping,
-      EditorView.updateListener.of((u: ViewUpdate) => {
-        if (u.docChanged) {
-          onChangeRef.current(u.state.doc.toString());
-        }
-      }),
-      keymap.of([
-        {
-          key: "Mod-s",
-          run: () => {
-            onSaveRef.current();
-            return true;
-          },
-        },
-      ]),
-      EditorView.editable.of(!readOnly),
-      EditorState.readOnly.of(!!readOnly),
-      EditorView.theme({
-        "&": { height: "280px", fontSize: "13px" },
-        ".cm-scroller": {
-          overflow: "auto",
-          fontFamily:
-            "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace",
-        },
-        ".cm-content": { padding: "12px 0" },
-        ".cm-gutters": {
-          borderRight: "1px solid var(--border, #e5e7eb)",
-          backgroundColor: "transparent",
-        },
-      }),
-    ];
-    if (isDark) exts.push(oneDark);
-
-    const state = EditorState.create({ doc: value, extensions: exts });
-    const view = new EditorView({ state, parent: hostRef.current });
-    viewRef.current = view;
-    return () => {
-      view.destroy();
-      viewRef.current = null;
-    };
-     
-  }, [value, isDark, readOnly]);
-
-  return (
-    <div
-      ref={hostRef}
-      data-testid="agents-md-editor-surface"
-      className="rounded border bg-background"
-    />
-  );
+interface ReadState {
+  status: LoadStatus;
+  /** Server-side content when present; empty string otherwise. */
+  source: string;
+  /** True iff the file exists on disk. */
+  present: boolean;
+  /** Best-effort message for the "error" branch only. */
+  errorMessage?: string;
 }
+
+function deriveReadState(
+  isLoading: boolean,
+  data: FsReadResponse | undefined,
+  error: unknown,
+): ReadState {
+  if (error) {
+    if (extractStatus(error) === 403) {
+      return { status: "forbidden", source: "", present: false };
+    }
+    return {
+      status: "error",
+      source: "",
+      present: false,
+      errorMessage:
+        error instanceof Error ? error.message : "Failed to load AGENTS.md",
+    };
+  }
+  if (isLoading || !data) {
+    return { status: "loading", source: "", present: false };
+  }
+  if (data.ok === true) {
+    return { status: "loaded", source: data.content, present: true };
+  }
+  // ok === false: distinguish "not present yet" from genuine errors.
+  if (
+    data.error_code === "fs_not_found" ||
+    data.error_code === "fs_no_project_path" ||
+    data.error_code === "fs_missing_path"
+  ) {
+    return { status: "creating new", source: "", present: false };
+  }
+  if (data.error_code === "fs_permission_denied") {
+    return { status: "forbidden", source: "", present: false };
+  }
+  return {
+    status: "error",
+    source: "",
+    present: false,
+    errorMessage: data.message ?? data.error_code,
+  };
+}
+
+const STATUS_LABEL: Record<LoadStatus, string> = {
+  loading: "loading",
+  loaded: "loaded",
+  "creating new": "creating new",
+  error: "error",
+  forbidden: "forbidden",
+};
 
 // --- Effective preview accordion ---
 
@@ -282,19 +284,29 @@ export function AgentsMdEditor({
     : "Agent documentation",
   description,
 }: AgentsMdEditorProps) {
-  const projectQuery = useProjectAgentsMd(scope === "project" ? id : "");
-  const workspaceQuery = useWorkspaceAgentsMd(scope === "workspace" ? id : "");
+  // --- Read path: GET /:scope/:id/fs/file?path=AGENTS.md -------------------
+  //
+  // The two hooks are gated on `scope`: only one ever has `enabled: true`
+  // for a given mount, so we don't double-fetch.
+  const projectFile = useProjectFile(
+    scope === "project" ? id : "",
+    scope === "project" ? AGENTS_MD_PATH : null,
+  );
+  const workspaceFile = useWorkspaceFile(
+    scope === "workspace" ? id : "",
+    scope === "workspace" ? AGENTS_MD_PATH : null,
+  );
+  const fileQuery = scope === "project" ? projectFile : workspaceFile;
+
   const projectEffective = useProjectEffective(scope === "project" ? id : "");
   const workspaceEffective = useWorkspaceEffective(scope === "workspace" ? id : "");
+  const effective = scope === "project" ? projectEffective : workspaceEffective;
+
+  // --- Save path: unchanged from the previous slice. ------------------------
   const putProject = usePutProjectAgentsMd();
   const putWorkspace = usePutWorkspaceAgentsMd();
 
-  const query = scope === "project" ? projectQuery : workspaceQuery;
-  const effective = scope === "project" ? projectEffective : workspaceEffective;
-
   const layerKey = LAYER_FOR_SCOPE[scope];
-  const layersMap = (query.data?.layers ?? {}) as Record<string, LayerState>;
-  const layerState = layersMap[layerKey];
 
   // --- Toasts ---
   const [toasts, setToasts] = useState<ToastState[]>([]);
@@ -342,28 +354,46 @@ export function AgentsMdEditor({
     [pushToast],
   );
 
-  // --- 403 short-circuit: the user can't edit. Render a message in place
-  //     of the editor instead of silently leaving it empty. ---
-  const loadStatus = extractStatus(query.error);
-  const forbidden = loadStatus === 403;
+  // --- Resolve load state. -------------------------------------------------
+  const readState = deriveReadState(
+    fileQuery.isLoading,
+    fileQuery.data,
+    fileQuery.error,
+  );
+  const { status: loadStatus, source, present, errorMessage } = readState;
+  const forbidden = loadStatus === "forbidden";
 
   // --- Draft state (must live outside conditional early returns) ---
-  const present = !!layerState?.present;
-  const source = layerState?.content ?? "";
   const [draft, setDraft] = useState(source);
   const [materialized, setMaterialized] = useState(present);
+
+  // Held sha — the sha we believe the on-disk file has. Initialized from
+  // the loaded fs/file response and advanced after every successful save.
+  // When the held sha disagrees with the latest sha at save time, another
+  // writer beat us; we surface a conflict banner instead of overwriting.
+  const initialSha = fileQuery.data && fileQuery.data.ok ? fileQuery.data.sha : "";
+  const [heldSha, setHeldSha] = useState<string>(initialSha);
 
   const resetKey = `${scope}:${id}`;
   const lastResetKey = useRef<string>(resetKey);
   const lastSource = useRef<string>(source);
+  const lastSha = useRef<string>(initialSha);
   useEffect(() => {
-    if (lastResetKey.current !== resetKey || lastSource.current !== source) {
+    const incomingSha =
+      fileQuery.data && fileQuery.data.ok ? fileQuery.data.sha : "";
+    if (
+      lastResetKey.current !== resetKey ||
+      lastSource.current !== source ||
+      lastSha.current !== incomingSha
+    ) {
       lastResetKey.current = resetKey;
       lastSource.current = source;
+      lastSha.current = incomingSha;
       setDraft(source);
       setMaterialized(present);
+      setHeldSha(incomingSha);
     }
-  }, [resetKey, source, present]);
+  }, [resetKey, source, present, fileQuery.data]);
 
   const dirty = draft !== source;
   const bytes = byteLen(draft);
@@ -371,19 +401,127 @@ export function AgentsMdEditor({
   const overSoft = bytes > SOFT_BYTE_WARN;
   const isSaving = putProject.isPending || putWorkspace.isPending;
 
+  // --- Conflict state ------------------------------------------------------
+  //
+  // A non-null `conflict` means: at save time we observed a sha on disk that
+  // differs from `heldSha`, i.e. another tab / agent / editor wrote to
+  // AGENTS.md while the user was typing here. Save is blocked until the user
+  // resolves it via the banner — Reload (discard our edits, pull theirs) or
+  // Keep mine (advance heldSha so the next save deliberately overwrites).
+  const [conflict, setConflict] = useState<{ currentSha: string } | null>(null);
+
+  const queryClient = useQueryClient();
+
+  const fileKey =
+    scope === "project"
+      ? projectFileQueryKey(id, AGENTS_MD_PATH)
+      : workspaceFileQueryKey(id, AGENTS_MD_PATH);
+
+  const fetchFile = useCallback((): Promise<FsReadResponse> => {
+    return scope === "project"
+      ? fetchProjectFile(id, AGENTS_MD_PATH)
+      : fetchWorkspaceFile(id, AGENTS_MD_PATH);
+  }, [scope, id]);
+
   const saveLayer = useCallback(async () => {
+    // Hard limit guard — the Save button is also disabled in this state, but
+    // the keyboard shortcut bypasses the disabled state on the button.
+    if (overHard || isSaving) return;
+    setConflict(null);
+
+    // 1) Optimistic conflict detection: refetch the latest file and compare
+    //    its sha against the one we hold. We only treat a mismatch as a
+    //    conflict when both sides have a sha — a fresh "creating new" save
+    //    legitimately starts with empty heldSha and no on-disk file.
+    let latest: FsReadResponse;
+    try {
+      latest = await fetchFile();
+    } catch (err) {
+      handleSaveError(err);
+      return;
+    }
+    const latestSha = latest.ok ? latest.sha : "";
+    if (heldSha && latestSha && latestSha !== heldSha) {
+      setConflict({ currentSha: latestSha });
+      return;
+    }
+
+    // 2) No conflict — write through the existing PUT mutation.
     try {
       if (scope === "project") {
         await putProject.mutateAsync({ projectId: id, content: draft });
       } else {
         await putWorkspace.mutateAsync({ workspaceId: id, content: draft });
       }
-      setMaterialized(true);
-      handleSaved();
     } catch (err) {
       handleSaveError(err);
+      return;
     }
-  }, [scope, id, draft, putProject, putWorkspace, handleSaved, handleSaveError]);
+
+    // 3) Refresh our local snapshot of the file so source/draft re-align,
+    //    the dirty badge clears, and heldSha advances to the just-written
+    //    version. Pushing the fresh response straight into the React Query
+    //    cache (rather than just invalidating) avoids a one-frame flicker
+    //    where source still points at the previous content.
+    setMaterialized(true);
+    try {
+      const after = await fetchFile();
+      queryClient.setQueryData(fileKey, after);
+      if (after.ok) setHeldSha(after.sha);
+    } catch {
+      // The follow-up GET is best-effort — fall back to a cache invalidation
+      // so the next render still picks up fresh content.
+      void queryClient.invalidateQueries({ queryKey: fileKey });
+    }
+    handleSaved();
+  }, [
+    scope,
+    id,
+    draft,
+    heldSha,
+    overHard,
+    isSaving,
+    putProject,
+    putWorkspace,
+    handleSaved,
+    handleSaveError,
+    fetchFile,
+    queryClient,
+    fileKey,
+  ]);
+
+  // Cmd/Ctrl+S — Monaco's `editor.addCommand` registers a global handler that
+  // intercepts the browser's Save dialog while the editor has focus. The
+  // saveLayer closure is captured by ref so the binding doesn't need to be
+  // re-registered every keystroke.
+  const saveLayerRef = useRef(saveLayer);
+  useEffect(() => {
+    saveLayerRef.current = saveLayer;
+  }, [saveLayer]);
+  const handleEditorMount = useCallback<OnMount>((editor, monaco) => {
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
+      void saveLayerRef.current();
+    });
+  }, []);
+
+  // --- Conflict resolution handlers ----------------------------------------
+  const reloadFromDisk = useCallback(async () => {
+    // Pull the latest content + sha and let the source-sync effect reset the
+    // editor's draft to it. Invalidating drives a refetch through
+    // `useProjectFile` / `useWorkspaceFile`; the effect above swaps draft and
+    // heldSha as soon as the new data lands.
+    setConflict(null);
+    await queryClient.invalidateQueries({ queryKey: fileKey });
+  }, [queryClient, fileKey]);
+
+  const keepMyEdits = useCallback(() => {
+    if (!conflict) return;
+    // Advance heldSha so the next save passes the conflict check and
+    // intentionally overwrites whatever is on disk now. The Monaco buffer is
+    // left untouched — the user's edits remain in the draft.
+    setHeldSha(conflict.currentSha);
+    setConflict(null);
+  }, [conflict]);
 
   if (forbidden) {
     return (
@@ -409,7 +547,7 @@ export function AgentsMdEditor({
     );
   }
 
-  if (query.isLoading) {
+  if (loadStatus === "loading") {
     return (
       <Card>
         <CardHeader>
@@ -422,7 +560,7 @@ export function AgentsMdEditor({
     );
   }
 
-  if (query.error) {
+  if (loadStatus === "error") {
     return (
       <Card>
         <CardHeader>
@@ -431,9 +569,7 @@ export function AgentsMdEditor({
         <CardContent>
           <p role="alert" className="text-sm text-destructive">
             Failed to load agent guidance:{" "}
-            {query.error instanceof Error
-              ? query.error.message
-              : "unknown error"}
+            {errorMessage ?? "unknown error"}
           </p>
         </CardContent>
       </Card>
@@ -467,7 +603,7 @@ export function AgentsMdEditor({
           )}
         </div>
       </CardHeader>
-      <CardContent className="space-y-4">
+      <CardContent className="space-y-3">
         {/* Empty state: no AGENTS.md yet for this scope. */}
         {!materialized && !dirty ? (
           <div
@@ -493,11 +629,79 @@ export function AgentsMdEditor({
           </div>
         ) : (
           <>
-            <LayerEditor
-              value={source}
-              onChange={setDraft}
-              onSave={saveLayer}
-            />
+            {/* Conflict banner — surfaces when another writer modified
+                AGENTS.md on disk while the user was editing here. Two
+                resolutions: pull theirs (Reload from disk) or stage to
+                overwrite on next save (Keep my edits). The banner sits above
+                the editor surface so it isn't hidden behind a long file. */}
+            {conflict && (
+              <div
+                role="alert"
+                data-testid="agents-md-conflict-banner"
+                className="rounded border border-amber-500 bg-amber-50 dark:bg-amber-900/20 px-3 py-2 text-sm"
+              >
+                <p className="text-amber-700 dark:text-amber-400">
+                  AGENTS.md changed on disk while you were editing. Save was
+                  blocked to prevent overwriting another edit.
+                </p>
+                <div className="mt-2 flex gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    data-testid="agents-md-conflict-reload"
+                    onClick={() => {
+                      void reloadFromDisk();
+                    }}
+                  >
+                    Reload from disk
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    data-testid="agents-md-conflict-keep"
+                    onClick={keepMyEdits}
+                  >
+                    Keep my edits
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {/* Header strip: file path + read status. The status reflects the
+                /fs/file fetch — once a draft has diverged from disk, it stays
+                "loaded" / "creating new"; the dirty Badge below the editor
+                signals unsaved changes separately. */}
+            <div
+              data-testid={`agents-md-editor-header-${layerKey}`}
+              className="flex items-center justify-between gap-2 rounded-t border border-b-0 bg-muted/40 px-3 py-1.5 text-xs"
+            >
+              <span
+                className="font-mono text-muted-foreground"
+                data-testid={`agents-md-path-${layerKey}`}
+              >
+                {AGENTS_MD_PATH}
+              </span>
+              <span
+                className="text-muted-foreground"
+                data-testid={`agents-md-status-${layerKey}`}
+              >
+                {STATUS_LABEL[loadStatus]}
+              </span>
+            </div>
+            <div
+              data-testid="agents-md-editor-surface"
+              className="rounded-b border bg-background overflow-hidden"
+              style={EDITOR_SURFACE_STYLE}
+            >
+              <CodeEditor
+                language="markdown"
+                path={AGENTS_MD_PATH}
+                value={draft}
+                onChange={setDraft}
+                onMount={handleEditorMount}
+                height="100%"
+              />
+            </div>
             <div className="flex items-center justify-between gap-3">
               <div
                 data-testid={`agents-md-byte-counter-${layerKey}`}

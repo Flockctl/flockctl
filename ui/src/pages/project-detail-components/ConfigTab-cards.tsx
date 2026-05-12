@@ -1,14 +1,6 @@
-import type { Dispatch, SetStateAction } from "react";
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+import type { Dispatch, ReactNode, SetStateAction } from "react";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { Separator } from "@/components/ui/separator";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
   Select,
@@ -22,21 +14,79 @@ import {
   GitignoreToggles,
   type GitignoreTogglesValue,
 } from "@/components/gitignore-toggles";
+import { FlatCard, SectionHeader } from "@/components/design";
 import type { MetaModel, PermissionMode, AIProviderKeyResponse } from "@/lib/types";
 
 /**
- * Card groups extracted from ConfigTab.tsx. Each one renders a tight
- * settings cluster and binds directly to the form state owned by the parent
- * — no duplication of `useState` calls. The parent keeps the validation + the
- * two-step save (updateProject + updateProjectConfig); these components only
- * own their JSX. Split so the page-level file stays focused on the
- * orchestration plumbing instead of 600 lines of grid layout.
+ * Card groups for {@link ConfigTab}, restyled in M23 slice 00 / T08.
+ *
+ * Surface look:
+ * - **Containers** are `<FlatCard>`s grouping related rows; each card
+ *   leads with a `<SectionHeader size="section">` so the page-level
+ *   "Config" tab renders as a flat ladder of named sections, no shadcn
+ *   `<Card>` chrome.
+ * - **Rows** use a fixed `grid grid-cols-[200px_1fr] gap-4 items-baseline`
+ *   layout — a 200px gutter for the label, the rest for the control. This
+ *   matches `.flockctl/plan/ui-prototype.html` and keeps every label
+ *   aligned regardless of input height (textarea, checkbox stack, etc.).
+ * - **Labels** are `text-zinc-500 text-[12px]` — they're hints, not
+ *   call-outs, because the field name is already the row's identity.
+ *
+ * Forms exception (CONTRIBUTING-DESIGN.md): we keep using shadcn
+ * `Input` / `Textarea` / `Select` / `Checkbox` because rebuilding
+ * accessible form primitives for the design tier is out of scope —
+ * the redesign only standardises the layout chrome around them.
+ *
+ * The parent {@link ConfigTab} keeps full ownership of form state and the
+ * two-step save flow (`updateProject` for DB-backed identity fields +
+ * `updateProjectConfig` for `.flockctl/config.yaml`). These children are
+ * pure JSX.
  */
 
 /**
+ * `<FormRow>` — the canonical 2-column form layout used everywhere on
+ * this tab. Renders `[label][control]` on a `200px / 1fr` grid with
+ * baseline alignment. The optional `hint` slot drops below the control
+ * (still inside column 2) so explanatory text doesn't push the grid out
+ * of alignment with neighbouring rows.
+ *
+ * Pass `htmlFor` if the control inside has a stable `id`; the label
+ * becomes a real `<label>` and hover/click delegation works for free.
+ * Otherwise the label is a plain `<span>` (some controls — checkboxes
+ * with custom layout, segmented selects — own their own label nodes).
+ */
+function FormRow({
+  label,
+  htmlFor,
+  hint,
+  children,
+}: {
+  label: string;
+  htmlFor?: string;
+  hint?: ReactNode;
+  children: ReactNode;
+}) {
+  const labelClass = "text-zinc-500 text-[12px]";
+  return (
+    <div className="grid grid-cols-[200px_1fr] gap-4 items-baseline">
+      {htmlFor ? (
+        <label htmlFor={htmlFor} className={labelClass}>
+          {label}
+        </label>
+      ) : (
+        <span className={labelClass}>{label}</span>
+      )}
+      <div className="space-y-1.5">
+        {children}
+        {hint && <div className="text-[11px] text-zinc-500">{hint}</div>}
+      </div>
+    </div>
+  );
+}
+
+/**
  * "General" card — DB-backed identity fields plus the AI-key allow-list and
- * permission-mode pair. The allow-list + permission mode live side-by-side
- * on wide screens because they're both access-control knobs.
+ * permission-mode pair.
  */
 export function GeneralCard({
   name,
@@ -66,113 +116,98 @@ export function GeneralCard({
   setPermissionMode: (mode: PermissionMode | null) => void;
 }) {
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>General</CardTitle>
-        <p className="text-xs text-muted-foreground">Stored locally on this machine.</p>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <div className="space-y-2">
-            <Label htmlFor="proj-name">Name *</Label>
-            <Input
-              id="proj-name"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-            />
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="proj-repo-url">Remote URL</Label>
-            <Input
-              id="proj-repo-url"
-              value={repoUrl}
-              onChange={(e) => setRepoUrl(e.target.value)}
-              placeholder="https://github.com/org/repo.git"
-              className="font-mono"
-            />
-          </div>
-        </div>
-        <div className="space-y-2">
-          <Label htmlFor="proj-desc">Description</Label>
+    <FlatCard className="p-5">
+      <SectionHeader
+        size="section"
+        title="General"
+        subtitle="Stored locally on this machine."
+        data-testid="config-general-header"
+      />
+      <div className="space-y-4">
+        <FormRow label="Name *" htmlFor="proj-name">
+          <Input
+            id="proj-name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+        </FormRow>
+        <FormRow label="Remote URL" htmlFor="proj-repo-url">
+          <Input
+            id="proj-repo-url"
+            value={repoUrl}
+            onChange={(e) => setRepoUrl(e.target.value)}
+            placeholder="https://github.com/org/repo.git"
+            className="font-mono"
+          />
+        </FormRow>
+        <FormRow label="Description" htmlFor="proj-desc">
           <Textarea
             id="proj-desc"
             value={description}
             onChange={(e) => setDescription(e.target.value)}
             rows={3}
           />
-        </div>
+        </FormRow>
         {path && (
-          <div className="space-y-1">
-            <Label className="text-muted-foreground">Path</Label>
-            <p className="text-sm font-mono bg-muted/50 rounded px-2 py-1">{path}</p>
-          </div>
+          <FormRow label="Path">
+            <p className="text-sm font-mono bg-muted/50 rounded px-2 py-1">
+              {path}
+            </p>
+          </FormRow>
         )}
 
-        <Separator />
-
-        {/*
-          Allowed AI keys and permission mode sit side-by-side — both are
-          access-control knobs and read naturally as a pair. Collapses to
-          one column under `md` where the checkbox list would otherwise
-          overflow a narrow half-column.
-        */}
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-          <div className="space-y-2">
-            <Label>Allowed AI Keys *</Label>
-            <p className="text-xs text-muted-foreground">
-              At least one active key is required (clearing not permitted).
-            </p>
-            <div className="flex flex-wrap gap-3">
-              {keys.map((k) => (
-                <label key={k.id} className="flex items-center gap-1.5 text-sm">
-                  <Checkbox
-                    checked={allowedKeyIds.includes(Number(k.id))}
-                    onCheckedChange={(checked) =>
-                      setAllowedKeyIds((prev) =>
-                        checked
-                          ? [...prev, Number(k.id)]
-                          : prev.filter((id) => id !== Number(k.id)),
-                      )
-                    }
-                  />
-                  {k.name ?? k.label ?? `Key #${k.id}`}
-                </label>
-              ))}
-              {keys.length === 0 && (
-                <p className="text-xs text-destructive">
-                  No active AI keys. Add one in Settings → AI Keys.
-                </p>
-              )}
-            </div>
-            {keys.length > 0 && allowedKeyIds.length === 0 && (
+        <FormRow
+          label="Allowed AI keys *"
+          hint="At least one active key is required (clearing not permitted)."
+        >
+          <div className="flex flex-wrap gap-3">
+            {keys.map((k) => (
+              <label key={k.id} className="flex items-center gap-1.5 text-sm">
+                <Checkbox
+                  checked={allowedKeyIds.includes(Number(k.id))}
+                  onCheckedChange={(checked) =>
+                    setAllowedKeyIds((prev) =>
+                      checked
+                        ? [...prev, Number(k.id)]
+                        : prev.filter((id) => id !== Number(k.id)),
+                    )
+                  }
+                />
+                {k.name ?? k.label ?? `Key #${k.id}`}
+              </label>
+            ))}
+            {keys.length === 0 && (
               <p className="text-xs text-destructive">
-                Select at least one key to save.
+                No active AI keys. Add one in Settings → AI Keys.
               </p>
             )}
           </div>
-
-          <div className="space-y-2">
-            <Label>Permission mode</Label>
-            <p className="text-xs text-muted-foreground">
-              Applied to tasks and chats in this project. Per-task overrides win.
+          {keys.length > 0 && allowedKeyIds.length === 0 && (
+            <p className="text-xs text-destructive">
+              Select at least one key to save.
             </p>
-            <PermissionModeSelect
-              value={permissionMode}
-              onChange={setPermissionMode}
-              inheritLabel="inherit from workspace"
-            />
-          </div>
-        </div>
-      </CardContent>
-    </Card>
+          )}
+        </FormRow>
+
+        <FormRow
+          label="Permission mode"
+          hint="Applied to tasks and chats in this project. Per-task overrides win."
+        >
+          <PermissionModeSelect
+            value={permissionMode}
+            onChange={setPermissionMode}
+            inheritLabel="inherit from workspace"
+          />
+        </FormRow>
+      </div>
+    </FlatCard>
   );
 }
 
 /**
  * Paired AI Configuration + Execution cards. Both persist to
- * `.flockctl/config.yaml`, so they sit side-by-side on wide screens and
- * collapse to a single column below `lg` to keep number inputs readable
- * on narrow windows.
+ * `.flockctl/config.yaml`. They sit side-by-side on wide screens and
+ * collapse to a single column below `lg`.
  */
 export function AIAndExecutionCards({
   model,
@@ -212,23 +247,22 @@ export function AIAndExecutionCards({
   setPostTaskCmd: Dispatch<SetStateAction<string>>;
 }) {
   return (
-    <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+    <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
       {/* AI Configuration — .flockctl/config.yaml */}
-      <Card>
-        <CardHeader>
-          <CardTitle>AI Configuration</CardTitle>
-          <p className="text-xs text-muted-foreground">
-            Stored in .flockctl/config.yaml — shared via git.
-          </p>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="space-y-2">
-            <Label htmlFor="proj-model">Default Model</Label>
+      <FlatCard className="p-5">
+        <SectionHeader
+          size="section"
+          title="AI Configuration"
+          subtitle="Stored in .flockctl/config.yaml — shared via git."
+          data-testid="config-ai-header"
+        />
+        <div className="space-y-4">
+          <FormRow label="Default model" htmlFor="proj-model">
             <Select
               value={model || "__none__"}
               onValueChange={(v) => setModel(v === "__none__" ? "" : v)}
             >
-              <SelectTrigger id="proj-model">
+              <SelectTrigger id="proj-model" aria-label="Default model">
                 <SelectValue placeholder="No default" />
               </SelectTrigger>
               <SelectContent>
@@ -240,14 +274,18 @@ export function AIAndExecutionCards({
                 ))}
               </SelectContent>
             </Select>
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="proj-planning-model">Planning Model</Label>
+          </FormRow>
+          <FormRow label="Planning model" htmlFor="proj-planning-model">
             <Select
               value={planningModel || "__none__"}
-              onValueChange={(v) => setPlanningModel(v === "__none__" ? "" : v)}
+              onValueChange={(v) =>
+                setPlanningModel(v === "__none__" ? "" : v)
+              }
             >
-              <SelectTrigger id="proj-planning-model">
+              <SelectTrigger
+                id="proj-planning-model"
+                aria-label="Planning model"
+              >
                 <SelectValue placeholder="No default" />
               </SelectTrigger>
               <SelectContent>
@@ -259,54 +297,46 @@ export function AIAndExecutionCards({
                 ))}
               </SelectContent>
             </Select>
-          </div>
-
-          <div className="space-y-2">
-            <Label htmlFor="proj-branch">Base Branch</Label>
+          </FormRow>
+          <FormRow label="Base branch" htmlFor="proj-branch">
             <Input
               id="proj-branch"
               value={baseBranch}
               onChange={(e) => setBaseBranch(e.target.value)}
               placeholder="main"
             />
-          </div>
-        </CardContent>
-      </Card>
+          </FormRow>
+        </div>
+      </FlatCard>
 
       {/* Execution — .flockctl/config.yaml */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Execution</CardTitle>
-          <p className="text-xs text-muted-foreground">
-            Stored in .flockctl/config.yaml — shared via git.
-          </p>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <div className="space-y-2">
-              <Label htmlFor="proj-timeout">Timeout (s)</Label>
-              <Input
-                id="proj-timeout"
-                type="number"
-                value={defaultTimeout}
-                onChange={(e) => setDefaultTimeout(e.target.value)}
-                placeholder="300"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="proj-concurrent">Max concurrent</Label>
-              <Input
-                id="proj-concurrent"
-                type="number"
-                value={maxConcurrent}
-                onChange={(e) => setMaxConcurrent(e.target.value)}
-                placeholder="5"
-              />
-            </div>
-          </div>
-
-          <div className="space-y-2">
-            <Label htmlFor="proj-budget">Daily Budget (USD)</Label>
+      <FlatCard className="p-5">
+        <SectionHeader
+          size="section"
+          title="Execution"
+          subtitle="Stored in .flockctl/config.yaml — shared via git."
+          data-testid="config-execution-header"
+        />
+        <div className="space-y-4">
+          <FormRow label="Timeout (s)" htmlFor="proj-timeout">
+            <Input
+              id="proj-timeout"
+              type="number"
+              value={defaultTimeout}
+              onChange={(e) => setDefaultTimeout(e.target.value)}
+              placeholder="300"
+            />
+          </FormRow>
+          <FormRow label="Max concurrent" htmlFor="proj-concurrent">
+            <Input
+              id="proj-concurrent"
+              type="number"
+              value={maxConcurrent}
+              onChange={(e) => setMaxConcurrent(e.target.value)}
+              placeholder="5"
+            />
+          </FormRow>
+          <FormRow label="Daily budget (USD)" htmlFor="proj-budget">
             <Input
               id="proj-budget"
               type="number"
@@ -315,21 +345,22 @@ export function AIAndExecutionCards({
               onChange={(e) => setBudgetDaily(e.target.value)}
               placeholder="10.00"
             />
-          </div>
-
-          <label className="flex items-center gap-3">
-            <Checkbox
-              id="proj-approval"
-              checked={requiresApproval}
-              onCheckedChange={(checked) => setRequiresApproval(!!checked)}
-            />
-            <Label htmlFor="proj-approval">
-              Require approval before task execution
-            </Label>
-          </label>
-
-          <div className="space-y-2">
-            <Label htmlFor="proj-post-task-cmd">Post-task command</Label>
+          </FormRow>
+          <FormRow label="Approval">
+            <label className="flex items-center gap-2 text-sm">
+              <Checkbox
+                id="proj-approval"
+                checked={requiresApproval}
+                onCheckedChange={(checked) => setRequiresApproval(!!checked)}
+              />
+              <span>Require approval before task execution</span>
+            </label>
+          </FormRow>
+          <FormRow
+            label="Post-task command"
+            htmlFor="proj-post-task-cmd"
+            hint="Runs in the project dir after each task (e.g. tests, linting)."
+          >
             <Input
               id="proj-post-task-cmd"
               value={postTaskCmd}
@@ -337,26 +368,16 @@ export function AIAndExecutionCards({
               placeholder="npm test"
               className="font-mono"
             />
-            <p className="text-xs text-muted-foreground">
-              Runs in the project dir after each task (e.g. tests, linting).
-            </p>
-          </div>
-        </CardContent>
-      </Card>
+          </FormRow>
+        </div>
+      </FlatCard>
     </div>
   );
 }
 
 /**
- * Paired Environment Variables + Gitignore cards. Env vars persist to
- * `.flockctl/config.yaml`; the gitignore toggles are DB-backed and
- * reconciled into the project's `.gitignore` on save.
- *
- * Below the pair we render a third full-width card for the
- * `use_project_claude_skills` opt-in (see migration 0045) — placed here
- * because, like the gitignore toggles, it is DB-backed and triggers a
- * reconcile when changed, but it gets its own card to make the
- * "locked-on, can't be disabled per-skill" intent explicit.
+ * Paired Environment Variables + Gitignore cards plus a third
+ * full-width card for the `use_project_claude_skills` opt-in.
  */
 export function EnvAndGitignoreCards({
   envVarsText,
@@ -376,82 +397,92 @@ export function EnvAndGitignoreCards({
   projectPath: string | null | undefined;
 }) {
   return (
-    <div className="space-y-6">
-    <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-      {/* Environment Variables — .flockctl/config.yaml */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Environment Variables</CardTitle>
-          <p className="text-xs text-muted-foreground">
-            .flockctl/config.yaml · one KEY=VALUE per line · # is a comment.
-          </p>
-        </CardHeader>
-        <CardContent>
-          <Textarea
-            value={envVarsText}
-            onChange={(e) => setEnvVarsText(e.target.value)}
-            rows={5}
-            placeholder={"NODE_ENV=production\nCI=true"}
-            className="font-mono text-sm"
+    <div className="space-y-4">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        {/* Environment Variables — .flockctl/config.yaml */}
+        <FlatCard className="p-5">
+          <SectionHeader
+            size="section"
+            title="Environment Variables"
+            subtitle=".flockctl/config.yaml · one KEY=VALUE per line · # is a comment."
+            data-testid="config-env-header"
           />
-        </CardContent>
-      </Card>
+          <FormRow label="KEY=VALUE" htmlFor="proj-env-vars">
+            <Textarea
+              id="proj-env-vars"
+              value={envVarsText}
+              onChange={(e) => setEnvVarsText(e.target.value)}
+              rows={5}
+              placeholder={"NODE_ENV=production\nCI=true"}
+              className="font-mono text-sm"
+            />
+          </FormRow>
+        </FlatCard>
 
-      {/* Gitignore — DB-backed, reconciles on save */}
-      <Card>
-        <CardHeader>
-          <CardTitle>Gitignore</CardTitle>
-          <p className="text-xs text-muted-foreground">
-            Local to this machine · rewrites the managed block in{" "}
-            <code>{projectPath ?? "<project>"}/.gitignore</code> on save.
-          </p>
-        </CardHeader>
-        <CardContent>
-          <GitignoreToggles
-            value={gitignoreToggles}
-            onChange={setGitignoreToggles}
-            title="Additional ignores"
-            idPrefix="proj-gi"
+        {/* Gitignore — DB-backed, reconciles on save */}
+        <FlatCard className="p-5">
+          <SectionHeader
+            size="section"
+            title="Gitignore"
+            subtitle="Local · rewrites the managed block in the project's .gitignore on save."
+            data-testid="config-gitignore-header"
           />
-        </CardContent>
-      </Card>
-    </div>
+          <FormRow
+            label="Additional ignores"
+            hint={
+              <>
+                Rewrites <code>{projectPath ?? "<project>"}/.gitignore</code>{" "}
+                on save.
+              </>
+            }
+          >
+            <GitignoreToggles
+              value={gitignoreToggles}
+              onChange={setGitignoreToggles}
+              title="Additional ignores"
+              idPrefix="proj-gi"
+            />
+          </FormRow>
+        </FlatCard>
+      </div>
 
-    {/* Project-owned skills opt-in — DB-backed, reconciles on save */}
-    <Card>
-      <CardHeader>
-        <CardTitle>Project skills source</CardTitle>
-        <p className="text-xs text-muted-foreground">
-          Local to this machine · controls whether the agent picks up skills
-          from this project's own <code>.claude/skills/</code> folder.
-        </p>
-      </CardHeader>
-      <CardContent>
-        <label
-          htmlFor="proj-use-claude-skills"
-          className="flex items-start gap-2 text-sm"
-        >
-          <Checkbox
-            id="proj-use-claude-skills"
-            checked={useProjectClaudeSkills}
-            onCheckedChange={(next) => setUseProjectClaudeSkills(next === true)}
-          />
-          <span className="flex-1">
-            <span className="block leading-tight">
-              Use skills from <code>.claude/skills/</code> in this project
+      {/* Project-owned skills opt-in — DB-backed, reconciles on save */}
+      <FlatCard className="p-5">
+        <SectionHeader
+          size="section"
+          title="Project skills source"
+          subtitle="Local · controls whether the agent picks up skills from this project's own .claude/skills/ folder."
+          data-testid="config-claude-skills-header"
+        />
+        <FormRow label="Project .claude/skills/">
+          <label
+            htmlFor="proj-use-claude-skills"
+            className="flex items-start gap-2 text-sm"
+          >
+            <Checkbox
+              id="proj-use-claude-skills"
+              checked={useProjectClaudeSkills}
+              onCheckedChange={(next) =>
+                setUseProjectClaudeSkills(next === true)
+              }
+            />
+            <span className="flex-1">
+              <span className="block leading-tight">
+                Use skills from <code>.claude/skills/</code> in this project
+              </span>
+              <span className="block text-[11px] text-zinc-500">
+                When enabled, every <code>SKILL.md</code> under{" "}
+                <code>{projectPath ?? "<project>"}/.claude/skills/</code> is
+                treated as a locked, always-on skill that overrides any
+                same-name skill from global / workspace /{" "}
+                <code>.flockctl/skills/</code>. These skills bypass the
+                per-skill disable list — they cannot be turned off through
+                the toggles below.
+              </span>
             </span>
-            <span className="block text-xs text-muted-foreground">
-              When enabled, every <code>SKILL.md</code> under{" "}
-              <code>{projectPath ?? "<project>"}/.claude/skills/</code> is
-              treated as a locked, always-on skill that overrides any same-name
-              skill from global / workspace / <code>.flockctl/skills/</code>.
-              These skills bypass the per-skill disable list — they cannot be
-              turned off through the toggles below.
-            </span>
-          </span>
-        </label>
-      </CardContent>
-    </Card>
+          </label>
+        </FormRow>
+      </FlatCard>
     </div>
   );
 }

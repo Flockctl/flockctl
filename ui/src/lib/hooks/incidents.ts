@@ -51,8 +51,25 @@ export function useUpdateIncident() {
       data: Parameters<typeof updateIncident>[1];
     }) => updateIncident(id, data),
     onSuccess: (incident) => {
+      // Single-row patch (audit-round-5). Previously the success path
+      // invalidated the whole list, forcing a refetch on every open
+      // incidents page. Now we patch the detail cache AND every cached
+      // list page that contains the row — same pattern as
+      // `patchTaskInLists` in tasks.ts.
       qc.setQueryData(queryKeys.incident(incident.id), incident);
-      qc.invalidateQueries({ queryKey: queryKeys.incidents });
+      qc.setQueriesData<PaginatedResponse<IncidentResponse>>(
+        { queryKey: queryKeys.incidents },
+        (old) => {
+          if (!old) return old;
+          let touched = false;
+          const items = old.items.map((row) => {
+            if (String(row.id) !== String(incident.id)) return row;
+            touched = true;
+            return incident;
+          });
+          return touched ? { ...old, items } : old;
+        },
+      );
     },
   });
 }

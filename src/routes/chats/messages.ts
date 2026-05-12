@@ -5,6 +5,7 @@ import { chats, chatMessages, usageRecords } from "../../db/schema.js";
 import { eq } from "drizzle-orm";
 import { NotFoundError, ValidationError } from "../../lib/errors.js";
 import { parseIdParam } from "../../lib/route-params.js";
+import { BoundedStringAccumulator } from "../../lib/bounded-string.js";
 import {
   validateAttachmentsForMessage,
   linkAttachmentsToMessage,
@@ -48,8 +49,20 @@ export function registerChatMessages(router: Hono): void {
     const id = parseIdParam(c);
     const chat = getChatOrThrow(id);
 
-    const body = await c.req.json();
+    const body = await c.req.json().catch(() => ({}));
     if (!body.content) throw new ValidationError("content is required");
+    // Cap message content at 1 MiB to bound memory exposure (audit-
+    // round-7 SECURITY finding). Without this, a single oversized POST
+    // would land in SQLite + be fanned out via SSE/WS + forwarded to
+    // the LLM provider as one row. 1 MiB is generous for normal use
+    // (a 1000-line agent reply is ~100 KiB) but still rejects the
+    // 100 MiB blob class.
+    const MAX_MESSAGE_CONTENT_BYTES = 1_048_576;
+    if (typeof body.content === "string" && body.content.length > MAX_MESSAGE_CONTENT_BYTES) {
+      throw new ValidationError(
+        `content too large (${body.content.length} bytes, max ${MAX_MESSAGE_CONTENT_BYTES})`,
+      );
+    }
     const role = body.role ?? "user";
     const content = body.content;
     // Model resolution: explicit body.model → chat's saved model → global
@@ -78,9 +91,9 @@ export function registerChatMessages(router: Hono): void {
     const effortBody = parseEffortBody(body);
     // `effortBody === null` is the explicit "clear back to default" signal;
     // anything else (string | undefined) falls back to the stored chat value
-    // and finally `undefined` (the SDK default = "high"). We deliberately do
-    // NOT coerce NULL to "high" here — keeping the column nullable lets the
-    // runtime default drift later without a DB backfill.
+    // and finally `undefined` (the runtime default = "xhigh"). We deliberately
+    // do NOT coerce NULL to "xhigh" here — keeping the column nullable lets
+    // the runtime default drift later without a DB backfill.
     const effort: import("../../services/ai/client.js").EffortLevel | undefined =
       (effortBody === null ? undefined : effortBody)
       ?? (chat.effort as import("../../services/ai/client.js").EffortLevel | null ?? undefined);
@@ -212,8 +225,11 @@ export function registerChatMessages(router: Hono): void {
         }
       }
     });
-    let fullText = "";
-    session.on("text", (chunk) => { fullText += chunk; });
+    // Bounded chunk-buffer accumulator (see lib/bounded-string.ts). Replaces
+    // a `let s = ""; s += chunk` that was O(n²) over total bytes and had no
+    // ceiling on memory if a runaway provider streamed multi-GB.
+    const fullTextAcc = new BoundedStringAccumulator();
+    session.on("text", (chunk) => fullTextAcc.append(chunk));
     let finalMetrics: AgentSessionMetrics | undefined;
     session.on("usage", (m) => { finalMetrics = m; });
 
@@ -260,6 +276,7 @@ export function registerChatMessages(router: Hono): void {
       }
 
       // Save assistant response
+      const fullText = fullTextAcc.toString();
       const assistantMsg = db.insert(chatMessages).values({
         chatId: id,
         role: "assistant",
@@ -324,8 +341,15 @@ export function registerChatMessages(router: Hono): void {
     const id = parseIdParam(c);
     const chat = getChatOrThrow(id);
 
-    const body = await c.req.json();
+    const body = await c.req.json().catch(() => ({}));
     if (!body.content) throw new ValidationError("content is required");
+    // Same 1 MiB cap as the non-stream handler — see L52 for rationale.
+    const MAX_MESSAGE_CONTENT_BYTES = 1_048_576;
+    if (typeof body.content === "string" && body.content.length > MAX_MESSAGE_CONTENT_BYTES) {
+      throw new ValidationError(
+        `content too large (${body.content.length} bytes, max ${MAX_MESSAGE_CONTENT_BYTES})`,
+      );
+    }
     const content = body.content;
     const keyId = resolveChatKeyId(db, body.keyId, chat);
     assertKeyAllowedForChat(db, chat, keyId, classifyKeyIdSource(body.keyId, chat.aiProviderKeyId));
@@ -448,16 +472,21 @@ export function registerChatMessages(router: Hono): void {
     });
 
     return streamSSE(c, async (stream) => {
-      let fullText = "";
+      // Bounded chunk-buffer accumulators (see lib/bounded-string.ts) replace
+      // four parallel `let s = ""; s += chunk` paths. Without these the SDK
+      // streaming hot path was O(n²) in total bytes per accumulator AND
+      // unbounded — a runaway provider could pin multi-GB of heap.
+      const fullTextAcc = new BoundedStringAccumulator();
+      const fullThinkingAcc = new BoundedStringAccumulator();
       // Text/thinking accumulated since the last flush boundary (= the last
       // `tool_call` event). Each tool_call marks the end of an assistant turn
-      // in Claude Code's rendering model, so we persist `pendingText` as its
-      // own `role: "assistant"` row at each boundary instead of concatenating
-      // the whole run into one final message. Without this, a multi-turn
-      // agent response renders as a single wall of text on reload because
-      // everything lands in one `chat_messages` row.
-      let pendingText = "";
-      let pendingThinking = "";
+      // in Claude Code's rendering model, so we persist the pending buffer as
+      // its own `role: "assistant"` row at each boundary instead of
+      // concatenating the whole run into one final message. Without this, a
+      // multi-turn agent response renders as a single wall of text on reload
+      // because everything lands in one `chat_messages` row.
+      const pendingTextAcc = new BoundedStringAccumulator();
+      const pendingThinkingAcc = new BoundedStringAccumulator();
       let returnedSessionId: string | undefined;
       let finalMetrics: AgentSessionMetrics | undefined;
       let clientDisconnected = false;
@@ -499,7 +528,6 @@ export function registerChatMessages(router: Hono): void {
       // error SSE frame in that case so the user sees WHY (model returned no
       // content) rather than the ambiguous fallback.
       let meaningfulEventCount = 0;
-      let fullThinking = "";
       let resolveWait: (() => void) | null = null;
       const wakeWaiter = () => {
         if (resolveWait) { resolveWait(); resolveWait = null; }
@@ -507,15 +535,15 @@ export function registerChatMessages(router: Hono): void {
       const waitForNext = () => new Promise<void>((resolve) => { resolveWait = resolve; });
 
       session.on("text", (chunk) => {
-        fullText += chunk;
-        pendingText += chunk;
+        fullTextAcc.append(chunk);
+        pendingTextAcc.append(chunk);
         eventQueue.push({ content: chunk });
         meaningfulEventCount++;
         wakeWaiter();
       });
       session.on("thinking", (chunk) => {
-        fullThinking += chunk;
-        pendingThinking += chunk;
+        fullThinkingAcc.append(chunk);
+        pendingThinkingAcc.append(chunk);
         eventQueue.push({ thinking: chunk });
         meaningfulEventCount++;
         wakeWaiter();
@@ -560,23 +588,23 @@ export function registerChatMessages(router: Hono): void {
         let newAssistantRowId: number | null = null;
         try {
           /* v8 ignore next — `pendingThinking` is only populated by real SDK thinking deltas; live streaming tests don't emit them */
-          if (pendingThinking) {
+          if (pendingThinkingAcc.length > 0) {
             db.insert(chatMessages).values({
               chatId: id,
               role: "thinking",
-              content: pendingThinking,
+              content: pendingThinkingAcc.toString(),
             }).run();
-            pendingThinking = "";
+            pendingThinkingAcc.clear();
           }
-          if (pendingText) {
+          if (pendingTextAcc.length > 0) {
             const row = db.insert(chatMessages).values({
               chatId: id,
               role: "assistant",
-              content: pendingText,
+              content: pendingTextAcc.toString(),
             }).returning().get();
             lastAssistantRowId = row.id;
             newAssistantRowId = row.id;
-            pendingText = "";
+            pendingTextAcc.clear();
           }
         } catch (err) {
           console.error(`[chats.stream] failed to flush pending text at ${boundary} boundary (chat ${id}):`, err);
@@ -628,25 +656,37 @@ export function registerChatMessages(router: Hono): void {
         wakeWaiter();
       });
 
+      // Drain the eventQueue with a head pointer instead of `Array.shift()`.
+      // shift() is O(n) because it reindexes the entire buffer after each
+      // pop; on a turn that emits k events the cost is O(k²). Using a
+      // monotonic index + occasional reset keeps the drain O(k).
+      let head = 0;
       let done = false;
       try {
         while (!done) {
-          while (eventQueue.length > 0) {
-            const evt = eventQueue.shift()!;
+          while (head < eventQueue.length) {
+            const evt = eventQueue[head++]!;
             try {
               await stream.writeSSE({ data: JSON.stringify(evt) });
             } catch { clientDisconnected = true; break; }
           }
+          // Reset the buffer once we've drained it to avoid unbounded growth
+          // when the producer keeps appending — array.length stays small
+          // between drains.
+          if (head > 0 && head === eventQueue.length) {
+            eventQueue.length = 0;
+            head = 0;
+          }
           /* v8 ignore next — mid-loop client-disconnect branch requires the stream writer to throw between iterations; reproducible only with a real TCP socket teardown */
           if (clientDisconnected) break;
-          if (runFinished && eventQueue.length === 0) { done = true; break; }
+          if (runFinished && head === eventQueue.length) { done = true; break; }
           await waitForNext();
         }
         await runPromise; // ensure all events flushed
         // Drain any remaining events
         /* v8 ignore start — defensive drain after stream end; race-only */
-        while (eventQueue.length > 0 && !clientDisconnected) {
-          const evt = eventQueue.shift()!;
+        while (head < eventQueue.length && !clientDisconnected) {
+          const evt = eventQueue[head++]!;
           try {
             await stream.writeSSE({ data: JSON.stringify(evt) });
           } catch { clientDisconnected = true; }
@@ -727,6 +767,11 @@ export function registerChatMessages(router: Hono): void {
         }
       }
 
+      // Materialise the accumulators once for the post-stream block (title
+      // slice, session rename). `toString()` is idempotent so calling it
+      // again later is free; consolidating it here keeps the four .toString()
+      // call sites below in sync.
+      const fullText = fullTextAcc.toString();
       try {
         // Persist session ID + rename for [FLOCKCTL] tagging
         if (returnedSessionId && returnedSessionId !== chat.claudeSessionId) {

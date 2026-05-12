@@ -3,12 +3,15 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import simpleGit from "simple-git";
+import { eq } from "drizzle-orm";
 import { app } from "../../server.js";
-import { setDb } from "../../db/index.js";
-import { createTestDb, seedProject } from "../helpers.js";
+import { setDb, getDb } from "../../db/index.js";
+import { gitAuditLog } from "../../db/schema.js";
+import { createTestDb, seedProject, seedWorkspace } from "../helpers.js";
 import {
   classifyPullError,
   extractGitErrorMessage,
+  runGitCommand,
   runGitPull,
 } from "../../services/git-operations.js";
 
@@ -258,6 +261,68 @@ describe("POST /projects/:id/git-pull", () => {
     expect(body.ok).toBe(false);
     expect(body.reason).toBe("non_fast_forward");
     expect(typeof body.stderr).toBe("string");
+  });
+
+  // After the v2 envelope refactor, `runGitPull` delegates the actual git
+  // invocation to `runGitCommand`, which writes one row per call into
+  // `git_audit_log`. The table's CHECK constraint requires at least one of
+  // `project_id` / `workspace_id`, but allows the unused side to be NULL —
+  // and downstream queries (the per-project / per-workspace recency indexes)
+  // depend on that asymmetry being preserved. This test pins both directions
+  // of the contract: a pull-routed audit row keys on `project_id` only, and a
+  // workspace-scoped `runGitCommand` call keys on `workspace_id` only.
+  it("audit_row_omits_workspace_id_when_only_project_id_supplied_and_vice_versa", async () => {
+    // ── Direction 1: pull route → audit row keyed on project_id only ──
+    const remote = join(tmpRoot, "audit-keys.git");
+    const seeder = join(tmpRoot, "audit-keys-seeder");
+    const projPath = join(tmpRoot, "audit-keys-proj");
+
+    await initBareRepo(remote);
+    const seederGit = await initRepo(seeder);
+    writeFileSync(join(seeder, "a.txt"), "1");
+    await seederGit.add("a.txt");
+    await seederGit.commit("init");
+    await seederGit.addRemote("origin", remote);
+    await seederGit.push("origin", "main");
+
+    await simpleGit().clone(remote, projPath);
+    const projGit = simpleGit(projPath);
+    await projGit.addConfig("user.email", "test@example.com");
+    await projGit.addConfig("user.name", "Test");
+
+    const id = seedProject(testDb.sqlite, { path: projPath });
+    const res = await app.request(`/projects/${id}/git-pull`, {
+      method: "POST",
+    });
+    expect(res.status).toBe(200);
+
+    const projectRows = await getDb()
+      .select()
+      .from(gitAuditLog)
+      .where(eq(gitAuditLog.projectId, id));
+    expect(projectRows).toHaveLength(1);
+    expect(projectRows[0]!.projectId).toBe(id);
+    expect(projectRows[0]!.workspaceId).toBeNull();
+    expect(projectRows[0]!.action).toBe("pull");
+
+    // ── Direction 2: workspace-only audit scope ──
+    const wsId = seedWorkspace(testDb.sqlite, {});
+    const got = await runGitCommand({
+      cwd: projPath,
+      action: "push",
+      run: async () => "ok",
+      audit: { workspaceId: String(wsId), argsJson: "{}" },
+    });
+    expect(got.ok).toBe(true);
+
+    const workspaceRows = await getDb()
+      .select()
+      .from(gitAuditLog)
+      .where(eq(gitAuditLog.workspaceId, wsId));
+    expect(workspaceRows).toHaveLength(1);
+    expect(workspaceRows[0]!.workspaceId).toBe(wsId);
+    expect(workspaceRows[0]!.projectId).toBeNull();
+    expect(workspaceRows[0]!.action).toBe("push");
   });
 });
 

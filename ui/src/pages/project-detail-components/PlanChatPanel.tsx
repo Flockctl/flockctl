@@ -68,7 +68,13 @@ export function PlanChatPanel({
       <div className="flex items-center gap-2 border-b p-3">
         <Badge variant="outline" className="text-xs capitalize">{context.entity_type}</Badge>
         <span className="min-w-0 flex-1 truncate text-sm font-medium">{context.title}</span>
-        <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={onClose}>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7 shrink-0"
+          onClick={onClose}
+          aria-label="Close chat panel"
+        >
           <X className="h-4 w-4" />
         </Button>
       </div>

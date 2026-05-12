@@ -27,7 +27,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { KeyRound } from "lucide-react";
+import { KeyRound, Wand2 } from "lucide-react";
 
 /**
  * Create-or-edit dialog for an MCP server, shared between the sidebar McpPanel
@@ -159,16 +159,17 @@ export function McpServerDialog({
     <Dialog open={open} onOpenChange={handleClose}>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>
+          <DialogTitle className="flex items-center gap-2">
+            <Wand2 className="h-4 w-4 text-foreground/70" aria-hidden="true" />
             {isEditing ? "Edit MCP Server" : `Add MCP Server (${scope})`}
           </DialogTitle>
           <DialogDescription>
             {isEditing
               ? `Edit the "${editServer.name}" MCP server at ${scope} level.`
-              : `Configure a new MCP server at the ${scope} level.`}
+              : `Configure a new MCP server at the ${scope} level. Servers are reconciled into .mcp.json on save.`}
           </DialogDescription>
         </DialogHeader>
-        <div className="space-y-4">
+        <div className="space-y-3">
           <div className="space-y-2">
             <Label htmlFor="mcp-name">Name</Label>
             <Input

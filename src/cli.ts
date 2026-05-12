@@ -2,6 +2,7 @@
 import { Command } from "commander";
 import { startDaemon, stopDaemon, statusDaemon } from "./daemon.js";
 import {
+  DEFAULT_DAEMON_PORT,
   addRemoteAccessToken,
   getConfiguredTokens,
   removeRemoteAccessToken,
@@ -32,6 +33,7 @@ import { registerConfigCommand } from "./cli-commands/config.js";
 import { registerBackupCommand } from "./cli-commands/backup.js";
 import { registerMigrateCommand } from "./cli-commands/migrate.js";
 import { registerOpenCommand } from "./cli-commands/open.js";
+import { registerWorktreeCommand } from "./cli-commands/worktree.js";
 
 const program = new Command();
 
@@ -43,7 +45,7 @@ program
 program
   .command("start")
   .description("Start Flockctl web server in background")
-  .option("-p, --port <number>", "Port to listen on", "52077")
+  .option("-p, --port <number>", "Port to listen on", String(DEFAULT_DAEMON_PORT))
   .option(
     "-H, --host <address>",
     "Interface to bind to. Default is 127.0.0.1 (loopback only). " +
@@ -215,6 +217,7 @@ registerConfigCommand(program);
 registerBackupCommand(program);
 registerMigrateCommand(program);
 registerOpenCommand(program);
+registerWorktreeCommand(program);
 registerProjectCommand(program);
 registerWorkspaceCommand(program);
 registerAgentsCommand(program);

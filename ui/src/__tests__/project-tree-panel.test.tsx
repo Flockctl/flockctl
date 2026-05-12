@@ -250,8 +250,12 @@ describe("ProjectTreePanel — board integration", () => {
     // Expand Alpha first so its slice rows render.
     await user.click(screen.getByLabelText("Expand milestone"));
 
-    // Click slice s-a2 in the tree.
-    await user.click(screen.getByTestId("tree-slice-s-a2"));
+    // Click slice s-a2 in the tree. The click handler lives on the inner
+    // row div (not the <li>) so we click the title text rather than the
+    // testid'd <li> element.
+    await user.click(
+      within(screen.getByTestId("tree-slice-s-a2")).getByText(/Slice s-a2/i),
+    );
 
     const search = screen.getByTestId("url-probe").textContent ?? "";
     expect(search).toContain("milestone=m-alpha");

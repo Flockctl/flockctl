@@ -9,12 +9,7 @@ import {
   useMeta,
   useAIKeys,
 } from "@/lib/hooks";
-import {
-  Card,
-  CardHeader,
-  CardTitle,
-  CardContent,
-} from "@/components/ui/card";
+import { FlatCard, SectionHeader } from "@/components/design";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
@@ -239,7 +234,7 @@ export function ConfigTab({ projectId }: { projectId: string }) {
   }
 
   return (
-    <div className="space-y-6" data-testid="project-config-tab">
+    <div className="space-y-4" data-testid="project-config-tab">
       {/* Save bar — pinned to the top of the tab. The tab already lives
           under a page header with the project title, so we don't repeat
           the title here. */}
@@ -343,18 +338,20 @@ export function ConfigTab({ projectId }: { projectId: string }) {
       />
 
       {/* Danger Zone */}
-      <Card className="border-destructive/50">
-        <CardHeader>
-          <CardTitle className="text-destructive">Danger Zone</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm font-medium">Delete Project</p>
-              <p className="text-xs text-muted-foreground">
-                Permanently delete this project and all its milestones, slices, and tasks.
-              </p>
-            </div>
+      <FlatCard className="p-5 border-destructive/50">
+        <SectionHeader
+          size="section"
+          title="Danger Zone"
+          subtitle="Destructive actions are not reversible."
+          data-testid="config-danger-header"
+        />
+        <div className="grid grid-cols-[200px_1fr] gap-4 items-baseline">
+          <span className="text-zinc-500 text-[12px]">Delete project</span>
+          <div className="flex items-start justify-between gap-3">
+            <p className="text-[12px] text-zinc-500">
+              Permanently delete this project and all its milestones, slices,
+              and tasks.
+            </p>
             <Button
               variant="destructive"
               size="sm"
@@ -364,8 +361,8 @@ export function ConfigTab({ projectId }: { projectId: string }) {
               Delete Project
             </Button>
           </div>
-        </CardContent>
-      </Card>
+        </div>
+      </FlatCard>
 
       <ConfirmDialog
         open={deleteOpen}

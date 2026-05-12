@@ -28,7 +28,6 @@ import {
   getWorkspacesDir,
   getGlobalSkillsDir,
   getRemoteServers,
-  getRemoteAccessToken,
   getConfiguredTokens,
   hasRemoteAuth,
   findMatchingToken,
@@ -158,31 +157,11 @@ describe("getRemoteServers", () => {
   });
 });
 
-describe("getRemoteAccessToken (legacy bcompat)", () => {
-  beforeEach(() => {
-    mockReadFileSync.mockReset();
-    _resetRcCache();
-  });
-
-  it("returns null when not configured", () => {
-    mockReadFileSync.mockReturnValue("{}");
-    expect(getRemoteAccessToken()).toBeNull();
-  });
-
-  it("rejects tokens shorter than 32 chars", () => {
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    mockReadFileSync.mockReturnValue(JSON.stringify({ remoteAccessToken: "short" }));
-    expect(getRemoteAccessToken()).toBeNull();
-    expect(warnSpy).toHaveBeenCalled();
-    warnSpy.mockRestore();
-  });
-
-  it("accepts tokens >= 32 chars", () => {
-    const token = "a".repeat(32);
-    mockReadFileSync.mockReturnValue(JSON.stringify({ remoteAccessToken: token }));
-    expect(getRemoteAccessToken()).toBe(token);
-  });
-});
+// `getRemoteAccessToken` was the legacy single-token bcompat helper; the
+// codebase now uses the multi-token `getConfiguredTokens()` / `findMatchingToken()`
+// surface (see `remote-auth.ts`). The legacy function and its parity tests
+// were removed in the round-2 dead-code sweep — `findMatchingToken()` covers
+// every production call site.
 
 const T1 = "a".repeat(32);
 const T2 = "b".repeat(32);

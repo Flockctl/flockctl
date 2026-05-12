@@ -9,18 +9,53 @@ import { tmpdir } from "os";
 import { listMilestones } from "../../services/plan-store/index.js";
 import { createMilestone } from "../../services/plan-store/index.js";
 
-// Mock child_process the same way as the sibling extras file so git clone
-// (execFileSync) forwards to the execSync mock impl.
+// Routes now use `execa` for git operations (async). Forward to the
+// legacy `execSync` mock impl and reshape returns into execa's
+// `{ stdout, stderr }` envelope.
 vi.mock("child_process", async () => {
   const actual = await vi.importActual<any>("child_process");
   return {
     ...actual,
     execSync: vi.fn(actual.execSync),
-    execFileSync: vi.fn((file: string, args: readonly string[], opts: unknown) => {
+  };
+});
+
+vi.mock("execa", async () => {
+  return {
+    execa: vi.fn(async (file: string, args: readonly string[]) => {
       const fake = (execSync as unknown as { getMockImplementation?: () => (cmd: string) => unknown })
         .getMockImplementation?.();
       const rebuiltCmd = `${file} ${args.join(" ")}`;
-      return fake ? fake(rebuiltCmd) : actual.execFileSync(file, args, opts);
+      if (!fake) return { stdout: "", stderr: "", exitCode: 0 };
+      try {
+        const result = fake(rebuiltCmd);
+        const stdout =
+          typeof result === "string"
+            ? result
+            : result && typeof (result as Buffer).toString === "function"
+              ? (result as Buffer).toString()
+              : "";
+        return { stdout, stderr: "", exitCode: 0 };
+      } catch (err) {
+        // Preserve the raw thrown shape so the route's catch-block
+        // fallback (stderr → message → "unknown error") still drives
+        // the expected error path. Tests deliberately throw `{}` to
+        // exercise the "unknown error" branch — overwriting `.message`
+        // here would mask it.
+        const e = err as { stderr?: Buffer | string; message?: string };
+        const stderrText =
+          typeof e.stderr === "string"
+            ? e.stderr
+            : e.stderr
+              ? e.stderr.toString()
+              : undefined;
+        const wrapped: { stderr?: string; message?: string; exitCode: number } = {
+          exitCode: 1,
+        };
+        if (stderrText !== undefined) wrapped.stderr = stderrText;
+        if (typeof e.message === "string") wrapped.message = e.message;
+        throw wrapped;
+      }
     }),
   };
 });
@@ -113,7 +148,10 @@ describe("POST /workspaces — auto path fallback", () => {
     // code path. Use an in-process FLOCKCTL_HOME that exists. The route
     // derives from `homedir()` directly so just attempt to create under a
     // unique name and clean up afterwards.
-    const uniqueName = "wsauto_" + Date.now();
+    // Use only slug-safe characters (lowercase + dashes) so the post-slugify
+    // path matches the input exactly — slugify now lowercases + emits
+    // kebab-case, so a name like "wsauto_123" would become "wsauto-123".
+    const uniqueName = "wsauto-" + Date.now();
     const res = await app.request("/workspaces", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

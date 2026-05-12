@@ -14,6 +14,7 @@
  */
 import type { Command } from "commander";
 import { spawn } from "child_process";
+import { DEFAULT_DAEMON_PORT } from "../config/index.js";
 
 function pickOpener(): string | null {
   if (process.platform === "darwin") return "open";
@@ -23,7 +24,7 @@ function pickOpener(): string | null {
 
 function buildUrl(opts: { host?: string; port?: string; url?: string }): string {
   const host = opts.host ?? process.env.FLOCKCTL_HOST ?? "127.0.0.1";
-  const port = opts.port ?? process.env.FLOCKCTL_PORT ?? "52077";
+  const port = opts.port ?? process.env.FLOCKCTL_PORT ?? String(DEFAULT_DAEMON_PORT);
   const path = opts.url ?? "/";
   const cleanPath = path.startsWith("/") ? path : `/${path}`;
   return `http://${host}:${port}${cleanPath}`;
@@ -37,7 +38,7 @@ export function registerOpenCommand(program: Command): void {
         "Pass --url /tasks to deep-link a specific page.",
     )
     .option("-H, --host <host>", "Override host (default: 127.0.0.1 / FLOCKCTL_HOST)")
-    .option("-p, --port <port>", "Override port (default: 52077 / FLOCKCTL_PORT)")
+    .option("-p, --port <port>", `Override port (default: ${DEFAULT_DAEMON_PORT} / FLOCKCTL_PORT)`)
     .option("-u, --url <path>", "Path component to append (e.g. /tasks)")
     .option("--print", "Print the URL instead of opening it", false)
     .action((opts: { host?: string; port?: string; url?: string; print?: boolean }) => {

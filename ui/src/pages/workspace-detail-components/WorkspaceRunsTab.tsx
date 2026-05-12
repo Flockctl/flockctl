@@ -44,7 +44,7 @@ export function WorkspaceRunsTab({
         <CardHeader>
           <CardTitle className="text-sm font-medium">Runs</CardTitle>
         </CardHeader>
-        <CardContent className="space-y-4">
+        <CardContent className="space-y-3">
           <p className="text-sm text-muted-foreground">
             Runs are scoped per project. Open a project's Runs tab to see
             its execution history.

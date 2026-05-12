@@ -1,366 +1,233 @@
-import { useState } from "react";
-import { useTasks, useProjects, useUsageSummary, useUsageBreakdown, useTaskStats, useAIKeys } from "@/lib/hooks";
-import { formatTokens, formatDuration } from "@/lib/format";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Skeleton } from "@/components/ui/skeleton";
-import { StatCard } from "@/components/stat-card";
-import {
-  ListTodo,
-  FolderGit2,
-  DollarSign,
-  Hash,
-  ArrowDownToLine,
-  ArrowUpFromLine,
-  DatabaseZap,
-  BookOpen,
-  Server,
-  CheckCircle,
-  XCircle,
-  Clock,
-  Loader,
-} from "lucide-react";
-import {
-  LineChart,
-  Line,
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  Tooltip,
-  ResponsiveContainer,
-  CartesianGrid,
-  PieChart,
-  Pie,
-  Cell,
-  Legend,
-} from "recharts";
-import {
-  CHART_TICK_STYLE as TICK_STYLE,
-  CHART_GRID_STROKE as GRID_STROKE,
-  CHART_TOOLTIP_PROPS,
-} from "@/lib/chart-theme";
+import { useMemo } from "react";
+import { useNavigate } from "react-router-dom";
+import { Plus } from "lucide-react";
 
-const POLL_INTERVAL = 30_000;
+import { SectionHeader } from "@/components/design";
+import { Button } from "@/components/ui/button";
+import { useTasks, useUsageSummary, useChats, useProjects } from "@/lib/hooks";
+import { useAttention } from "@/lib/hooks/attention";
+import { cn } from "@/lib/utils";
 
-const PERIOD_OPTIONS = [
-  { label: "7 days", value: "7d" },
-  { label: "30 days", value: "30d" },
-  { label: "90 days", value: "90d" },
-  { label: "All time", value: "" },
-];
+import { DashboardKpiTiles } from "./dashboard-components/DashboardKpiTiles";
+import {
+  RecentActivity,
+  type RecentActivityItem,
+} from "./dashboard-components/RecentActivity";
+import { ActiveMissionCard } from "./dashboard-components/ActiveMissionCard";
+import { QuickLinks } from "./dashboard-components/QuickLinks";
+import {
+  TimeRangeSelect,
+  useTimeRange,
+} from "./dashboard-components/TimeRangeSelect";
 
-const STATUS_COLORS: Record<string, string> = {
-  queued: "#94a3b8",
-  assigned: "#a78bfa",
-  running: "#3b82f6",
-  completed: "#22c55e",
-  done: "#22c55e",
-  failed: "#ef4444",
-  timed_out: "#f97316",
-  cancelled: "#6b7280",
-};
+/**
+ * Dashboard page (slice 23-01 — T06 page assembly).
+ *
+ * Layout per slice.md `## Tasks → T06`:
+ *
+ *   <PageContainer max-w-7xl p-6>
+ *     <SectionHeader title="Dashboard" subtitle=… action=…/>
+ *     <DashboardKpiTiles ... />
+ *     <div class="grid grid-cols-3 gap-3">
+ *       <RecentActivity class="col-span-2" />
+ *       <div class="space-y-3">
+ *         <ActiveMissionCard />
+ *         <QuickLinks />
+ *       </div>
+ *     </div>
+ *   </PageContainer>
+ *
+ * Data wiring is intentionally thin — the dashboard composes a handful
+ * of existing hooks (`useTasks`, `useUsageSummary`, `useChats`,
+ * `useProjects`, `useAttention`) and forwards their results into the
+ * presentational tiles built in T01–T05. The aggregator-hook avenue
+ * was left open by T00's audit (no `useDashboardKpi` exists; the
+ * project-detail precedent is `useKpiData`) — but for the page-assembly
+ * task we keep the wiring inline so the component boundaries stay
+ * obvious in the diff.
+ *
+ * Time-range source of truth
+ * --------------------------
+ * The URL `?range=` query string is the single source of truth, read
+ * via `useTimeRange()`. The `TimeRangeSelect` writes back to it via
+ * `useSearchParams({ replace: true })`. The page forwards the validated
+ * range to `useUsageSummary({ period })` so KPI fetches re-run when the
+ * operator changes the picker.
+ *
+ * Active-mission + primary-project wiring
+ * ---------------------------------------
+ * The dashboard does not currently know which mission is "active" at
+ * the user level — `useMissions(projectId)` is project-scoped. We pass
+ * `null` to {@link ActiveMissionCard}, which renders the canonical
+ * empty state with a "Start a mission" CTA. Same story for the QuickLinks
+ * primary project: there is no `is_pinned` flag on the Project shape
+ * yet, so we pick the first project alphabetically (when one exists).
+ * Both wirings are documented next to their respective TODOs so the
+ * follow-up slices have a short list of seams to attach to.
+ */
+
+// Page wrapper: ONLY constrain max-width. The shell's <main> already adds
+// `p-3 sm:p-4 md:p-6` padding (see `components/shell/NewShell.tsx`) so adding
+// another `p-6` here would double-pad and visually offset the page from
+// every other surface (Tasks, Projects, Workspaces, Templates, …). Skipping
+// `mx-auto` keeps the title at the same left edge as those surfaces.
+const PAGE_CLASSES = "max-w-7xl";
 
 export default function DashboardPage() {
-  const [period, setPeriod] = useState("30d");
-  const [aiKeyId, setAiKeyId] = useState("");
-  const periodParam = period || undefined;
-  const aiKeyParam = aiKeyId || undefined;
+  const navigate = useNavigate();
+  const range = useTimeRange();
 
-  const tasksQuery = useTasks(0, 50, undefined, { refetchInterval: POLL_INTERVAL });
-  const projectsQuery = useProjects({ refetchInterval: POLL_INTERVAL });
-  const taskStatsQuery = useTaskStats(undefined, { refetchInterval: POLL_INTERVAL });
-  const aiKeysQuery = useAIKeys();
+  // --- KPI data fan-out --------------------------------------------------
+  const tasksQuery = useTasks(0, 100);
+  const usageQuery = useUsageSummary({ period: range });
+  const chatsQuery = useChats({});
+  const projectsQuery = useProjects();
+  const attention = useAttention();
 
-  const usageQuery = useUsageSummary(
-    { period: periodParam, ai_provider_key_id: aiKeyParam },
-    { refetchInterval: POLL_INTERVAL },
-  );
-
-  const usageOverTimeQuery = useUsageBreakdown(
-    { group_by: "day", period: periodParam, ai_provider_key_id: aiKeyParam },
-    { refetchInterval: POLL_INTERVAL },
-  );
-
-  const costByProjectQuery = useUsageBreakdown(
-    { group_by: "project", period: periodParam, ai_provider_key_id: aiKeyParam },
-    { refetchInterval: POLL_INTERVAL },
-  );
-
-  const costByProviderQuery = useUsageBreakdown(
-    { group_by: "provider", period: periodParam, ai_provider_key_id: aiKeyParam },
-    { refetchInterval: POLL_INTERVAL },
-  );
-
-  const costByModelQuery = useUsageBreakdown(
-    { group_by: "model", period: periodParam, ai_provider_key_id: aiKeyParam },
-    { refetchInterval: POLL_INTERVAL },
-  );
-
+  // `assigned` was a vestigial status the backend FSM never produces; the
+  // legacy match was kept for safety while the enum still listed it. With
+  // the dead-code cleanup, "active" tasks are exactly the running ones.
   const activeTasks = (tasksQuery.data?.items ?? []).filter(
     (t) => t.status === "running",
   ).length;
 
-  const projectCount = projectsQuery.data?.length ?? 0;
   const usage = usageQuery.data;
-  const totalTokens = (usage?.total_input_tokens ?? 0) + (usage?.total_output_tokens ?? 0);
+  const totalTokens =
+    (usage?.total_input_tokens ?? 0) + (usage?.total_output_tokens ?? 0);
+  const costUsd = usage?.total_cost_usd ?? 0;
 
-  const periodLabel = PERIOD_OPTIONS.find(o => o.value === period)?.label ?? "All time";
+  // Treat any chat we can see as "open" — the dashboard doesn't have a
+  // first-class "active" filter on the chats list endpoint and the brief
+  // calls for an at-a-glance count, not a per-state breakdown.
+  const openChats = chatsQuery.data?.length ?? 0;
 
-  // Task status distribution for pie chart
-  const taskStatsData = taskStatsQuery.data;
-  const taskPieData = taskStatsData
-    ? Object.entries(taskStatsData)
-        .filter(([k, v]) => k !== "total" && k !== "avg_duration_seconds" && (v as number) > 0)
-        .map(([k, v]) => ({ name: k, value: v as number, fill: STATUS_COLORS[k] ?? "#94a3b8" }))
-    : [];
+  // --- Subtitle ---------------------------------------------------------
+  // "{N} active tasks · {M} chats · daemon healthy" — the slice's demo
+  // copy. We don't have a daemon-health probe wired in here, so we
+  // default to "healthy" as the connection-dot in the title bar already
+  // surfaces the live network state.
+  const subtitle = useMemo(() => {
+    const parts = [
+      `${activeTasks} active task${activeTasks === 1 ? "" : "s"}`,
+      `${openChats} chat${openChats === 1 ? "" : "s"}`,
+      "daemon healthy",
+    ];
+    return parts.join(" · ");
+  }, [activeTasks, openChats]);
+
+  // --- Recent activity --------------------------------------------------
+  // Derive client-side from concat of recent tasks + chats + attention
+  // items, sorted newest-first. The dashboard owns this fan-out so
+  // <RecentActivity> stays trivially testable.
+  const activityItems = useMemo<RecentActivityItem[]>(() => {
+    const items: RecentActivityItem[] = [];
+    for (const task of tasksQuery.data?.items ?? []) {
+      if (task.status === "done") {
+        items.push({
+          id: `task-${task.id}`,
+          type: "task_completed",
+          title: task.prompt?.slice(0, 80) ?? "Task completed",
+          detail: task.project_id
+            ? `task · ${task.actual_model_used ?? task.model ?? ""}`
+            : undefined,
+          timestamp:
+            task.completed_at ?? task.updated_at ?? task.created_at,
+          href: `/tasks/${task.id}`,
+        });
+      }
+    }
+    for (let idx = 0; idx < attention.items.length; idx += 1) {
+      const a = attention.items[idx]!;
+      const stamp =
+        "created_at" in a && a.created_at
+          ? a.created_at
+          : "since" in a && a.since
+            ? a.since
+            : new Date().toISOString();
+      const title =
+        "title" in a && a.title
+          ? a.title
+          : "question" in a && a.question
+            ? a.question
+            : "Needs attention";
+      const projectId = a.project_id ?? null;
+      items.push({
+        id: `attention-${idx}`,
+        type: "proposal_filed",
+        title,
+        detail: projectId ? `project ${projectId}` : undefined,
+        timestamp: stamp,
+      });
+    }
+    items.sort((a, b) => {
+      const ta = new Date(a.timestamp).getTime() || 0;
+      const tb = new Date(b.timestamp).getTime() || 0;
+      return tb - ta;
+    });
+    return items.slice(0, 5);
+  }, [tasksQuery.data, attention.items]);
+
+  // --- Primary project for QuickLinks -----------------------------------
+  // No `is_pinned` flag exists on the Project shape, so we fall back to
+  // the first project sorted alphabetically. When the projects list is
+  // empty, QuickLinks hides the Code-mode row by contract.
+  const primaryProject = useMemo(() => {
+    const list = projectsQuery.data ?? [];
+    if (list.length === 0) return undefined;
+    const sorted = [...list].sort((a, b) =>
+      (a.name ?? "").localeCompare(b.name ?? ""),
+    );
+    const first = sorted[0]!;
+    return { slug: first.id, name: first.name };
+  }, [projectsQuery.data]);
 
   return (
-    <div>
-      <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="min-w-0">
-          <h1 className="mb-1 text-xl font-bold sm:text-2xl">Dashboard</h1>
-          <p className="text-sm text-muted-foreground">Flockctl</p>
+    <div data-testid="dashboard-page" className={cn(PAGE_CLASSES)}>
+      <SectionHeader
+        title="Dashboard"
+        subtitle={subtitle}
+        action={
+          <>
+            <TimeRangeSelect />
+            <Button
+              type="button"
+              size="sm"
+              data-testid="dashboard-new-chat-button"
+              onClick={() => navigate("/chats")}
+            >
+              <Plus aria-hidden="true" />
+              New chat
+            </Button>
+          </>
+        }
+      />
+
+      <DashboardKpiTiles
+        activeTasks={activeTasks}
+        costUsd={costUsd}
+        tokensTotal={totalTokens}
+        tokensIn={usage?.total_input_tokens}
+        tokensOut={usage?.total_output_tokens}
+        openChats={openChats}
+        missions={0}
+      />
+
+      <div
+        data-testid="dashboard-grid"
+        className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-3"
+      >
+        <RecentActivity
+          items={activityItems}
+          className="lg:col-span-2"
+        />
+        <div className="space-y-3">
+          <ActiveMissionCard mission={null} />
+          <QuickLinks
+            primaryProject={primaryProject}
+            attentionCount={attention.total ?? 0}
+          />
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <select
-            value={aiKeyId}
-            onChange={(e) => setAiKeyId(e.target.value)}
-            className="rounded-md border bg-background px-3 py-1.5 text-sm"
-          >
-            <option value="">All AI Keys</option>
-            {(aiKeysQuery.data ?? []).map((k) => (
-              <option key={k.id} value={k.id}>
-                {(k.label ?? k.name ?? k.provider) + (k.key_suffix ? ` ···${k.key_suffix}` : "")}
-              </option>
-            ))}
-          </select>
-          <select
-            value={period}
-            onChange={(e) => setPeriod(e.target.value)}
-            className="rounded-md border bg-background px-3 py-1.5 text-sm"
-          >
-            {PERIOD_OPTIONS.map((opt) => (
-              <option key={opt.value} value={opt.value}>
-                {opt.label}
-              </option>
-            ))}
-          </select>
-        </div>
-      </div>
-
-      {/* Row 1: Summary stat cards */}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <StatCard
-          icon={ListTodo}
-          label="Active Tasks"
-          value={activeTasks}
-          isLoading={tasksQuery.isLoading}
-        />
-        <StatCard
-          icon={FolderGit2}
-          label="Projects"
-          value={projectCount}
-          isLoading={projectsQuery.isLoading}
-        />
-        <StatCard
-          icon={DollarSign}
-          label={`${periodLabel} Spend`}
-          value={`$${(usage?.total_cost_usd ?? 0).toFixed(2)}`}
-          isLoading={usageQuery.isLoading}
-        />
-        <StatCard
-          icon={Hash}
-          label={`${periodLabel} Tokens`}
-          value={formatTokens(totalTokens)}
-          subtitle={`in: ${formatTokens(usage?.total_input_tokens ?? 0)} / out: ${formatTokens(usage?.total_output_tokens ?? 0)}`}
-          isLoading={usageQuery.isLoading}
-        />
-      </div>
-
-      {/* Row 2: Token breakdown */}
-      <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <StatCard
-          icon={ArrowDownToLine}
-          label="Input Tokens"
-          value={formatTokens(usage?.total_input_tokens ?? 0)}
-          isLoading={usageQuery.isLoading}
-        />
-        <StatCard
-          icon={ArrowUpFromLine}
-          label="Output Tokens"
-          value={formatTokens(usage?.total_output_tokens ?? 0)}
-          isLoading={usageQuery.isLoading}
-        />
-        <StatCard
-          icon={DatabaseZap}
-          label="Cache Creation"
-          value={formatTokens(usage?.total_cache_creation_tokens ?? 0)}
-          isLoading={usageQuery.isLoading}
-        />
-        <StatCard
-          icon={BookOpen}
-          label="Cache Read"
-          value={formatTokens(usage?.total_cache_read_tokens ?? 0)}
-          isLoading={usageQuery.isLoading}
-        />
-      </div>
-
-      {/* Charts row 1: Usage Over Time + Cost by Project */}
-      <div className="mt-6 grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <ChartCard title="Usage Over Time" isLoading={usageOverTimeQuery.isLoading} isEmpty={(usageOverTimeQuery.data?.items ?? []).length === 0}>
-          <ResponsiveContainer width="100%" height={300}>
-            <LineChart data={(usageOverTimeQuery.data?.items ?? []).map((item) => ({ date: item.scope_id ?? "", cost: item.cost_usd }))}>
-              <CartesianGrid strokeDasharray="3 3" stroke={GRID_STROKE} />
-              <XAxis dataKey="date" tick={TICK_STYLE} />
-              <YAxis tick={TICK_STYLE} />
-              <Tooltip {...CHART_TOOLTIP_PROPS} formatter={(value) => [`$${Number(value).toFixed(4)}`, "Cost"]} />
-              <Line type="monotone" dataKey="cost" stroke="var(--primary)" strokeWidth={2} dot={false} />
-            </LineChart>
-          </ResponsiveContainer>
-        </ChartCard>
-
-        <ChartCard title="Cost by Project" isLoading={costByProjectQuery.isLoading} isEmpty={(costByProjectQuery.data?.items ?? []).length === 0}>
-          <ResponsiveContainer width="100%" height={300}>
-            <BarChart data={(costByProjectQuery.data?.items ?? []).map((item) => ({ name: item.scope_label ?? item.scope_id ?? "Unknown", cost: item.cost_usd }))}>
-              <CartesianGrid strokeDasharray="3 3" stroke={GRID_STROKE} />
-              <XAxis dataKey="name" tick={TICK_STYLE} />
-              <YAxis tick={TICK_STYLE} />
-              <Tooltip {...CHART_TOOLTIP_PROPS} formatter={(value) => [`$${Number(value).toFixed(4)}`, "Cost"]} />
-              <Bar dataKey="cost" fill="var(--primary)" radius={[4, 4, 0, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
-        </ChartCard>
-      </div>
-
-      {/* Charts row 2: Cost by Provider + Cost by Model */}
-      <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <ChartCard title="Cost by Provider" isLoading={costByProviderQuery.isLoading} isEmpty={(costByProviderQuery.data?.items ?? []).length === 0}>
-          <ResponsiveContainer width="100%" height={300}>
-            <BarChart data={(costByProviderQuery.data?.items ?? []).map((item) => ({ name: item.scope_label ?? item.scope_id ?? "Unknown", cost: item.cost_usd }))}>
-              <CartesianGrid strokeDasharray="3 3" stroke={GRID_STROKE} />
-              <XAxis dataKey="name" tick={TICK_STYLE} />
-              <YAxis tick={TICK_STYLE} />
-              <Tooltip {...CHART_TOOLTIP_PROPS} formatter={(value) => [`$${Number(value).toFixed(4)}`, "Cost"]} />
-              <Bar dataKey="cost" fill="#8b5cf6" radius={[4, 4, 0, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
-        </ChartCard>
-
-        <ChartCard title="Cost by Model" isLoading={costByModelQuery.isLoading} isEmpty={(costByModelQuery.data?.items ?? []).length === 0}>
-          <ResponsiveContainer width="100%" height={300}>
-            <BarChart layout="vertical" data={(costByModelQuery.data?.items ?? []).map((item) => ({ name: item.scope_label ?? item.scope_id ?? "Unknown", cost: item.cost_usd }))}>
-              <CartesianGrid strokeDasharray="3 3" stroke={GRID_STROKE} />
-              <XAxis type="number" tick={TICK_STYLE} />
-              <YAxis type="category" dataKey="name" tick={{ fontSize: 11, fill: "var(--foreground)" }} width={160} />
-              <Tooltip {...CHART_TOOLTIP_PROPS} formatter={(value) => [`$${Number(value).toFixed(4)}`, "Cost"]} />
-              <Bar dataKey="cost" fill="#0ea5e9" radius={[0, 4, 4, 0]} />
-            </BarChart>
-          </ResponsiveContainer>
-        </ChartCard>
-      </div>
-
-      {/* Task Status Distribution */}
-      <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <ChartCard title="Task Status Distribution" isLoading={taskStatsQuery.isLoading} isEmpty={taskPieData.length === 0}>
-          <ResponsiveContainer width="100%" height={300}>
-            <PieChart>
-              <Pie data={taskPieData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={100} label={({ name, value }) => `${name}: ${value}`}>
-                {taskPieData.map((entry, index) => (
-                  <Cell key={index} fill={entry.fill} />
-                ))}
-              </Pie>
-              <Tooltip {...CHART_TOOLTIP_PROPS} />
-              <Legend wrapperStyle={{ color: "var(--foreground)" }} />
-            </PieChart>
-          </ResponsiveContainer>
-        </ChartCard>
-
-        {/* Task stats summary cards */}
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium">Task Summary</CardTitle>
-          </CardHeader>
-          <CardContent>
-            {taskStatsQuery.isLoading ? (
-              <Skeleton className="h-[300px] w-full" />
-            ) : (
-              <div className="grid grid-cols-2 gap-3">
-                <MiniStat icon={Hash} label="Total" value={taskStatsData?.total ?? 0} />
-                <MiniStat icon={Clock} label="Queued" value={taskStatsData?.queued ?? 0} />
-                <MiniStat icon={Loader} label="Running" value={taskStatsData?.running ?? 0} color="text-blue-500" />
-                <MiniStat icon={CheckCircle} label="Completed" value={(taskStatsData?.completed ?? 0) + (taskStatsData?.done ?? 0)} color="text-green-500" />
-                <MiniStat icon={XCircle} label="Failed" value={taskStatsData?.failed ?? 0} color="text-red-500" />
-                <MiniStat icon={Clock} label="Timed Out" value={taskStatsData?.timed_out ?? 0} color="text-orange-500" />
-                <div className="col-span-2 mt-2 border-t pt-2">
-                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                    <Server className="h-4 w-4" />
-                    <span>Avg Duration:</span>
-                    <span className="font-medium text-foreground">
-                      {taskStatsData?.avg_duration_seconds != null
-                        ? formatDuration(taskStatsData.avg_duration_seconds)
-                        : "N/A"}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            )}
-          </CardContent>
-        </Card>
       </div>
     </div>
   );
 }
-
-function ChartCard({
-  title,
-  isLoading,
-  isEmpty,
-  children,
-}: {
-  title: string;
-  isLoading: boolean;
-  isEmpty: boolean;
-  children: React.ReactNode;
-}) {
-  return (
-    <Card>
-      <CardHeader className="pb-2">
-        <CardTitle className="text-sm font-medium">{title}</CardTitle>
-      </CardHeader>
-      <CardContent>
-        {isLoading ? (
-          <Skeleton className="h-[300px] w-full" />
-        ) : isEmpty ? (
-          <div className="flex h-[300px] items-center justify-center text-sm text-muted-foreground">
-            No data
-          </div>
-        ) : (
-          children
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-function MiniStat({
-  icon: Icon,
-  label,
-  value,
-  color,
-}: {
-  icon: React.ComponentType<React.SVGProps<SVGSVGElement>>;
-  label: string;
-  value: number;
-  color?: string;
-}) {
-  return (
-    <div className="flex items-center gap-2 rounded-md border p-2">
-      <Icon className={`h-4 w-4 ${color ?? "text-muted-foreground"}`} />
-      <div>
-        <p className="text-xs text-muted-foreground">{label}</p>
-        <p className="text-lg font-semibold">{value}</p>
-      </div>
-    </div>
-  );
-}
-

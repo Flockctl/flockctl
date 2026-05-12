@@ -1,20 +1,13 @@
 import type { Hono } from "hono";
-import { z } from "zod";
 import { getDb } from "../../db/index.js";
 import { chats, chatMessages, chatTodos } from "../../db/schema.js";
 import { eq, sql, desc, and, isNull } from "drizzle-orm";
 import { paginationParams } from "../../lib/pagination.js";
 import { NotFoundError, ValidationError } from "../../lib/errors.js";
+import { parseIdParam } from "../../lib/route-params.js";
 import { computeCounts, type Todo } from "../../services/todo-store.js";
 import { parseTodosJson } from "./helpers.js";
 import { getChatOrThrow } from "../../lib/db-helpers.js";
-
-// ─── Todos ──────────────────────────────────────────────────────────────────
-// Zod-validated `:id` path param. Same pattern as `attachmentIdParamSchema`
-// above — keeps ValidationError (422) separate from NotFoundError (404).
-export const todosIdParamSchema = z.object({
-  id: z.coerce.number().int().positive(),
-});
 
 /**
  * Sentinel agent key used by /chats/:id/todos/{agents,history?agent=…} to
@@ -99,10 +92,17 @@ export function annotateCompletedAt(
  *  when no matching Task message can be resolved (legacy rows, sub-agent
  *  spawned by something other than Task, or the sub-agent's parent is
  *  outside the inspected chat). */
-function resolveTaskMeta(
+/**
+ * Build a `Map<parentToolUseId, meta>` by scanning every `role='tool'`
+ * message in a chat exactly once. Replaces an O(subAgents × messages)
+ * pattern where each sub-agent re-parsed the full tool transcript
+ * looking for its parent Task call. Skips messages that don't parse
+ * as JSON or that don't describe a `Task` tool call.
+ */
+function buildTaskMetaIndex(
   toolMessages: Array<{ content: string }>,
-  parentToolUseId: string,
-): { label: string | null; subagentType: string | null } {
+): Map<string, { label: string | null; subagentType: string | null }> {
+  const index = new Map<string, { label: string | null; subagentType: string | null }>();
   for (const m of toolMessages) {
     let parsed: any;
     try {
@@ -111,13 +111,18 @@ function resolveTaskMeta(
       continue;
     }
     if (parsed?.kind !== "call" || parsed?.name !== "Task") continue;
-    if (parsed?.tool_use_id !== parentToolUseId) continue;
+    const toolUseId = parsed?.tool_use_id;
+    if (typeof toolUseId !== "string" || toolUseId.length === 0) continue;
+    // First-wins: agents emit one canonical `Task` call per spawn; if
+    // a duplicate id appears (re-run / retry), the earlier label is
+    // the operator-visible one we want to keep.
+    if (index.has(toolUseId)) continue;
     const input = parsed.input ?? {};
     const description = typeof input.description === "string" ? input.description : null;
     const subagentType = typeof input.subagent_type === "string" ? input.subagent_type : null;
-    return { label: description, subagentType };
+    index.set(toolUseId, { label: description, subagentType });
   }
-  return { label: null, subagentType: null };
+  return index;
 }
 
 export function registerChatTodos(router: Hono): void {
@@ -125,9 +130,7 @@ export function registerChatTodos(router: Hono): void {
   // pre-computed counts. Returns 204 when the chat exists but has never
   // received a TodoWrite call; 404 when the chat itself is unknown.
   router.get("/:id/todos", (c) => {
-    const paramParse = todosIdParamSchema.safeParse({ id: c.req.param("id") });
-    if (!paramParse.success) throw new ValidationError("invalid chat id");
-    const chatId = paramParse.data.id;
+    const chatId = parseIdParam(c);
 
     const db = getDb();
     getChatOrThrow(chatId);
@@ -161,9 +164,7 @@ export function registerChatTodos(router: Hono): void {
   // a single agent's timeline. Without the filter the response collapses
   // sub-agents into the main feed (legacy callers stay byte-identical).
   router.get("/:id/todos/history", (c) => {
-    const paramParse = todosIdParamSchema.safeParse({ id: c.req.param("id") });
-    if (!paramParse.success) throw new ValidationError("invalid chat id");
-    const chatId = paramParse.data.id;
+    const chatId = parseIdParam(c);
 
     const db = getDb();
     getChatOrThrow(chatId);
@@ -225,9 +226,7 @@ export function registerChatTodos(router: Hono): void {
   // latest snapshot, snapshot count, and a human label resolved by joining
   // back to the spawning Task call in chat_messages.
   router.get("/:id/todos/agents", (c) => {
-    const paramParse = todosIdParamSchema.safeParse({ id: c.req.param("id") });
-    if (!paramParse.success) throw new ValidationError("invalid chat id");
-    const chatId = paramParse.data.id;
+    const chatId = parseIdParam(c);
 
     const db = getDb();
     getChatOrThrow(chatId);
@@ -278,16 +277,16 @@ export function registerChatTodos(router: Hono): void {
     // distinct sub-agents. Limited to role='tool' so we don't deserialise
     // every assistant turn.
     const subAgentIds = [...byAgent.keys()].filter((k) => k !== MAIN_AGENT_KEY);
-    const taskMeta = new Map<string, { label: string | null; subagentType: string | null }>();
+    let taskMeta = new Map<string, { label: string | null; subagentType: string | null }>();
     if (subAgentIds.length > 0) {
       const toolMessages = db
         .select({ content: chatMessages.content })
         .from(chatMessages)
         .where(and(eq(chatMessages.chatId, chatId), eq(chatMessages.role, "tool")))
         .all();
-      for (const id of subAgentIds) {
-        taskMeta.set(id, resolveTaskMeta(toolMessages, id));
-      }
+      // One scan, one index — replaces the O(subAgents × messages)
+      // re-parse pattern that audit-round-2 finding #2 flagged.
+      taskMeta = buildTaskMetaIndex(toolMessages);
     }
 
     const items: AgentSummary[] = [];
@@ -299,14 +298,20 @@ export function registerChatTodos(router: Hono): void {
       if (key === MAIN_AGENT_KEY) {
         label = "Main agent";
       } else {
+        // `key` is the parentToolUseId for sub-agent buckets; look it up
+        // in the index built above. Missing entry → legacy / imported
+        // chat with no Task call recorded in chat_messages.
         const meta = taskMeta.get(key);
         if (meta?.label) {
           label = meta.label;
           subagentType = meta.subagentType;
+        } else if (meta?.subagentType) {
+          // Task call found but with no `description`; fall back to the
+          // subagent type so the tab is still labelled by its purpose.
+          label = meta.subagentType;
+          subagentType = meta.subagentType;
         } else {
-          // Fallback when no Task call was found in chat_messages (legacy
-          // rows, or the chat was imported without tool history). Truncated
-          // to keep the tab strip readable — the full id is still in `key`
+          // Truncated id keeps the tab strip readable; full id is in `key`
           // for diagnostics.
           label = `Sub-agent ${key.slice(-6)}`;
         }

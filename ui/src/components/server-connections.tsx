@@ -127,7 +127,7 @@ export function AddServerForm({
   }
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-4">
+    <form onSubmit={handleSubmit} className="space-y-3">
       {/* 1. Name */}
       <div className="space-y-2">
         <Label htmlFor="server-name">
@@ -457,6 +457,7 @@ export function ServerConnectionsList() {
                         size="xs"
                         onClick={() => void testConnection()}
                         title="Test connection"
+                        aria-label={`Test connection to ${server.name}`}
                       >
                         <RotateCw className="h-3 w-3" />
                       </Button>
@@ -468,6 +469,7 @@ export function ServerConnectionsList() {
                           size="xs"
                           onClick={() => setEditing(server)}
                           title="Rename"
+                          aria-label={`Rename server ${server.name}`}
                         >
                           <PencilLine className="h-3 w-3" />
                         </Button>
@@ -477,6 +479,7 @@ export function ServerConnectionsList() {
                           className="text-destructive hover:text-destructive"
                           onClick={() => deleteConfirm.requestConfirm(server.id)}
                           title="Delete"
+                          aria-label={`Delete server ${server.name}`}
                         >
                           <Trash2 className="h-3 w-3" />
                         </Button>

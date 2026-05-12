@@ -19,6 +19,15 @@ Flockctl is a daemon that lets you plan work, run coding tasks on your own machi
 └─────────────────────────────┘
 ```
 
+## Screenshots
+
+| | |
+|:---:|:---:|
+| ![Dashboard](docs/screenshots/dashboard.png) | ![Project detail](docs/screenshots/project-detail.png) |
+| **Dashboard** — KPI tiles, active mission, recent activity. | **Project detail** — milestones, slices, and tasks at a glance. |
+| ![Chat conversation](docs/screenshots/chat-conversation.png) | ![Mission detail](docs/screenshots/mission-detail.png) |
+| **Chat conversation** — streamed messages, tool calls, and inline approval prompts. | **Mission detail** — proposals queue, budget bar, and supervisor event feed. |
+
 ## Why Flockctl
 
 - **Local-first by default.** Binds to `127.0.0.1` only; your code, API keys, and task history never leave your machine unless you opt in.

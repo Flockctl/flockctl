@@ -4,6 +4,7 @@ import { join } from "path";
 import { eq } from "drizzle-orm";
 import { getDb } from "../../db/index.js";
 import { projects, tasks, workspaces } from "../../db/schema.js";
+import { getProjectById } from "../../lib/db-helpers.js";
 import { getDefaultModel, getFlockctlHome } from "../../config/index.js";
 import {
   resolvePermissionMode,
@@ -13,6 +14,7 @@ import { buildCodebaseContext } from "../git-context.js";
 import { resolveTaskPrompt } from "../prompt-resolver.js";
 import { loadProjectConfig } from "../project-config.js";
 import { loadWorkspaceConfig } from "../workspace-config.js";
+import { createWorktree, WorktreeError } from "../worktree-manager.js";
 import type { KeySelection } from "../ai/key-selection.js";
 
 type TaskRow = typeof tasks.$inferSelect;
@@ -60,7 +62,7 @@ export async function buildTaskRunContext(
   // Always fetch project so we can read permission_mode / workspace link
   let projectRecord: ProjectRow | undefined;
   if (task.projectId) {
-    projectRecord = db.select().from(projects).where(eq(projects.id, task.projectId)).get();
+    projectRecord = getProjectById(task.projectId) ?? undefined;
   }
   let workspaceRecord: WorkspaceRow | undefined;
   if (projectRecord?.workspaceId) {
@@ -75,6 +77,43 @@ export async function buildTaskRunContext(
   // Ensure workingDir exists — spawn will ENOENT on missing cwd
   if (!existsSync(workingDir)) {
     mkdirSync(workingDir, { recursive: true });
+  }
+
+  // Worktree isolation. When `task.isolation === 'worktree'` AND we have
+  // a project path that is a git working tree, materialise (or reattach
+  // to) a per-task worktree under
+  // `<project>/.flockctl/worktrees/task-<id>/`, rewrite `workingDir` to
+  // point at it, and persist the path/branch on the task row so daemon
+  // restarts can find it. The createWorktree call is idempotent — a
+  // crash between creation and DB write surfaces here as `reused: true`
+  // on the next attempt.
+  //
+  // Silent fallback (with a logged warning) when the project is not a
+  // git repo or has no initial commit: the task still runs, just without
+  // isolation. Throwing here would convert "isolation requested but not
+  // possible" into a hard failure, which is more user-hostile than
+  // matching `claude --worktree`'s "fall back gracefully" stance.
+  if (task.isolation === "worktree" && projectRecord?.path) {
+    try {
+      const result = createWorktree({
+        projectPath: projectRecord.path,
+        ownerKind: "task",
+        ownerId: task.id,
+      });
+      workingDir = result.path;
+      // Persist immediately so a daemon restart between worktree
+      // creation and session start can re-attach without re-running git.
+      db.update(tasks)
+        .set({ worktreePath: result.path, worktreeBranch: result.branch })
+        .where(eq(tasks.id, task.id))
+        .run();
+    } catch (err) {
+      const code = err instanceof WorktreeError ? err.code : "unknown";
+      console.warn(
+        `[task-executor] task ${task.id} requested isolation='worktree' but ` +
+          `worktree creation failed (${code}); falling back to shared working dir`,
+      );
+    }
   }
 
   let gitCommitBefore: string | null = null;

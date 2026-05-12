@@ -5,7 +5,150 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] - 2026-05-12
+
+First minor release. Consolidates 46 commits since `0.0.4` into a single
+shipping cut: a full UI rewrite, per-task / per-chat Git worktree
+isolation, a new code-mode editor with first-class filesystem and Git
+operations, scheduled wakeups, and a wide refactor / hardening sweep
+across the backend.
+
+### Added
+- **Per-task and per-chat Git worktree isolation.** Tasks and chats can
+  now run inside a dedicated `git worktree` instead of the project's
+  primary working tree, so concurrent agent activity no longer contends
+  for the same checkout. Worktrees expose first-class **Apply** and
+  **Open PR** affordances on the chat detail page, refuse to delete
+  with unsaved changes (silent-delete bug fixed), and worktree-mode is
+  now the default flag on new templates with a row pill so the choice
+  is visible from the list view.
+- **Code-mode editor.** New full-page Monaco-backed editor with chunked
+  loading (fixes the long-standing Monaco bundle-chunking issue), file
+  tree, dirty-state tracking, and direct hand-off to the agent. Adds
+  filesystem operation primitives (`fs-operations.ts`) and Git
+  primitives (`git-operations.ts`) that both the editor and the agent
+  tools share.
+- **Scheduled wakeups.** Daemon-side cron primitive that fires
+  `wakeup` events at scheduled times (`src/services/wakeups/`); the
+  scheduler persists `nextFireTime` before arming the in-memory cron
+  so a daemon restart never drops a wakeup.
+- **Per-project Git commit + push + audit log.** New endpoints to
+  `git commit` and `git push` from the project / workspace detail
+  pages, plus a per-project audit log surfacing every Git operation
+  the daemon performed on the working tree.
+- **Workspace-scoped AI key allow-lists.** Workspace-only chats can
+  now be restricted to a curated subset of provider keys instead of
+  inheriting the full global key pool.
+- **Chat composer rewrite (M25).** Numbered drag-and-drop queue for
+  queued messages, batch-delete on the chat list, load-more pagination
+  for long histories, and a redesigned composer surface.
+- **Bottom-sheet create flows (M27).** Create Workspace, Create
+  Project, Create Template, Create Schedule and Create Task were
+  rewritten from modal dialogs to bottom-sheet surfaces with shared
+  primitives.
+- **Mission / Shell / Tokens-preview pages.** Three new top-level
+  pages in the UI shell, alongside the chat-queue overlay and many
+  cross-cutting subsystem polish passes.
+- **DB covering indexes** on hot foreign-key columns flagged by the
+  audit pass, plus a covering index on `task_logs (task_id, timestamp)`
+  for tail-log queries. Two new partial indexes
+  (`migrations/0061_tasks_schedules_partial_indexes.sql`,
+  `migrations/0062_plan_task_execution_index.sql`) targeting
+  scheduled-task lookups and the plan-task execution index.
+- **Per-page search** on the Schedules and Templates pages, with
+  unified page-wrapper primitives shared across list pages.
+- **Plan-task execution index** (`src/services/plan-store/execution-index.ts`)
+  for fast lookup of executable plan tasks.
+- **Bounded-string helper** (`src/lib/bounded-string.ts`) and shared
+  question-option parser (`src/services/agent-session/parse-question-options.ts`).
+- **Test coverage** for the previously 8%-covered `/wakeups` route
+  surface and the meta-branches route surface.
+
+### Changed
+- **UI: complete redesign** aligned with the prototype in
+  `.flockctl/plan/ui-prototype.html`. Inter + JetBrains Mono fonts,
+  explicit zinc/indigo palette, custom utilities (`divider-y`, `mono`,
+  `pulse-dot`, `agent-glow`, `sparkbar`, `bar`, `card-hover`,
+  `tab-active`, `editor-line`, `tok-*`, `diff-*`), flat reusable
+  primitives (`KpiTile`, `FlatCard`, `StatusPill`, `SegmentToggle`,
+  `SectionHeader`, `LiveDot`, `Sparkbar`). All 14 pages restyled.
+- **`metrics` route** now computes median plus per-task / per-chat
+  aggregates in SQL instead of in JavaScript — the daemon no longer
+  has to materialise every row to compute summary statistics.
+- **`config` and `wakeups` validation** moved from hand-rolled
+  validators to Zod schemas, matching the rest of the routing layer.
+- **Hono routes** are now typed with a proper `Context` generic
+  instead of `c: any`, and `throw AppError` replaces inline
+  `c.json(..., status)` error responses across the route layer.
+- **`db-helpers`** added non-throwing variants used by services that
+  prefer return-value error handling over exception flow; the
+  throwing variants are still available for the route layer.
+- **`paths`** helpers centralised into a single module so the
+  `.flockctl/<subdir>` layout has exactly one owner.
+- **`DEFAULT_DAEMON_PORT` (52077)** centralised into a single
+  constant; the daemon-client now consumes `isLoopbackBindHost` from
+  the middleware module instead of duplicating it.
+- **Markdown rendering** extracts code text via a shared helper for
+  block detection instead of two near-identical inline implementations.
+- **Bundled skills** bumped to `a170d9a` — picks up the rewritten
+  `agents-md-editing` skill.
+- **Audit-route helpers** unified pagination, parsing and error
+  helpers and removed dead exports flagged by the audit sweep.
+- **UI** de-duplicated `formatDuration` / `formatTimestamp` helpers,
+  removed dead `TaskStatus.assigned` branches, and synced the
+  frontend `TaskStatus` enum with the backend.
+
+### Fixed
+- **AI client unhang.** Chats no longer hang when the underlying SDK
+  returns an `error` result instead of throwing.
+- **Auto-executor cancellation.** The polling timer is now `unref()`'d
+  and cancellation flows through an `AbortSignal` so stop is reliably
+  observed by the next tick.
+- **CORS.** Refuse cross-origin requests when remote auth is enabled
+  but `corsOrigins` is empty — previously the empty list silently
+  allowed everything.
+- **Plan-store.** Slugs are now kebab-case, the PATCH whitelist is
+  complete, and frontmatter-less artefacts are ignored rather than
+  failing the whole reconcile pass.
+- **Routes.** Every `parseInt` now explicitly passes `radix=10`, `id`
+  query params are validated instead of silently filtering on `NaN`,
+  and every post-`UPDATE` re-fetch is wrapped with `requireRow` so a
+  missed row 500s instead of returning a phantom record.
+- **Fire-and-forget async paths** propagate errors instead of swallowing
+  them, and streams are explicitly closed on error.
+- **`fs-operations`.** `realRootCache` and `indexCache` are now bounded
+  with LRU eviction so a long-running daemon cannot leak memory
+  through path-resolution caches.
+
+### Performance
+- **SQLite write throughput ~2-3x.** `synchronous=NORMAL` pragma is
+  now set at boot; WAL mode + NORMAL is the standard combination for
+  durable-but-fast SQLite. Coupled with the new covering indexes the
+  daemon's write path is noticeably faster on chat-heavy projects.
+- **Audit sweep (8 rounds)** across backend + UI: removed accidental
+  O(n²) loops, switched several hot paths from per-row JS aggregation
+  to SQL aggregation, and tightened a number of cache lifetimes.
+
+### Security
+- **CORS hardening** (see Fixed).
+- **A11y + security** improvements rolled into the 8-round audit
+  sweep across backend + UI.
+
+### Removed
+- **`flockctl.ui.next` feature flag.** The new shell is now the
+  default and only shell.
+- **`OldLayout`, `ShellSwitch`** and dead `shadcn` primitives that no
+  longer have callers.
+- **`js-yaml` / `@types/js-yaml`** dropped from `package.json` — the
+  daemon no longer reads YAML at runtime (legacy YAML config migration
+  was removed in `0.0.1-rc.2`).
+
+### Internal
+- **E2E.** Git-dropdown Playwright specs fixed and visual baselines
+  added.
+- **Unused dependencies** dropped from `package.json`.
+- **Lint cache** wired up for `eslint src` so iterative lint is
+  faster locally.
 
 ## [0.0.4] - 2026-04-30
 

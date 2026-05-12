@@ -1,12 +1,12 @@
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { getDb } from "../db/index.js";
 import { usageRecords, projects, budgetLimits, chatMessages, chats, workspaces } from "../db/schema.js";
-import { eq, and, sql, desc, gte, lte, inArray } from "drizzle-orm";
+import { eq, and, sql, desc, gte, lte, inArray, type SQL } from "drizzle-orm";
 import { paginationParams } from "../lib/pagination.js";
 import { getBudgetSummary } from "../services/budget.js";
 import { BudgetScope, BudgetPeriod, BudgetAction } from "../lib/types.js";
 import { ValidationError, NotFoundError } from "../lib/errors.js";
-import { parseIdParam } from "../lib/route-params.js";
+import { parseIdParam, parseIdQuery, parseJsonBodySafe } from "../lib/route-params.js";
 
 export const usageRoutes = new Hono();
 
@@ -147,45 +147,70 @@ usageRoutes.get("/breakdown", (c) => {
     return c.json({ ...buildTotals(), items, page, perPage });
   }
 
-  // Default: individual records
-  const items = db.select().from(usageRecords).where(where).orderBy(desc(usageRecords.createdAt)).limit(perPage).offset(offset).all();
-  const total = db.select({ count: sql<number>`count(*)` }).from(usageRecords).where(where).get()?.count ?? 0;
+  // Default: individual records. Audit-round-4 finding: the previous
+  // shape ran TWO sequential queries — `SELECT items` + `SELECT count(*)`
+  // — both with the same WHERE filter. Collapsed into a single query
+  // using SQLite's `count(*) OVER ()` window function so the total
+  // rides on each item row without a second scan. The total is the
+  // same across all rows, so we read it from the first row (or 0 when
+  // the page is empty).
+  const rowsWithTotal = db
+    .select({
+      row: usageRecords,
+      totalCount: sql<number>`count(*) OVER ()`.as("total_count"),
+    })
+    .from(usageRecords)
+    .where(where)
+    .orderBy(desc(usageRecords.createdAt))
+    .limit(perPage)
+    .offset(offset)
+    .all();
+
+  const total = rowsWithTotal[0]?.totalCount ?? 0;
+  const items = rowsWithTotal.map((r) => r.row);
 
   return c.json({ items, total, page, perPage });
 });
 
-function buildFilters(c: any): any[] {
+function buildFilters(c: Context): SQL[] {
   const db = getDb();
-  const conditions: any[] = [];
-  const projectId = c.req.query("project_id");
-  const taskId = c.req.query("task_id");
-  const chatId = c.req.query("chat_id");
+  const conditions: SQL[] = [];
+  // Use parseIdQuery so a malformed `?project_id=abc` returns 422 instead
+  // of silently filtering everything out via `WHERE col = NaN`.
+  const projectId = parseIdQuery(c, "project_id");
+  const taskId = parseIdQuery(c, "task_id");
+  const chatId = parseIdQuery(c, "chat_id");
+  const workspaceId = parseIdQuery(c, "workspace_id");
+  const aiProviderKeyId = parseIdQuery(c, "ai_provider_key_id");
   const provider = c.req.query("provider");
   const model = c.req.query("model");
   const dateFrom = c.req.query("date_from");
   const dateTo = c.req.query("date_to");
   const period = c.req.query("period");
-  const workspaceId = c.req.query("workspace_id");
-  const aiProviderKeyId = c.req.query("ai_provider_key_id");
 
-  if (projectId) conditions.push(eq(usageRecords.projectId, parseInt(projectId)));
-  if (taskId) conditions.push(eq(usageRecords.taskId, parseInt(taskId)));
-  if (chatId) conditions.push(eq(usageRecords.chatMessageId, parseInt(chatId)));
+  if (projectId !== undefined) conditions.push(eq(usageRecords.projectId, projectId));
+  if (taskId !== undefined) conditions.push(eq(usageRecords.taskId, taskId));
+  if (chatId !== undefined) conditions.push(eq(usageRecords.chatMessageId, chatId));
   if (provider) conditions.push(eq(usageRecords.provider, provider));
   if (model) conditions.push(eq(usageRecords.model, model));
   if (dateFrom) conditions.push(gte(usageRecords.createdAt, dateFrom));
   if (dateTo) conditions.push(lte(usageRecords.createdAt, dateTo));
 
-  if (aiProviderKeyId) {
-    conditions.push(eq(usageRecords.aiProviderKeyId, parseInt(aiProviderKeyId)));
+  if (aiProviderKeyId !== undefined) {
+    conditions.push(eq(usageRecords.aiProviderKeyId, aiProviderKeyId));
   }
 
-  // Period shorthand: "30d", "7d", "90d" etc.
-  if (period) {
+  // Period shorthand: "30d", "7d", "90d" etc. Cap input length defensively
+  // — see `metrics.ts::buildDateFilters` for the same rationale.
+  if (period && period.length <= 16) {
     const match = period.match(/^(\d+)([dhm])$/);
     if (match) {
-      const amount = parseInt(match[1]);
-      const unit = match[2];
+      // Capture groups are guaranteed populated — the regex matched
+      // with two parenthesised groups, so `match[1]` / `match[2]` are
+      // never undefined here. Non-null assertions silence strict-mode
+      // TS without a redundant guard.
+      const amount = parseInt(match[1]!, 10);
+      const unit = match[2]!;
       const now = new Date();
       if (unit === "d") now.setDate(now.getDate() - amount);
       else if (unit === "h") now.setHours(now.getHours() - amount);
@@ -195,10 +220,10 @@ function buildFilters(c: any): any[] {
   }
 
   // Workspace filter: find all project IDs in the workspace
-  if (workspaceId) {
+  if (workspaceId !== undefined) {
     const wsProjects = db.select({ id: projects.id })
       .from(projects)
-      .where(eq(projects.workspaceId, parseInt(workspaceId)))
+      .where(eq(projects.workspaceId, workspaceId))
       .all();
     const projectIds = wsProjects.map(p => p.id);
     if (projectIds.length > 0) {
@@ -221,7 +246,7 @@ usageRoutes.get("/budgets", (c) => {
 
 // POST /usage/budgets — create a budget limit
 usageRoutes.post("/budgets", async (c) => {
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
   const { scope, scopeId, period, limitUsd, action } = body;
 
   const validScopes = Object.values(BudgetScope);
@@ -256,7 +281,7 @@ usageRoutes.post("/budgets", async (c) => {
 // PATCH /usage/budgets/:id — update a budget limit
 usageRoutes.patch("/budgets/:id", async (c) => {
   const id = parseIdParam(c);
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
   const db = getDb();
 
   const existing = db.select().from(budgetLimits).where(eq(budgetLimits.id, id)).get();

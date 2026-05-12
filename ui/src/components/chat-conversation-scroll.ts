@@ -66,11 +66,31 @@ export function useChatScroll(chatId: string | null) {
    * push scroll-to-tail (e.g. message count, live block length, streamed
    * delta lengths). Safe to call unconditionally — it no-ops when the user
    * has scrolled up.
+   *
+   * Uses a double `requestAnimationFrame` so the jump happens *after* the
+   * browser has painted whatever the parent's render just produced. The
+   * single-rAF version misses scrollHeight changes from late-rendering
+   * markdown / code blocks on the very first paint of a freshly-opened
+   * chat — which is the most visible failure mode (you click a chat,
+   * the messages appear, but the view is anchored at the top instead of
+   * the latest reply). Two frames is enough for layout to settle.
    */
   const autoScrollToTail = useCallback(() => {
-    if (!userScrolledUp.current && scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
+    if (userScrolledUp.current) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    requestAnimationFrame(() => {
+      if (userScrolledUp.current) return;
+      const cur = scrollRef.current;
+      if (!cur) return;
+      requestAnimationFrame(() => {
+        if (userScrolledUp.current) return;
+        const fin = scrollRef.current;
+        if (!fin) return;
+        fin.scrollTop = fin.scrollHeight;
+      });
+    });
   }, []);
 
   return {

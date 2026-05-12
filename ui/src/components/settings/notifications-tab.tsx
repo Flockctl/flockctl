@@ -95,7 +95,7 @@ export function NotificationsTab(): React.JSX.Element {
     };
 
   return (
-    <div className="space-y-6" data-testid="notifications-tab">
+    <div className="space-y-4" data-testid="notifications-tab">
       <PermissionStatusRow status={permStatus} />
       <LeaderStatusRow />
 

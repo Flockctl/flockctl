@@ -48,10 +48,27 @@ const metaMock: { data: any } = {
 const projectAllowedKeysMock: { data: any } = {
   data: { allowedKeyIds: null, source: "none" },
 };
+// Workspace-only chats use this in place of the project allow-list. The
+// chat-conversation guard only fires the workspace fetch when the chat
+// has a workspaceId AND no projectId, so the default "no restriction"
+// payload is a safe baseline for every test that pins a project.
+const workspaceAllowedKeysMock: { data: any } = {
+  data: { allowedKeyIds: null, source: "none" },
+};
+
+// Captures the most recent `useChatStream` options so tests can pin down
+// what ChatConversation passed in (chatId, serverBusy). Reset in
+// beforeEach. Lets us assert on cooperation with the runner without
+// rendering React hooks ourselves.
+const streamHookOpts: { last: { chatId?: string | null; serverBusy?: boolean } | null } =
+  { last: null };
 
 vi.mock("@/lib/hooks", () => ({
   useChat: () => ({ data: chatDetail, isLoading: chatLoading }),
-  useChatStream: () => streamMocks,
+  useChatStream: (opts?: { chatId?: string | null; serverBusy?: boolean }) => {
+    streamHookOpts.last = opts ?? {};
+    return streamMocks;
+  },
   useChatEventStream: () => eventStreamMocks,
   useAgentQuestions: () => agentQuestionMocks,
   useAnswerAgentQuestion: () => ({ mutateAsync: vi.fn() }),
@@ -70,6 +87,7 @@ vi.mock("@/lib/hooks", () => ({
   // can mutate `projectAllowedKeysMock.data` to simulate loading / fetched
   // states.
   useProjectAllowedKeys: () => projectAllowedKeysMock,
+  useWorkspaceAllowedKeys: () => workspaceAllowedKeysMock,
   useMeta: () => metaMock,
 }));
 
@@ -101,6 +119,7 @@ beforeEach(() => {
   streamMocks.removeFromQueue.mockReset();
   streamMocks.clearQueue.mockReset();
   streamMocks.clearChat.mockReset();
+  streamHookOpts.last = null;
   eventStreamMocks.permissionRequests = [];
   eventStreamMocks.sessionRunning = false;
   agentQuestionMocks.question = null;
@@ -114,6 +133,7 @@ beforeEach(() => {
     defaults: { model: "claude-sonnet-4-6", key_id: 1 },
   };
   projectAllowedKeysMock.data = { allowedKeyIds: null, source: "none" };
+  workspaceAllowedKeysMock.data = { allowedKeyIds: null, source: "none" };
 });
 
 function renderConversation(
@@ -333,12 +353,93 @@ describe("ChatConversation", () => {
     ];
     renderConversation();
     const bar = screen.getByTestId("chat-queued-bar");
-    expect(bar.textContent).toContain("Queued (2)");
+    // M25 redesign — header reads "<N> queued · runs after current turn"
+    // and each row carries its position badge (#1, #2). The pre-M25
+    // "Queued (N)" copy is gone; the count is embedded in a sentence.
+    expect(bar.textContent).toContain("2 queued");
+    expect(bar.textContent).toContain("runs after current turn");
     const items = screen.getAllByTestId("chat-queued-item");
     expect(items).toHaveLength(2);
     const removes = screen.getAllByTestId("chat-queued-remove");
     await user.click(removes[0]!);
     expect(streamMocks.removeFromQueue).toHaveBeenCalledWith("queued-1");
+  });
+
+  it("REGRESSION: passes chatId to useChatStream so the queue is keyed correctly (runner cooperation)", () => {
+    chatDetail = { id: "c-1", messages: [] };
+    chatLoading = false;
+    eventStreamMocks.sessionRunning = false;
+    renderConversation();
+    expect(streamHookOpts.last?.chatId).toBe("c-1");
+  });
+
+  it("REGRESSION: serverBusy=true while chatDetail is still loading (prevents drain race on first mount)", () => {
+    // Reproducer: on first chat mount, `useChat` is still fetching so
+    // `chatDetail` is undefined and `is_running` is unknown. Without
+    // gating on `chatLoading` here, `serverBusy` would resolve to
+    // `false` and the drain effect could fire optimistically — opening
+    // a parallel turn next to whatever the daemon was actually doing.
+    chatDetail = null;
+    chatLoading = true;
+    eventStreamMocks.sessionRunning = null as unknown as boolean; // WS not yet connected
+    renderConversation();
+    expect(streamHookOpts.last?.serverBusy).toBe(true);
+  });
+
+  it("REGRESSION: serverBusy=true when sessionRunning is true even if chatDetail.is_running is false", () => {
+    // The OR semantics matter: a stale `is_running=false` from cache
+    // must not override a live `sessionRunning=true` WS frame.
+    chatDetail = { id: "c-1", is_running: false, messages: [] };
+    chatLoading = false;
+    eventStreamMocks.sessionRunning = true;
+    renderConversation();
+    expect(streamHookOpts.last?.serverBusy).toBe(true);
+  });
+
+  it("REGRESSION: serverBusy=true when chatDetail.is_running is true even if sessionRunning is false", () => {
+    chatDetail = { id: "c-1", is_running: true, messages: [] };
+    chatLoading = false;
+    eventStreamMocks.sessionRunning = false;
+    renderConversation();
+    expect(streamHookOpts.last?.serverBusy).toBe(true);
+  });
+
+  it("REGRESSION: serverBusy=false only when ALL signals say idle", () => {
+    chatDetail = { id: "c-1", is_running: false, messages: [] };
+    chatLoading = false;
+    eventStreamMocks.sessionRunning = false;
+    renderConversation();
+    expect(streamHookOpts.last?.serverBusy).toBe(false);
+  });
+
+  it("'Clear all' button on the queued-messages bar calls clearQueue (BUG #4 / #5)", async () => {
+    // Regression: before the fix, the queue could only be drained one entry
+    // at a time via the per-chip ✕. Pressing Stop on the composer aborted
+    // the in-flight turn but left the queue intact, so users had no way to
+    // bail out of a long line of follow-ups they no longer wanted. The new
+    // "Clear all" button on the queue bar wires up the previously unused
+    // `clearQueue` helper.
+    const user = userEvent.setup();
+    chatDetail = { id: "c-1", messages: [] };
+    streamMocks.queuedMessages = [
+      { id: "queued-1", chatId: "c-1", data: { content: "first" } },
+      { id: "queued-2", chatId: "c-1", data: { content: "second" } },
+      { id: "queued-3", chatId: "c-1", data: { content: "third" } },
+    ];
+    renderConversation();
+    // M25 redesign — header now reads "3 queued · runs after current turn"
+    // (with the count baked into the sentence), not the pre-M25
+    // "Queued (3)" prefix.
+    expect(screen.getByTestId("chat-queued-bar").textContent).toContain(
+      "3 queued",
+    );
+    const clearBtn = screen.getByTestId("chat-queued-clear");
+    expect(clearBtn).toBeTruthy();
+    await user.click(clearBtn);
+    expect(streamMocks.clearQueue).toHaveBeenCalledTimes(1);
+    // Per-chip removeFromQueue must NOT be called by the bulk action — it
+    // would interleave optimistic state with the bulk wipe.
+    expect(streamMocks.removeFromQueue).not.toHaveBeenCalled();
   });
 
   it("hides liveBlocks once the turn has ended to prevent a duplicate of the persisted assistant message", () => {
@@ -382,6 +483,7 @@ describe("ChatConversation", () => {
         name: "Grep",
         input: { pattern: "foo" },
         summary: "pattern=foo",
+        createdAt: "2026-05-09T10:16:00.000Z",
       },
       {
         id: "live-3",
@@ -389,6 +491,7 @@ describe("ChatConversation", () => {
         name: "Grep",
         output: "match-1",
         summary: "1 match",
+        createdAt: "2026-05-09T10:16:01.000Z",
       },
       { id: "live-4", kind: "text", content: "answer", streaming: true },
     ];
@@ -397,6 +500,49 @@ describe("ChatConversation", () => {
     const toolRows = screen.getAllByTestId("stored-tool-message");
     expect(toolRows).toHaveLength(2);
     expect(screen.getByText("answer")).toBeTruthy();
+  });
+
+  it("applies the agent-glow class to the latest assistant turn when is_streaming=true", () => {
+    chatDetail = {
+      id: "c-1",
+      messages: [
+        { id: "1", role: "user", content: "hello" },
+        { id: "2", role: "assistant", content: "world", is_streaming: true },
+      ],
+    };
+    renderConversation();
+    const container = screen.getByTestId("agent-glow-turn");
+    expect(container.className).toMatch(/\bagent-glow\b/);
+  });
+
+  it("does NOT add agent-glow on non-streaming turns", () => {
+    chatDetail = {
+      id: "c-1",
+      messages: [
+        { id: "1", role: "user", content: "hi" },
+        { id: "2", role: "assistant", content: "done", is_streaming: false },
+      ],
+    };
+    renderConversation();
+    expect(screen.queryByTestId("agent-glow-turn")).toBeNull();
+    // The persisted assistant row still renders, just without the glow.
+    expect(screen.getByText("done")).toBeTruthy();
+  });
+
+  it("only flags the LATEST assistant message as streaming, never older rows", () => {
+    // Defensive: a stale `is_streaming=true` on an earlier row must not glow
+    // — only the row at messages.length-1 ever gets the class. Without the
+    // index gate, any historical row left over from a previous turn would
+    // pulse forever.
+    chatDetail = {
+      id: "c-1",
+      messages: [
+        { id: "1", role: "assistant", content: "old", is_streaming: true },
+        { id: "2", role: "user", content: "follow-up" },
+      ],
+    };
+    renderConversation();
+    expect(screen.queryByTestId("agent-glow-turn")).toBeNull();
   });
 
   // Regression: a project whose allow-list only permits the "Work" key used

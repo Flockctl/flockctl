@@ -7,6 +7,17 @@ import type {
   ChatMessageResponse,
   LiveChatBlock,
 } from "../types";
+import {
+  enqueueMessage as storeEnqueue,
+  peekHead as storePeekHead,
+  removeFromQueue as storeRemove,
+  markDrainInFlight as storeMarkDrainInFlight,
+  registerActiveChat,
+  useChatQueue,
+  useRemoveFromQueue,
+  useClearQueue,
+  useReorderQueue,
+} from "../chat-queue-store";
 import { queryKeys } from "./core";
 
 /**
@@ -28,33 +39,69 @@ import { queryKeys } from "./core";
  * until the user next refetches manually (e.g. page navigation).
  *
  * Queue (Claude-Code-style): if the caller sends a new message while a turn
- * is already running, `enqueueMessage` appends it to `queuedMessages`. The
- * drain effect below picks the next queued item up the moment `isStreaming`
- * flips back to false and kicks off its stream automatically. `cancelStream`
- * only aborts the currently-running turn — the queue is left intact so
- * pressing Esc mid-turn behaves exactly like Claude Code: the current
- * response stops, the next queued prompt takes over.
+ * is already running, `enqueueMessage` appends it to the per-chat queue
+ * (backed by `chat-queue-store` so it survives the parent's
+ * `key={selectedChatId}` remount). The drain effect below picks the next
+ * queued item up the moment BOTH `isStreaming` flips to false AND the
+ * caller-supplied `serverBusy` flag clears — kicking off the next stream
+ * automatically. Earlier versions only checked `isStreaming`, which let a
+ * queued prompt fire in the brief window between SSE `done` and the WS
+ * `session_ended` frame, opening a second concurrent server turn for the
+ * same chat. `cancelStream` only aborts the currently-running turn — the
+ * queue is left intact so pressing Esc mid-turn behaves exactly like
+ * Claude Code: the current response stops, the next queued prompt takes
+ * over (use `clearQueue` to drop the rest if that's not what you want).
  */
-export interface QueuedChatMessage {
-  id: string;
-  chatId: string;
-  data: ChatMessageCreate;
-  opts?: { projectId?: string };
+export type { QueuedChatMessage } from "../chat-queue-store";
+
+export interface UseChatStreamOptions {
+  /**
+   * Current chat id this hook is scoped to. The queue is read from
+   * `chat-queue-store` keyed by this id, so the same hook mounted in
+   * different chats sees independent queues. Optional for tests / legacy
+   * callers; when omitted, the queue collapses to the shared "no chat"
+   * slot and behaves like a single-chat store.
+   */
+  chatId?: string | null;
+  /**
+   * True when the daemon still reports the session for `chatId` is in
+   * flight — i.e. WS `sessionRunning === true` OR the persisted
+   * `is_running === true` on the chat row. Drain blocks while this is
+   * true so a queued prompt doesn't open a parallel server-side turn
+   * next to one that's still finalising (the local SSE stream usually
+   * closes a few hundred ms before the WS `session_ended` frame).
+   */
+  serverBusy?: boolean;
 }
 
-export function useChatStream() {
+export function useChatStream(opts: UseChatStreamOptions = {}) {
+  const { chatId = null, serverBusy = false } = opts;
   const [isStreaming, setIsStreaming] = useState(false);
   const [liveBlocks, setLiveBlocks] = useState<LiveChatBlock[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [queuedMessages, setQueuedMessages] = useState<QueuedChatMessage[]>([]);
+  // Queue is no longer per-hook state — it lives in the module-level
+  // `chat-queue-store` so messages survive `ChatConversation`'s remount on
+  // every chat switch. `useChatQueue` subscribes via `useSyncExternalStore`
+  // so any push/pop into the store re-renders this hook automatically.
+  const queuedMessages = useChatQueue(chatId);
+  const removeFromQueue = useRemoveFromQueue();
+  const clearQueue = useClearQueue(chatId);
+  const reorderQueue = useReorderQueue(chatId);
   const abortRef = useRef<AbortController | null>(null);
   // Tracks the chatId of the currently-streaming turn so cancelStream can
   // tell the server which session to abort. Set at the top of startStream,
   // cleared in its `finally` — outside of an active stream it's null and
   // cancelStream becomes a no-op for the backend side.
   const streamingChatIdRef = useRef<string | null>(null);
+  // Synchronous reentrancy guard. `setIsStreaming(true)` is async (React
+  // batches it), so two clicks in the same tick can both pass the
+  // `!isStreaming` gate in `handleComposerSend` and both call `startStream`,
+  // causing the second to abort the first via `abortRef.current.abort()` —
+  // the user's first prompt vanishes silently. Flipping a ref synchronously
+  // at the top of `startStream` lets the second call detect the in-flight
+  // start and route the message to the queue instead.
+  const startingRef = useRef(false);
   const blockCounterRef = useRef(0);
-  const queueCounterRef = useRef(0);
   const lastInvalidationRef = useRef<number>(0);
   const mountedRef = useRef(true);
   const queryClient = useQueryClient();
@@ -63,6 +110,18 @@ export function useChatStream() {
     mountedRef.current = true;
     return () => { mountedRef.current = false; };
   }, []);
+
+  // Tell the background queue-runner that this hook is now responsible
+  // for `chatId` — the runner will skip drain attempts for chats with at
+  // least one mounted hook so the two don't race for `dequeueHead`. The
+  // marker is refcounted so React StrictMode's mount → unmount → mount
+  // cycle in dev doesn't briefly hand the runner a window to launch a
+  // duplicate drain.
+  useEffect(() => {
+    if (!chatId) return;
+    const release = registerActiveChat(chatId);
+    return release;
+  }, [chatId]);
 
   const appendChunk = useCallback(
     (kind: "text" | "thinking", chunk: string) => {
@@ -112,7 +171,14 @@ export function useChatStream() {
         );
         return [
           ...closed,
-          { id: `live-${++blockCounterRef.current}`, kind: "tool_call", name, input, summary },
+          {
+            id: `live-${++blockCounterRef.current}`,
+            kind: "tool_call",
+            name,
+            input,
+            summary,
+            createdAt: new Date().toISOString(),
+          },
         ];
       });
     },
@@ -123,13 +189,69 @@ export function useChatStream() {
     (name: string, output: string, summary: string) => {
       setLiveBlocks((prev) => [
         ...prev,
-        { id: `live-${++blockCounterRef.current}`, kind: "tool_result", name, output, summary },
+        {
+          id: `live-${++blockCounterRef.current}`,
+          kind: "tool_result",
+          name,
+          output,
+          summary,
+          createdAt: new Date().toISOString(),
+        },
       ]);
     },
     [],
   );
 
-  const startStream = useCallback(async (chatId: string, data: ChatMessageCreate, opts?: { projectId?: string }) => {
+  /**
+   * Append a message to the queue for `chatId`. The drain effect below starts
+   * it as soon as the current turn finishes AND the server reports idle.
+   * Returns the queue entry id so callers can target it for `removeFromQueue`
+   * (e.g. the ✕ button on a queued-message chip).
+   *
+   * Stable identity (no chatId / serverBusy in deps) — the store call is a
+   * pure module-level write, so a re-render shouldn't churn the callback
+   * reference and force every consumer of `enqueueMessage` to re-bind.
+   */
+  const enqueueMessage = useCallback(
+    (entryChatId: string, data: ChatMessageCreate, opts?: { projectId?: string }) =>
+      storeEnqueue(entryChatId, data, opts),
+    [],
+  );
+
+  const startStream = useCallback(async (
+    entryChatId: string,
+    data: ChatMessageCreate,
+    opts?: { projectId?: string },
+    /**
+     * Hook-internal options. The drain effect passes `queueEntryId` so
+     * `startStream` can remove the entry from the queue ONLY after the
+     * server returns 2xx — preserving the prompt for retry on a network
+     * blip. Direct callers (e.g. `handleComposerSend`) leave this
+     * undefined: their entry isn't in the queue to begin with.
+     */
+    internal?: { queueEntryId?: string },
+  ): Promise<boolean> => {
+    // Synchronous reentrancy guard (BUG #3 fix). If a start is already in
+    // flight in this tick — typical case: the user double-clicked Send, or
+    // the drain effect raced `handleComposerSend` — we route the message
+    // to the queue instead of aborting the in-flight start. Without this
+    // the second call would hit the `abortRef.current.abort()` branch
+    // below and silently drop the first prompt before its SSE body had
+    // even returned.
+    if (startingRef.current) {
+      enqueueMessage(entryChatId, data, opts);
+      // Returning false here would mark the head failed even though it
+      // was successfully enqueued — return true so the drain effect's
+      // `failedHeadRef` doesn't trip over a perfectly fine outcome.
+      return true;
+    }
+    startingRef.current = true;
+    // Coordinate with the background runner against a SINGLE source of
+    // truth — both paths block while a drain is in flight for this chat.
+    // Released in `finally` so a thrown exception still clears the
+    // marker. The disposer is captured into a local variable so the
+    // `finally` block can call it without re-walking the store.
+    const releaseInFlight = storeMarkDrainInFlight(entryChatId);
     // Defensive guard: if a previous stream is somehow still active (e.g. the
     // caller raced the drain effect, or a test double didn't finish), abort
     // the old fetch before replacing the ref. Without this the old reader
@@ -144,8 +266,17 @@ export function useChatStream() {
     setError(null);
     blockCounterRef.current = 0;
     abortRef.current = new AbortController();
-    streamingChatIdRef.current = chatId;
+    streamingChatIdRef.current = entryChatId;
     const signal = abortRef.current.signal;
+    /**
+     * Whether the server accepted the request (HTTP 2xx). The drain
+     * effect uses this to decide if the queue entry needs to be marked
+     * as "failed" so it doesn't re-fire on the very next render. A
+     * non-accepted entry stays in the queue but blocks subsequent
+     * drains for this head — the user can retry via the ✕→re-add cycle
+     * or via "Clear all".
+     */
+    let accepted = false;
 
     // Optimistic update: show the user message immediately and flag the chat
     // as running. `is_running` must survive chat switches — if the user
@@ -161,11 +292,11 @@ export function useChatStream() {
     // uses the snake-case key even though the backend emits `isRunning`.
     // Writing `isRunning` here would silently leave the real field
     // untouched and the Stop button would not appear optimistically.
-    queryClient.setQueryData(queryKeys.chat(chatId), (old: ChatDetailResponse | undefined) => {
+    queryClient.setQueryData(queryKeys.chat(entryChatId), (old: ChatDetailResponse | undefined) => {
       if (!old) return old;
       const optimisticMsg: ChatMessageResponse = {
         id: `optimistic-${Date.now()}`,
-        chat_id: chatId,
+        chat_id: entryChatId,
         role: 'user' as const,
         content: data.content,
         created_at: new Date().toISOString(),
@@ -174,9 +305,17 @@ export function useChatStream() {
     });
 
     try {
-      const res = await streamMessage(chatId, data, signal);
+      const res = await streamMessage(entryChatId, data, signal);
       if (!res.ok) throw new Error(`Stream failed: ${res.status}`);
       if (!res.body) throw new Error("Response body is null");
+      // Server accepted the request. ONLY now is it safe to remove the
+      // entry from the queue: a network blip before this point should
+      // leave the prompt queued so the next drain (hook or runner)
+      // retries it instead of silently dropping it.
+      accepted = true;
+      if (internal?.queueEntryId) {
+        storeRemove(internal.queueEntryId);
+      }
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
@@ -247,11 +386,22 @@ export function useChatStream() {
       }
       abortRef.current = null;
       streamingChatIdRef.current = null;
+      // Release the shared in-flight marker so the runner can pick up
+      // the next entry once the user navigates away (or so the hook's
+      // own drain effect can re-evaluate cleanly).
+      releaseInFlight();
+      // Release the reentrancy guard last so any drain that fires on the
+      // `setIsStreaming(false)` flush above still sees `startingRef === true`
+      // and routes the next item through the queue path. The drain effect's
+      // own check on `startingRef` keeps things consistent — releasing here
+      // lets the NEXT drain (after the dependency array refires) proceed.
+      startingRef.current = false;
       if (opts?.projectId) {
         queryClient.invalidateQueries({ queryKey: queryKeys.projectTree(opts.projectId) });
       }
     }
-  }, [queryClient, appendChunk, appendToolCall, appendToolResult, closeStreamingBlocks]);
+    return accepted;
+  }, [queryClient, appendChunk, appendToolCall, appendToolResult, closeStreamingBlocks, enqueueMessage]);
 
   // Stopping a turn is a two-part operation:
   //   1. Tell the daemon to abort the AgentSession (POST /chats/:id/cancel)
@@ -271,9 +421,9 @@ export function useChatStream() {
   // backend is still running. Passing the chatId in from the caller lets
   // `POST /chats/:id/cancel` fire in that scenario too.
   const cancelStream = useCallback((fallbackChatId?: string) => {
-    const chatId = streamingChatIdRef.current ?? fallbackChatId ?? null;
-    if (chatId) {
-      cancelChatRun(chatId).catch(() => {
+    const targetChatId = streamingChatIdRef.current ?? fallbackChatId ?? null;
+    if (targetChatId) {
+      cancelChatRun(targetChatId).catch(() => {
         // Silent: the server may have already finished the turn between the
         // user's click and this request. The client-side abort below will
         // still close the stream.
@@ -288,49 +438,76 @@ export function useChatStream() {
     blockCounterRef.current = 0;
   }, []);
 
-  /**
-   * Append a message to the queue for `chatId`. The drain effect below starts
-   * it as soon as the current turn finishes. Returns the queue entry id so
-   * callers can target it for `removeFromQueue` (e.g. the ✕ button on a
-   * queued-message chip).
-   */
-  const enqueueMessage = useCallback(
-    (chatId: string, data: ChatMessageCreate, opts?: { projectId?: string }) => {
-      const id = `queued-${++queueCounterRef.current}-${Date.now()}`;
-      setQueuedMessages((prev) => [...prev, { id, chatId, data, opts }]);
-      return id;
-    },
-    [],
-  );
-
-  const removeFromQueue = useCallback((id: string) => {
-    setQueuedMessages((prev) => prev.filter((m) => m.id !== id));
-  }, []);
-
-  const clearQueue = useCallback(() => {
-    setQueuedMessages([]);
-  }, []);
-
-  // Auto-drain: the moment a turn finishes (isStreaming flips false) and the
-  // queue has something for any chat, pop the head and start its stream.
-  // React re-renders serially, so `setIsStreaming(true)` inside the triggered
-  // `startStream` prevents this effect from firing a second time for the same
-  // turn — exactly one drain per finished stream.
+  // Tracks the most recent queue entry whose drain attempt failed. The
+  // drain effect peeks at the head WITHOUT removing it (so a network
+  // blip leaves the prompt queued for retry), but that opens an
+  // infinite-loop trap: if `startStream` returns `accepted=false` and
+  // the entry stays at the head, the next render would peek the same
+  // head and fire `startStream` again, ad infinitum. This ref pins
+  // the failed id so subsequent drain ticks for the same head are no-ops.
   //
-  // We intentionally do NOT filter by chatId here. The queue is keyed per
-  // `useChatStream` instance, which is scoped to one ChatConversation mount
-  // (which is itself keyed on `selectedChatId`) — so every queued entry
-  // already belongs to this chat. Filtering here would just introduce a
-  // silent drop if a future caller ever routes cross-chat messages.
+  // Reset paths:
+  //   - User clicks ✕ → removeFromQueue → queue array changes → next
+  //     peek either returns a different head (drain fires) or null
+  //     (drain bails). Either way the ref is stale; we clear it
+  //     opportunistically when peek.id !== ref so a fresh head always
+  //     gets a fresh attempt.
+  //   - User adds another entry (Send while busy) → enqueue appends to
+  //     tail → head unchanged → ref still gates → still no-op. The
+  //     user can manually retry by clicking ✕ on the failed head.
+  const failedHeadRef = useRef<string | null>(null);
+
+  // Auto-drain. The moment the local stream finishes (`isStreaming` flips
+  // false) AND the daemon reports the session has finalised
+  // (`serverBusy === false`), pop the head of THIS chat's queue and start
+  // its stream.
+  //
+  // The `serverBusy` gate is the BUG #1 fix: the local SSE `done` event
+  // typically arrives a few hundred ms before the WS `session_ended` frame
+  // because the daemon flushes assistant rows + diff entries after closing
+  // the SSE writer. Without this gate, a queued prompt drained in that
+  // window would call `streamMessage` while the previous turn was still
+  // writing to the chat — opening a parallel server-side session whose
+  // tool calls and assistant rows interleave with the previous one in the
+  // DB. The fallback indicator and "ghost responses" the user sees are
+  // both downstream of that race.
+  //
+  // We also bail when `startingRef` is set — drain may fire from a state
+  // flush triggered inside `startStream` itself (see comment in `finally`),
+  // and we don't want a second drain pass to dequeue a fresh head while
+  // the previous one is still mid-setup.
+  //
+  // The queue is keyed on `chatId` via `chat-queue-store`, so this effect
+  // only ever drains entries that belong to the chat this hook instance
+  // is scoped to. Entries enqueued for a different chat sit untouched in
+  // the store until that chat's hook mounts.
   useEffect(() => {
     if (isStreaming) return;
+    if (serverBusy) return;
+    if (startingRef.current) return;
+    if (!chatId) return;
     if (queuedMessages.length === 0) return;
     if (!mountedRef.current) return;
-    const [next, ...rest] = queuedMessages;
-    if (!next) return;
-    setQueuedMessages(rest);
-    void startStream(next.chatId, next.data, next.opts);
-  }, [isStreaming, queuedMessages, startStream]);
+    const head = storePeekHead(chatId);
+    if (!head) return;
+    // Different head than the last failure → fresh attempt; clear the
+    // sticky-failure marker so we can re-evaluate.
+    if (failedHeadRef.current && failedHeadRef.current !== head.id) {
+      failedHeadRef.current = null;
+    }
+    if (failedHeadRef.current === head.id) return;
+    void (async () => {
+      const accepted = await startStream(head.chatId, head.data, head.opts, {
+        queueEntryId: head.id,
+      });
+      if (!accepted && mountedRef.current) {
+        // Pin this head as failed so the next render doesn't re-fire it.
+        // The user surfaces the failure via the existing `setError` UI;
+        // recovery is "click ✕ on the chip and retry from the composer".
+        failedHeadRef.current = head.id;
+      }
+    })();
+  }, [isStreaming, serverBusy, queuedMessages, chatId, startStream]);
 
   // Derived scalars kept for scroll-trigger sizing. Returning them here avoids
   // callers having to re-derive total text length from liveBlocks themselves.
@@ -350,6 +527,7 @@ export function useChatStream() {
     enqueueMessage,
     removeFromQueue,
     clearQueue,
+    reorderQueue,
     isStreaming,
     liveBlocks,
     queuedMessages,

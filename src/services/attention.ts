@@ -1,8 +1,9 @@
-import { and, asc, eq, isNotNull } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull } from "drizzle-orm";
 import type { FlockctlDb } from "../db/index.js";
 import { tasks, chats, agentQuestions } from "../db/schema.js";
 import type { AgentSession } from "./agent-session/index.js";
 import type { QuestionOption } from "./agent-session/index.js";
+import { parseQuestionOptions } from "./agent-session/parse-question-options.js";
 import { TaskStatus } from "../lib/types.js";
 
 /**
@@ -285,20 +286,38 @@ export function collectAttentionItems(
     .orderBy(asc(agentQuestions.createdAt))
     .all();
 
+  // Batch project resolution: one IN-query instead of N `WHERE id = ?` round
+  // trips on a polled endpoint. The polled `/attention` inbox fires this with
+  // every pending question, so the N+1 was the dominant cost when a chat
+  // backlog accumulated.
+  const taskIds = Array.from(
+    new Set(
+      taskQuestionRows
+        .map((r) => r.taskId)
+        .filter((id): id is number => id != null),
+    ),
+  );
+  const taskProjectByIdMap = new Map<number, number>();
+  if (taskIds.length > 0) {
+    const projRows = db
+      .select({ id: tasks.id, projectId: tasks.projectId })
+      .from(tasks)
+      .where(inArray(tasks.id, taskIds))
+      .all();
+    for (const r of projRows) {
+      if (r.projectId != null) taskProjectByIdMap.set(r.id, r.projectId);
+    }
+  }
   for (const row of taskQuestionRows) {
     if (row.taskId == null) continue;
-    const taskRow = db
-      .select({ projectId: tasks.projectId })
-      .from(tasks)
-      .where(eq(tasks.id, row.taskId))
-      .get();
-    if (!taskRow || taskRow.projectId == null) continue;
+    const projectId = taskProjectByIdMap.get(row.taskId);
+    if (projectId == null) continue;
     const base = serializeQuestionRow(row, "task");
     items.push({
       ...base,
       kind: "task_question",
       taskId: row.taskId,
-      projectId: taskRow.projectId,
+      projectId,
     });
   }
 
@@ -322,24 +341,43 @@ export function collectAttentionItems(
     .orderBy(asc(agentQuestions.createdAt))
     .all();
 
+  // Batch chat→project resolution (same rationale as the task path above).
+  // Note `projectId` here may legitimately be null (chats can be detached
+  // from a project), so we record presence in a separate Set and the
+  // projectId in a Map.
+  const chatIds = Array.from(
+    new Set(
+      chatQuestionRows
+        .map((r) => r.chatId)
+        .filter((id): id is number => id != null),
+    ),
+  );
+  const chatPresent = new Set<number>();
+  const chatProjectByIdMap = new Map<number, number>();
+  if (chatIds.length > 0) {
+    const chatRows = db
+      .select({ id: chats.id, projectId: chats.projectId })
+      .from(chats)
+      .where(inArray(chats.id, chatIds))
+      .all();
+    for (const r of chatRows) {
+      chatPresent.add(r.id);
+      if (r.projectId != null) chatProjectByIdMap.set(r.id, r.projectId);
+    }
+  }
   for (const row of chatQuestionRows) {
     if (row.chatId == null) continue;
-    const chatRow = db
-      .select({ projectId: chats.projectId })
-      .from(chats)
-      .where(eq(chats.id, row.chatId))
-      .get();
     // Tolerate a missing chat the same way section 3 tolerates a missing
     // task: cascade should clean these up, but we don't want a stale row to
     // crash the aggregator if a delete races with a question still in
     // `pending` status.
-    if (!chatRow) continue;
+    if (!chatPresent.has(row.chatId)) continue;
     const base = serializeQuestionRow(row, "chat");
     items.push({
       ...base,
       kind: "chat_question",
       chatId: row.chatId,
-      projectId: chatRow.projectId ?? null,
+      projectId: chatProjectByIdMap.get(row.chatId) ?? null,
     });
   }
 
@@ -407,18 +445,9 @@ export function serializeQuestionRow(
     createdAt: row.createdAt ?? new Date().toISOString(),
   };
   if (row.header != null) out.header = row.header;
-  if (row.options != null) {
-    try {
-      const parsed = JSON.parse(row.options);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        out.options = parsed as QuestionOption[];
-      }
-    } catch (err) {
-      console.warn(
-        `[attention] failed to parse agent_questions.options for ${row.requestId}:`,
-        err,
-      );
-    }
+  const parsedOpts = parseQuestionOptions(row.options, row.requestId);
+  if (parsedOpts && parsedOpts.length > 0) {
+    out.options = parsedOpts;
   }
   return out;
 }

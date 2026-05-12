@@ -32,7 +32,7 @@
 
 import { existsSync, readFileSync, readdirSync, statSync, watch } from "node:fs";
 import { join } from "node:path";
-import { load, FAILSAFE_SCHEMA } from "js-yaml";
+import { parse as parseYaml } from "yaml";
 import { minimatch } from "minimatch";
 
 import type { ParseError, StateMachine } from "./sm-parser.js";
@@ -103,9 +103,9 @@ function parseMarkdownFile(
   try {
     /* v8 ignore next — the FRONTMATTER_RE has a mandatory capture group that
        always matches when the regex itself matches; the ?? "" is TS glue. */
-    fmRaw = load(fmMatch[1] ?? "", { schema: FAILSAFE_SCHEMA });
+    fmRaw = parseYaml(fmMatch[1] ?? "", { schema: "failsafe" });
   } catch (e) {
-    /* v8 ignore next — js-yaml's load() only throws Error subclasses; the
+    /* v8 ignore next — yaml's parse() only throws Error subclasses; the
        String(e) fallback is defensive typing. */
     const msg = e instanceof Error ? e.message : String(e);
     errors.push({ message: `frontmatter yaml: ${msg}` });

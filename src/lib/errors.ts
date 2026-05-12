@@ -32,3 +32,20 @@ export class ConflictError extends AppError {
     super(409, message, details);
   }
 }
+
+/**
+ * 403 — the request was authenticated and well-formed but the caller
+ * does not have permission to access the resource. Distinct from
+ * ValidationError (422 = bad input shape) and from the implicit 401
+ * returned by the auth middleware (no/wrong bearer token).
+ *
+ * Used by /fs/* (browse/read/write) where the path-jail or
+ * loopback-only gate refuses an otherwise-valid request, and by
+ * places that distinguish "you can't do that" from "that doesn't
+ * exist" (e.g. permission_mode mismatch).
+ */
+export class ForbiddenError extends AppError {
+  constructor(message: string, details?: unknown) {
+    super(403, message, details);
+  }
+}

@@ -432,6 +432,32 @@ describe("Planning API", () => {
       expect(t.status).toBe("completed");
     });
 
+    it("PATCH .../tasks/:slug updates depends, files, verify, estimate (regression)", async () => {
+      // Regression: previously the PATCH whitelist only included
+      // title/description/status/order, so callers could not fix a wrong
+      // `depends` array (the only workaround was delete + recreate). The
+      // whitelist now mirrors POST, so the full shape is patchable.
+      const res = await app.request(
+        `/projects/${projectId}/milestones/${milestoneSlug}/slices/${sliceSlug}/tasks/${taskSlug}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            depends: ["00-some-other-task"],
+            files: ["src/foo.ts", "src/bar.ts"],
+            verify: "npm test -- foo",
+            estimate: "30 minutes",
+          }),
+        },
+      );
+      expect(res.status).toBe(200);
+      const t = await res.json();
+      expect(t.depends).toEqual(["00-some-other-task"]);
+      expect(t.files).toEqual(["src/foo.ts", "src/bar.ts"]);
+      expect(t.verify).toBe("npm test -- foo");
+      expect(t.estimate).toBe("30 minutes");
+    });
+
     it("PATCH .../tasks/:slug returns 404 for missing", async () => {
       const res = await app.request(`/projects/${projectId}/milestones/${milestoneSlug}/slices/${sliceSlug}/tasks/nonexistent`, {
         method: "PATCH",

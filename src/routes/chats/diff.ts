@@ -1,5 +1,5 @@
 import type { Hono } from "hono";
-import { parseIdParam } from "../../lib/route-params.js";
+import { parseIdParam, parseBoundedIntQuery } from "../../lib/route-params.js";
 import {
   parseJournal,
   renderJournalAsUnifiedDiff,
@@ -24,7 +24,7 @@ export function registerChatDiff(router: Hono): void {
     const id = parseIdParam(c);
     const chat = getChatOrThrow(id);
 
-    const maxLines = parseInt(c.req.query("maxLines") ?? "2000") || 2000;
+    const maxLines = parseBoundedIntQuery(c, "maxLines", { min: 1, max: 200_000, default: 2000 });
     const journal = parseJournal(chat.fileEdits);
     const summary = summarizeJournal(journal);
     let diff = renderJournalAsUnifiedDiff(journal);

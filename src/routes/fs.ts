@@ -3,8 +3,46 @@ import { homedir } from "os";
 import path from "path";
 import fs from "fs/promises";
 import { requireLoopback } from "../middleware/remote-auth.js";
+import {
+  AppError,
+  BadRequestError,
+  ForbiddenError,
+  NotFoundError,
+} from "../lib/errors.js";
 
 export const fsRoutes = new Hono();
+
+/**
+ * Map an `ErrnoException` from a path-resolution / stat / readdir call to
+ * an `AppError`. Returns `null` when the errno isn't one of the known
+ * "this is the user's fault" codes — caller should then throw a 500.
+ *
+ * Centralises the three near-identical error blocks that used to live
+ * inline at every fs call site below; the only thing that varies between
+ * call sites is whether `EINVAL`-class codes are reachable (they're not
+ * for `readdir`, since by then the path was already resolved).
+ */
+function mapPathErrno(e: NodeJS.ErrnoException): AppError | null {
+  if (e.code === "ENOENT" || e.code === "ENOTDIR") {
+    return new NotFoundError("Path");
+  }
+  if (e.code === "EACCES" || e.code === "EPERM") {
+    return new ForbiddenError("Permission denied");
+  }
+  // ENAMETOOLONG: path exceeded PATH_MAX (e.g. a 5 000-char input).
+  // ELOOP: too many levels of symbolic links.
+  // EINVAL / ERR_INVALID_ARG_VALUE: NUL byte or other illegal input.
+  if (
+    e.code === "ENAMETOOLONG" ||
+    e.code === "ELOOP" ||
+    e.code === "EINVAL" ||
+    e.code === "ERR_INVALID_ARG_VALUE" ||
+    e.code === "ERR_INVALID_ARG_TYPE"
+  ) {
+    return new BadRequestError("Invalid path");
+  }
+  return null;
+}
 
 // Loopback-only gate for the entire /fs router. Filesystem browsing reveals
 // the shape of the developer's $HOME, which is far more sensitive than the
@@ -62,7 +100,7 @@ fsRoutes.get("/browse", async (c) => {
   // Fast path: the resolved string itself is outside $HOME. Compare against
   // rawHome because `resolved` has not yet been canonicalized.
   if (!isInsideHome(resolved, rawHome) && !isInsideHome(resolved, canonicalHome)) {
-    return c.json({ error: "Path is outside of $HOME" }, 403);
+    throw new ForbiddenError("Path is outside of $HOME");
   }
 
   // Follow symlinks exactly once. If realpath pops out of $HOME → 403.
@@ -70,32 +108,14 @@ fsRoutes.get("/browse", async (c) => {
   try {
     real = await fs.realpath(resolved);
   } catch (err) {
-    const e = err as NodeJS.ErrnoException;
-    if (e.code === "ENOENT" || e.code === "ENOTDIR") {
-      return c.json({ error: "Path not found" }, 404);
-    }
-    if (e.code === "EACCES" || e.code === "EPERM") {
-      return c.json({ error: "Permission denied" }, 403);
-    }
-    // ENAMETOOLONG: path exceeded PATH_MAX (e.g. a 5 000-char input).
-    // ELOOP: too many levels of symbolic links.
-    // EINVAL / ERR_INVALID_ARG_VALUE: NUL byte or other illegal input.
-    // Treat all of these as bad input rather than a server fault.
-    if (
-      e.code === "ENAMETOOLONG" ||
-      e.code === "ELOOP" ||
-      e.code === "EINVAL" ||
-      e.code === "ERR_INVALID_ARG_VALUE" ||
-      e.code === "ERR_INVALID_ARG_TYPE"
-    ) {
-      return c.json({ error: "Invalid path" }, 400);
-    }
-    return c.json({ error: e.message || "Failed to resolve path" }, 500);
+    const mapped = mapPathErrno(err as NodeJS.ErrnoException);
+    if (mapped) throw mapped;
+    throw new AppError(500, (err as Error).message || "Failed to resolve path");
   }
 
   // Post-realpath check uses the canonicalized home anchor.
   if (!isInsideHome(real, canonicalHome)) {
-    return c.json({ error: "Path is outside of $HOME" }, 403);
+    throw new ForbiddenError("Path is outside of $HOME");
   }
 
   // Reject file paths early — callers must pass a directory.
@@ -103,26 +123,12 @@ fsRoutes.get("/browse", async (c) => {
   try {
     stat = await fs.lstat(real);
   } catch (err) {
-    const e = err as NodeJS.ErrnoException;
-    if (e.code === "ENOENT" || e.code === "ENOTDIR") {
-      return c.json({ error: "Path not found" }, 404);
-    }
-    if (e.code === "EACCES" || e.code === "EPERM") {
-      return c.json({ error: "Permission denied" }, 403);
-    }
-    if (
-      e.code === "ENAMETOOLONG" ||
-      e.code === "ELOOP" ||
-      e.code === "EINVAL" ||
-      e.code === "ERR_INVALID_ARG_VALUE" ||
-      e.code === "ERR_INVALID_ARG_TYPE"
-    ) {
-      return c.json({ error: "Invalid path" }, 400);
-    }
-    return c.json({ error: e.message || "Failed to stat path" }, 500);
+    const mapped = mapPathErrno(err as NodeJS.ErrnoException);
+    if (mapped) throw mapped;
+    throw new AppError(500, (err as Error).message || "Failed to stat path");
   }
   if (!stat.isDirectory()) {
-    return c.json({ error: "Path is not a directory" }, 400);
+    throw new BadRequestError("Path is not a directory");
   }
 
   let dirents;
@@ -130,10 +136,13 @@ fsRoutes.get("/browse", async (c) => {
     dirents = await fs.readdir(real, { withFileTypes: true });
   } catch (err) {
     const e = err as NodeJS.ErrnoException;
+    // readdir can't surface ENAMETOOLONG/ELOOP/EINVAL — by this point we've
+    // already realpath'd. Only the EACCES/EPERM branch of mapPathErrno
+    // applies. Fall through to 500 for anything else.
     if (e.code === "EACCES" || e.code === "EPERM") {
-      return c.json({ error: "Permission denied" }, 403);
+      throw new ForbiddenError("Permission denied");
     }
-    return c.json({ error: e.message || "Failed to read directory" }, 500);
+    throw new AppError(500, e.message || "Failed to read directory");
   }
 
   // lstat each entry so we can report symlinks WITHOUT following them. If an

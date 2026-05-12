@@ -40,6 +40,99 @@ import {
   useConfirmDialog,
 } from "@/components/confirm-dialog";
 import { ArrowLeft, Pencil, Save, Trash2, X } from "lucide-react";
+import {
+  IncidentTimeline,
+  type IncidentTimelineEvent,
+} from "@/pages/incident-detail-components/IncidentTimeline";
+import { StatusPill, type StatusPillTone } from "@/components/design";
+
+// Severity tag map — matches the list-row contract in
+// `IncidentRow.tsx` so a row labelled "CRIT" on the list still reads as
+// "Critical" on the detail header. Severity is derived from the tag set
+// (the API does not yet carry an explicit column).
+type IncidentSeverity = "critical" | "high" | "medium" | "low";
+
+const SEVERITY_TAGS: ReadonlySet<IncidentSeverity> = new Set([
+  "critical",
+  "high",
+  "medium",
+  "low",
+]);
+
+const SEVERITY_TONE: Record<IncidentSeverity, StatusPillTone> = {
+  critical: "danger",
+  high: "warning",
+  medium: "info",
+  low: "neutral",
+};
+
+const SEVERITY_LABEL: Record<IncidentSeverity, string> = {
+  critical: "Critical",
+  high: "High",
+  medium: "Medium",
+  low: "Low",
+};
+
+function deriveSeverity(tags: ReadonlyArray<string> | null | undefined): IncidentSeverity {
+  if (!tags || tags.length === 0) return "medium";
+  for (const raw of tags) {
+    const t = raw.toLowerCase();
+    if (SEVERITY_TAGS.has(t as IncidentSeverity)) {
+      return t as IncidentSeverity;
+    }
+  }
+  return "medium";
+}
+
+/**
+ * Synthesise timeline events from the incident's flat fields. The DB
+ * does not yet store a separate event log per incident, so the timeline
+ * mirrors the post-mortem fields — `symptom` + `root_cause` are the
+ * cause section, `resolution` is the resolution. Empty fields are
+ * skipped so the timeline does not pad itself with hollow rows.
+ *
+ * Local to this file — the IncidentTimeline component takes its
+ * `IncidentTimelineEvent[]` payload from any source.
+ */
+function buildTimeline(incident: {
+  id: number | string;
+  symptom: string | null;
+  root_cause: string | null;
+  resolution: string | null;
+  created_at: string;
+  updated_at: string;
+}): IncidentTimelineEvent[] {
+  const events: IncidentTimelineEvent[] = [];
+  const baseId = String(incident.id);
+  const symptom = incident.symptom?.trim();
+  if (symptom) {
+    events.push({
+      id: `${baseId}-symptom`,
+      type: "cause",
+      body: symptom,
+      at: incident.created_at,
+    });
+  }
+  const root = incident.root_cause?.trim();
+  if (root) {
+    events.push({
+      id: `${baseId}-root-cause`,
+      type: "cause",
+      body: root,
+      at: incident.created_at,
+    });
+  }
+  const resolution = incident.resolution?.trim();
+  if (resolution) {
+    events.push({
+      id: `${baseId}-resolution`,
+      type: "resolution",
+      body: resolution,
+      at: incident.updated_at,
+    });
+  }
+  return events;
+}
 
 /**
  * Markdown-rendered block for a long text field. Returns a muted "not set"
@@ -55,7 +148,7 @@ function MarkdownBlock({ content }: { content: string | null }) {
     );
   }
   return (
-    <div className="prose prose-sm dark:prose-invert max-w-none break-words">
+    <div className="chat-markdown prose prose-sm dark:prose-invert max-w-none break-words">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeHighlight]}
@@ -138,9 +231,16 @@ export default function IncidentDetailPage() {
   const suggestions = useMemo(() => {
     const q = tagInput.trim().toLowerCase();
     if (!q) return [];
-    return knownTags
-      .filter((t) => !tags.includes(t) && t.toLowerCase().includes(q))
-      .slice(0, 8);
+    // Set.has avoids the O(known × picked) `tags.includes` per keystroke.
+    const pickedSet = new Set(tags);
+    const out: string[] = [];
+    for (const t of knownTags) {
+      if (pickedSet.has(t)) continue;
+      if (!t.toLowerCase().includes(q)) continue;
+      out.push(t);
+      if (out.length >= 8) break;
+    }
+    return out;
   }, [tagInput, knownTags, tags]);
 
   function addTag(raw: string) {
@@ -260,8 +360,20 @@ export default function IncidentDetailPage() {
                   className="text-base"
                 />
               ) : (
-                <span className="flex-1 break-words" data-testid="incident-title">
-                  {incident.title}
+                <span className="flex-1 break-words flex items-center gap-2" data-testid="incident-title">
+                  {(() => {
+                    const sev = deriveSeverity(incident.tags);
+                    return (
+                      <StatusPill
+                        tone={SEVERITY_TONE[sev]}
+                        size="sm"
+                        data-testid="incident-detail-severity"
+                      >
+                        {SEVERITY_LABEL[sev]}
+                      </StatusPill>
+                    );
+                  })()}
+                  <span className="break-words">{incident.title}</span>
                 </span>
               )}
               <div className="ml-auto flex gap-2">
@@ -313,7 +425,7 @@ export default function IncidentDetailPage() {
               </div>
             </CardTitle>
           </CardHeader>
-          <CardContent className="space-y-4">
+          <CardContent className="space-y-3">
             {/* Metadata row */}
             <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-xs md:grid-cols-4">
               <div>
@@ -484,6 +596,22 @@ export default function IncidentDetailPage() {
             )}
           </CardContent>
         </Card>
+      )}
+
+      {incident && !editing && (
+        <div data-testid="incident-detail-timeline-section" className="space-y-2">
+          <h2 className="text-sm font-semibold text-foreground">Timeline</h2>
+          <IncidentTimeline
+            events={buildTimeline({
+              id: incident.id,
+              symptom: incident.symptom,
+              root_cause: incident.root_cause,
+              resolution: incident.resolution,
+              created_at: incident.created_at,
+              updated_at: incident.updated_at,
+            })}
+          />
+        </div>
       )}
 
       <ConfirmDialog

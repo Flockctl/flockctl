@@ -8,6 +8,7 @@ import { NotFoundError, ValidationError } from "../lib/errors.js";
 import { flattenZodError } from "../lib/zod-utils.js";
 import { jsonSafeParseStringArray } from "../lib/json-safe-parse.js";
 import { requireRow } from "../lib/db-helpers.js";
+import { parseIdParam, parseIdQuery, parsePositiveIntQuery } from "../lib/route-params.js";
 import { searchIncidents } from "../services/incidents/service.js";
 
 export const incidentRoutes = new Hono();
@@ -48,10 +49,68 @@ function serialize(row: IncidentRow): IncidentResponse {
   return { ...row, tags: jsonSafeParseStringArray(row.tags) };
 }
 
-function parseIdParam(raw: string | undefined): number {
-  const id = Number(raw);
-  if (!Number.isInteger(id) || id <= 0) throw new ValidationError("invalid id");
-  return id;
+// ─── In-memory cache for GET /incidents/tags (audit-round-3 fix) ───
+//
+// The tags typeahead fires this endpoint on every dialog focus. Without
+// caching, each call re-scans the incidents table and JSON.parse's every
+// row's `tags` blob. We cache the resulting sorted array per scope with
+// a short TTL; mutating handlers below call `invalidateTagsCache` so a
+// freshly-saved tag appears the next time the dialog opens.
+
+const TAGS_CACHE_TTL_MS = 30 * 1000;
+interface TagsCacheEntry {
+  tags: string[];
+  expiresAt: number;
+}
+const tagsCache = new Map<string | number, TagsCacheEntry>();
+
+function readTagsCache(key: string | number): string[] | null {
+  const entry = tagsCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    tagsCache.delete(key);
+    return null;
+  }
+  return entry.tags;
+}
+
+function writeTagsCache(key: string | number, tags: string[]): void {
+  tagsCache.set(key, { tags, expiresAt: Date.now() + TAGS_CACHE_TTL_MS });
+  // Bounded growth — at most the all-scopes key plus one per project
+  // ever exists, but cap defensively at 256 in case of churn from
+  // bursty traffic before a project is GC'd.
+  if (tagsCache.size > 256) {
+    const oldest = tagsCache.keys().next().value;
+    if (oldest !== undefined) tagsCache.delete(oldest);
+  }
+}
+
+function invalidateTagsCache(projectId?: number | null): void {
+  // Always clear the all-scopes key. When a projectId is provided,
+  // clear that specific bucket too.
+  tagsCache.delete("_");
+  if (typeof projectId === "number") tagsCache.delete(projectId);
+}
+
+/**
+ * Test-only escape hatch. Tests bypass the POST handler and insert
+ * rows via Drizzle directly, so the route-level invalidation never
+ * fires. Tests can import this and reset state in `beforeEach` to
+ * keep their assertions deterministic across cases.
+ *
+ * @internal — production code MUST NOT call this.
+ */
+export function _resetIncidentsTagsCache(): void {
+  tagsCache.clear();
+}
+
+/** Fetch an incident row by id, throwing `NotFoundError("Incident", id)` if missing. */
+function getIncidentOrThrow(id: number): IncidentRow {
+  return requireRow(
+    getDb().select().from(incidents).where(eq(incidents.id, id)).get(),
+    "Incident",
+    id,
+  );
 }
 
 // GET /incidents — paginated list, newest first
@@ -82,17 +141,27 @@ incidentRoutes.get("/", (c) => {
 // dialog so users converge on a consistent tag vocabulary per project.
 //
 // Registered before `/:id` so "tags" is not captured by the id matcher.
+//
+// Audit-round-3 finding: the previous shape scanned the entire incidents
+// table and JSON.parse'd every row's `tags` blob on every request. The
+// dialog typeahead fires this endpoint on every focus → noticeable cost
+// once an operator accumulates hundreds of incidents.
+//
+// Fix: short-lived in-memory cache keyed by `projectId ?? "_"` with a
+// 30s TTL. The cache is invalidated explicitly by `invalidateTagsCache`
+// (called from POST/PUT/DELETE handlers below) and falls back to a
+// time-based expiry so a daemon that misses an invalidation (e.g. direct
+// DB write outside the route) eventually recovers.
 incidentRoutes.get("/tags", (c) => {
   const db = getDb();
 
-  const rawProjectId = c.req.query("projectId");
-  let projectId: number | undefined;
-  if (rawProjectId !== undefined && rawProjectId !== "") {
-    const n = Number(rawProjectId);
-    if (!Number.isInteger(n) || n <= 0) {
-      throw new ValidationError("invalid projectId");
-    }
-    projectId = n;
+  const projectId = parseIdQuery(c, "projectId");
+  const cacheKey = projectId ?? "_";
+
+  const cached = readTagsCache(cacheKey);
+  if (cached) {
+    c.header("X-Cache", "hit");
+    return c.json({ tags: cached });
   }
 
   // `tags` is stored as a JSON-encoded string array per incident; aggregate
@@ -120,6 +189,8 @@ incidentRoutes.get("/tags", (c) => {
   }
 
   const tags = [...tagSet].sort((a, b) => a.localeCompare(b));
+  writeTagsCache(cacheKey, tags);
+  c.header("X-Cache", "miss");
   return c.json({ tags });
 });
 
@@ -145,25 +216,12 @@ incidentRoutes.get("/search", (c) => {
         .filter((t) => t.length > 0)
     : undefined;
 
-  const rawProjectId = c.req.query("projectId");
-  let projectId: number | undefined;
-  if (rawProjectId !== undefined && rawProjectId !== "") {
-    const n = Number(rawProjectId);
-    if (!Number.isInteger(n) || n <= 0) {
-      throw new ValidationError("invalid projectId");
-    }
-    projectId = n;
-  }
-
-  const rawLimit = c.req.query("limit");
-  let limit: number | undefined;
-  if (rawLimit !== undefined && rawLimit !== "") {
-    const n = Number(rawLimit);
-    if (!Number.isInteger(n) || n <= 0) {
-      throw new ValidationError("invalid limit");
-    }
-    limit = n;
-  }
+  const projectId = parseIdQuery(c, "projectId");
+  // `?limit=` is optional — absent/empty falls back to the service-layer
+  // default (DEFAULT_LIMIT = 10), and the service itself caps at MAX_LIMIT.
+  // The route only enforces "positive integer" so the operator gets a 422
+  // instead of a silent clamp on `?limit=0` or `?limit=-5`.
+  const limit = parsePositiveIntQuery(c, "limit");
 
   const items = searchIncidents(q, { tags, projectId, limit });
   return c.json({ items, total: items.length });
@@ -171,13 +229,8 @@ incidentRoutes.get("/search", (c) => {
 
 // GET /incidents/:id
 incidentRoutes.get("/:id", (c) => {
-  const id = parseIdParam(c.req.param("id"));
-  const row = requireRow(
-    getDb().select().from(incidents).where(eq(incidents.id, id)).get(),
-    "Incident",
-    id,
-  );
-  return c.json(serialize(row));
+  const id = parseIdParam(c);
+  return c.json(serialize(getIncidentOrThrow(id)));
 });
 
 // POST /incidents
@@ -203,17 +256,16 @@ incidentRoutes.post("/", async (c) => {
     .returning()
     .get();
 
+  if (data.tags && data.tags.length > 0) {
+    invalidateTagsCache(data.projectId ?? null);
+  }
   return c.json(serialize(row), 201);
 });
 
 // PUT /incidents/:id
 incidentRoutes.put("/:id", async (c) => {
-  const id = parseIdParam(c.req.param("id"));
-  requireRow(
-    getDb().select().from(incidents).where(eq(incidents.id, id)).get(),
-    "Incident",
-    id,
-  );
+  const id = parseIdParam(c);
+  getIncidentOrThrow(id);
 
   const body = await c.req.json().catch(() => null);
   const parsed = updateSchema.safeParse(body);
@@ -233,19 +285,31 @@ incidentRoutes.put("/:id", async (c) => {
   if (data.projectId !== undefined) patch.projectId = data.projectId ?? null;
   if (data.createdByChatId !== undefined) patch.createdByChatId = data.createdByChatId ?? null;
 
-  getDb().update(incidents).set(patch).where(eq(incidents.id, id)).run();
-  const updated = getDb().select().from(incidents).where(eq(incidents.id, id)).get()!;
-  return c.json(serialize(updated));
+  // `.returning().get()` removes the second SELECT round-trip and the unsafe
+  // `!` non-null assertion the old form relied on (it would have thrown a
+  // confusing 500 if a concurrent DELETE landed between the UPDATE and the
+  // re-fetch — vanishingly unlikely, but still wrong).
+  const updated = getDb()
+    .update(incidents)
+    .set(patch)
+    .where(eq(incidents.id, id))
+    .returning()
+    .get();
+  // Tags may have been mutated — invalidate the tags cache so the
+  // typeahead picks up the change on the next dialog open.
+  if (data.tags !== undefined) {
+    invalidateTagsCache(data.projectId ?? updated?.projectId ?? null);
+  }
+  return c.json(serialize(requireRow(updated, "Incident", id)));
 });
 
 // DELETE /incidents/:id
 incidentRoutes.delete("/:id", (c) => {
-  const id = parseIdParam(c.req.param("id"));
-  requireRow(
-    getDb().select().from(incidents).where(eq(incidents.id, id)).get(),
-    "Incident",
-    id,
-  );
+  const id = parseIdParam(c);
+  const row = getIncidentOrThrow(id);
   getDb().delete(incidents).where(eq(incidents.id, id)).run();
+  // Deleted incident may have been the last carrier of a given tag —
+  // invalidate so the typeahead drops orphaned values.
+  invalidateTagsCache(row.projectId ?? null);
   return c.json({ deleted: true });
 });

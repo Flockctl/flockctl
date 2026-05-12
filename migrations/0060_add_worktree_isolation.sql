@@ -1,0 +1,79 @@
+-- Per-task and per-chat git-worktree isolation.
+--
+-- Why this migration: parallel tasks/chats running against the same project
+-- step on each other's working tree — file edits collide, `git status` is
+-- noisy, and tests run against unstable state. claude-code solves this with
+-- per-session git worktrees (`claude --worktree`), so each agent session
+-- works in its own filesystem-isolated copy of the repo while sharing the
+-- underlying `.git/objects/` store. This migration adds the columns Flockctl
+-- needs to track that worktree alongside tasks and chats.
+--
+-- Three columns per owner table (`tasks`, `chats`):
+--
+--   `isolation` — TEXT, nullable. The opt-in switch.
+--     NULL  → legacy behaviour: agent runs in `task.workingDir` /
+--             `resolveChatCwd(chat)`, same as before. Default for every
+--             pre-existing row, so this migration is byte-equivalent at rest.
+--     'worktree' → at task start (or first chat message), the executor calls
+--                  `WorktreeManager.create()` to materialise a fresh
+--                  worktree under `<project>/.flockctl/worktrees/...`,
+--                  rewrites `workingDir` to that path, and persists the
+--                  result in the next two columns.
+--     The column is intentionally stringly-typed (no CHECK constraint) so
+--     follow-up modes ('container', 'sandbox', …) can be added without a
+--     CHECK-drop migration. Validation lives at the app boundary (Zod).
+--
+--   `worktree_path` — TEXT, nullable. Absolute path to the worktree
+--     directory once it has been created. NULL until creation; populated
+--     atomically with the first executor turn that materialises the
+--     worktree. Used by:
+--       - the executor on subsequent turns / boot-recovery to skip
+--         re-creation
+--       - cleanup endpoints (DELETE /tasks/:id/worktree,
+--         DELETE /chats/:id/worktree, POST /chats/:id/end-session)
+--       - `flockctl worktree list` to surface live worktrees to the operator
+--     Stored as an absolute path, not relative to project root, so the
+--     value survives a project rename / move (the worktree is still findable
+--     even if the project's `path` column drifts).
+--
+--   `worktree_branch` — TEXT, nullable. Branch name created with the
+--     worktree (`flockctl/task-<id>` / `flockctl/chat-<id>`). Captured at
+--     creation time so cleanup can `git branch -D` the right branch even
+--     if the worktree directory has been removed manually. NULL when
+--     `worktree_path` is NULL.
+--
+-- No indexes added: queries that filter by these columns are always
+-- already-narrowed by primary key (e.g. `SELECT worktree_path FROM tasks
+-- WHERE id = ?`), so an index would just inflate writes for no read win.
+-- Boot-recovery sweeps that scan all live worktrees use `git worktree list`,
+-- not a DB query, so no full-table-scan hot path exists either.
+--
+-- Tasks side: byte-equivalent at rest — every existing task row gets
+-- isolation=NULL, worktree_path=NULL, worktree_branch=NULL, matching
+-- legacy behaviour exactly.
+--
+-- Chats side: same — existing chats are unaffected; isolation is opt-in
+-- per chat at creation time. A chat with isolation='worktree' but
+-- worktree_path=NULL is the legitimate "isolation requested, worktree not
+-- yet created" state — the worktree is materialised lazily on the first
+-- message (so empty chats that never get a message don't leave behind
+-- worktree directories).
+--
+-- Rollback: ALTER TABLE chats DROP COLUMN worktree_branch; ALTER TABLE
+-- chats DROP COLUMN worktree_path; ALTER TABLE chats DROP COLUMN isolation;
+-- ALTER TABLE tasks DROP COLUMN worktree_branch; ALTER TABLE tasks DROP
+-- COLUMN worktree_path; ALTER TABLE tasks DROP COLUMN isolation;
+-- (Plus a manual `git worktree remove` sweep over any worktrees still
+-- on disk — the DB no longer remembers them.)
+
+ALTER TABLE tasks ADD COLUMN isolation TEXT;
+--> statement-breakpoint
+ALTER TABLE tasks ADD COLUMN worktree_path TEXT;
+--> statement-breakpoint
+ALTER TABLE tasks ADD COLUMN worktree_branch TEXT;
+--> statement-breakpoint
+ALTER TABLE chats ADD COLUMN isolation TEXT;
+--> statement-breakpoint
+ALTER TABLE chats ADD COLUMN worktree_path TEXT;
+--> statement-breakpoint
+ALTER TABLE chats ADD COLUMN worktree_branch TEXT;

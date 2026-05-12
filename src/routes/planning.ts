@@ -1,9 +1,9 @@
 import { Hono } from "hono";
 import { getDb } from "../db/index.js";
 import { projects, tasks } from "../db/schema.js";
-import { and, desc, eq, like } from "drizzle-orm";
+import { and, desc, eq, inArray, like } from "drizzle-orm";
 import { NotFoundError, ValidationError } from "../lib/errors.js";
-import { parseIdParam } from "../lib/route-params.js";
+import { parseIdParam, parseJsonBodySafe } from "../lib/route-params.js";
 import { buildPlanGenerationPrompt } from "../services/plan-prompt.js";
 import { startAutoExecution, stopAutoExecution, getAutoExecutionStatus, repointPlanTask } from "../services/auto-executor.js";
 import { resolveAllowedKeyIds, selectKeyForTask } from "../services/ai/key-selection.js";
@@ -13,7 +13,7 @@ import {
   listMilestones, getMilestone, createMilestone, updateMilestone, deleteMilestone,
   listSlices, getSlice, createSlice, updateSlice, deleteSlice,
   listPlanTasks, getPlanTask, createPlanTask, updatePlanTask, deletePlanTask,
-  getPlanDir, parseMd, writeMd,
+  getPlanDir, parseMd, writeMd, writeMdAsync, readMdAsync,
 } from "../services/plan-store/index.js";
 import { readFileSync, existsSync } from "fs";
 import { join } from "path";
@@ -33,7 +33,7 @@ function getProjectPath(pid: number): string {
 // POST /projects/:pid/milestones
 planningRoutes.post("/:pid/milestones", async (c) => {
   const projectPath = getProjectPath(parseIdParam(c, "pid"));
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
 
   const result = createMilestone(projectPath, {
     title: body.title,
@@ -72,7 +72,7 @@ planningRoutes.patch("/:pid/milestones/:slug", async (c) => {
   const existing = getMilestone(projectPath, slug);
   if (!existing) throw new NotFoundError("Milestone");
 
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
   const result = updateMilestone(projectPath, slug, {
     ...(body.title !== undefined && { title: body.title }),
     ...(body.description !== undefined && { description: body.description }),
@@ -103,7 +103,7 @@ planningRoutes.post("/:pid/milestones/:mslug/slices", async (c) => {
   const m = getMilestone(projectPath, mslug);
   if (!m) throw new NotFoundError("Milestone");
 
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
   const result = createSlice(projectPath, mslug, {
     title: body.title,
     description: body.description,
@@ -144,7 +144,7 @@ planningRoutes.patch("/:pid/milestones/:mslug/slices/:sslug", async (c) => {
   const existing = getSlice(projectPath, mslug, sslug);
   if (!existing) throw new NotFoundError("Slice");
 
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
   const result = updateSlice(projectPath, mslug, sslug, {
     ...(body.title !== undefined && { title: body.title }),
     ...(body.description !== undefined && { description: body.description }),
@@ -177,7 +177,7 @@ planningRoutes.post("/:pid/milestones/:mslug/slices/:sslug/tasks", async (c) => 
   const s = getSlice(projectPath, mslug, sslug);
   if (!s) throw new NotFoundError("Slice");
 
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
   const result = createPlanTask(projectPath, mslug, sslug, {
     title: body.title,
     description: body.description,
@@ -219,11 +219,26 @@ planningRoutes.patch("/:pid/milestones/:mslug/slices/:sslug/tasks/:tslug", async
   const existing = getPlanTask(projectPath, mslug, sslug, tslug);
   if (!existing) throw new NotFoundError("Plan Task");
 
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
+  // Accept the same field set as POST /tasks (minus slug-derived fields like
+  // title's effect on filename — title is updated in frontmatter only). The
+  // plan-store layer (`updatePlanTask`) merges any subset of `PlanTaskData`
+  // and writes back to disk, so any field the creator can set, the patcher
+  // can update.
   const result = updatePlanTask(projectPath, mslug, sslug, tslug, {
     ...(body.title !== undefined && { title: body.title }),
     ...(body.description !== undefined && { description: body.description }),
     ...(body.status !== undefined && { status: body.status }),
+    ...(body.model !== undefined && { model: body.model }),
+    ...(body.estimate !== undefined && { estimate: body.estimate }),
+    ...(body.files !== undefined && { files: body.files }),
+    ...(body.verify !== undefined && { verify: body.verify }),
+    ...(body.depends !== undefined && { depends: body.depends }),
+    ...(body.inputs !== undefined && { inputs: body.inputs }),
+    ...(body.expectedOutput !== undefined && { expectedOutput: body.expectedOutput }),
+    ...(body.failureModes !== undefined && { failureModes: body.failureModes }),
+    ...(body.negativeTests !== undefined && { negativeTests: body.negativeTests }),
+    ...(body.observabilityImpact !== undefined && { observabilityImpact: body.observabilityImpact }),
     ...(body.order !== undefined && { order: body.order }),
     ...(body.orderIndex !== undefined && { order: body.orderIndex }),
     ...(body.order_index !== undefined && { order: body.order_index }),
@@ -251,7 +266,7 @@ planningRoutes.post("/:pid/generate-plan", async (c) => {
   const pid = parseIdParam(c, "pid");
   const projectPath = getProjectPath(pid);
 
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
   const prompt = body.prompt;
   const mode = body.mode ?? "quick";
   // Optional UI-provided overrides. When omitted, the daemon picks a key via
@@ -461,9 +476,22 @@ planningRoutes.post("/:pid/milestones/:mslug/rerun-failed", async (c) => {
     return c.json({ rerun: [], count: 0, resumed: false });
   }
 
+  // Batch read originals + transactional inserts.
+  //
+  // Before: O(N) round-trips for SELECT + INSERT (each INSERT also paid a
+  // WAL fsync because they weren't grouped). After: one IN-query for the
+  // originals, plus a single COMMIT for the insert batch — bounded fsync
+  // cost regardless of how many failures the rerun fans out to.
+  const originals = db
+    .select()
+    .from(tasks)
+    .where(inArray(tasks.id, failedExecIds))
+    .all();
+  const originalById = new Map(originals.map((o) => [o.id, o] as const));
+
   const created: { originalTaskId: number; newTaskId: number }[] = [];
   for (const execId of failedExecIds) {
-    const original = db.select().from(tasks).where(eq(tasks.id, execId)).get();
+    const original = originalById.get(execId);
     /* v8 ignore next — failed plan tasks always carry a live exec row;
        the missing-row branch is defensive against a manually-deleted
        task and isn't worth staging in the test bed. */
@@ -548,34 +576,72 @@ planningRoutes.get("/:pid/milestones/:mslug/execution-graph", (c) => {
 
 // ─── File Content ─────────────────────────────
 
+/**
+ * Reject slug inputs that would escape the plan directory when joined into a
+ * file path. Used by `resolveEntityPath()` and the per-milestone README
+ * handler — both concatenate caller-supplied slugs into `join(planDir, ...)`,
+ * so without this gate `?milestone=../../etc&slice=passwd` would let the
+ * client read arbitrary files via the plan-file endpoints.
+ *
+ * The gate is intentionally narrow: it accepts the lower-kebab-case shape that
+ * `slugify()` emits and rejects everything else. The set is matched literally
+ * here (not via `slugify()` reuse) because we want to *validate*, not
+ * *normalise* — silently rewriting a request to a different file would be just
+ * as confusing as a 422.
+ */
+function assertSafeSlug(slug: unknown, name: string): asserts slug is string {
+  if (typeof slug !== "string" || slug.length === 0) {
+    throw new ValidationError(`Invalid ${name}: must be a non-empty string`);
+  }
+  if (!/^[a-z0-9][a-z0-9._\-]*$/.test(slug)) {
+    throw new ValidationError(
+      `Invalid ${name}: must match [a-z0-9][a-z0-9._\\-]*`,
+    );
+  }
+  if (slug.includes("..") || slug.includes("\0")) {
+    throw new ValidationError(`Invalid ${name}: must not contain '..' or NUL bytes`);
+  }
+}
+
 /** Resolve the .md file path for a planning entity */
 function resolveEntityPath(projectPath: string, entityType: string, milestoneSlug?: string, sliceSlug?: string, taskSlug?: string): string {
   const planDir = getPlanDir(projectPath);
   if (entityType === "milestone" && milestoneSlug) {
+    assertSafeSlug(milestoneSlug, "milestone");
     return join(planDir, milestoneSlug, "milestone.md");
   }
   if (entityType === "slice" && milestoneSlug && sliceSlug) {
+    assertSafeSlug(milestoneSlug, "milestone");
+    assertSafeSlug(sliceSlug, "slice");
     return join(planDir, milestoneSlug, sliceSlug, "slice.md");
   }
   if (entityType === "task" && milestoneSlug && sliceSlug && taskSlug) {
+    assertSafeSlug(milestoneSlug, "milestone");
+    assertSafeSlug(sliceSlug, "slice");
+    assertSafeSlug(taskSlug, "task");
     return join(planDir, milestoneSlug, sliceSlug, `${taskSlug}.md`);
   }
   throw new ValidationError("Invalid entity type or missing slugs");
 }
 
 // GET /projects/:pid/milestones/:slug/readme — read per-milestone README.md
-planningRoutes.get("/:pid/milestones/:slug/readme", (c) => {
+//
+// Async fs/promises (audit-round-5) — README content can be long
+// (milestone briefs run to thousands of lines) and we don't want to
+// block the event loop while we slurp it.
+planningRoutes.get("/:pid/milestones/:slug/readme", async (c) => {
   const projectPath = getProjectPath(parseIdParam(c, "pid"));
   const slug = c.req.param("slug");
+  assertSafeSlug(slug, "milestone");
   const filePath = join(getPlanDir(projectPath), slug, "README.md");
   if (!existsSync(filePath)) throw new NotFoundError("README");
 
-  const content = readFileSync(filePath, "utf-8");
+  const content = await readMdAsync(filePath);
   return c.json({ content, path: filePath });
 });
 
 // GET /projects/:pid/plan-file?type=milestone&milestone=slug[&slice=slug][&task=slug]
-planningRoutes.get("/:pid/plan-file", (c) => {
+planningRoutes.get("/:pid/plan-file", async (c) => {
   const projectPath = getProjectPath(parseIdParam(c, "pid"));
   const entityType = c.req.query("type") ?? "";
   const milestoneSlug = c.req.query("milestone");
@@ -585,14 +651,14 @@ planningRoutes.get("/:pid/plan-file", (c) => {
   const filePath = resolveEntityPath(projectPath, entityType, milestoneSlug, sliceSlug, taskSlug);
   if (!existsSync(filePath)) throw new NotFoundError("Plan file");
 
-  const content = readFileSync(filePath, "utf-8");
+  const content = await readMdAsync(filePath);
   return c.json({ content, path: filePath });
 });
 
 // PUT /projects/:pid/plan-file — update raw file content
 planningRoutes.put("/:pid/plan-file", async (c) => {
   const projectPath = getProjectPath(parseIdParam(c, "pid"));
-  const body = await c.req.json();
+  const body = await c.req.json().catch(() => ({}));
   const entityType = body.type ?? "";
   const milestoneSlug = body.milestone;
   const sliceSlug = body.slice;
@@ -601,19 +667,35 @@ planningRoutes.put("/:pid/plan-file", async (c) => {
 
   if (typeof content !== "string") throw new ValidationError("content is required");
 
+  // Cap plan-file payload at 1 MiB (audit-round-7 SECURITY finding).
+  // Plan markdown files in practice run to ~50 KiB even for large
+  // milestones; the cap blocks DoS-by-huge-payload while leaving 20×
+  // headroom for legitimate content.
+  const MAX_PLAN_FILE_BYTES = 1_048_576;
+  if (content.length > MAX_PLAN_FILE_BYTES) {
+    throw new ValidationError(
+      `content too large (${content.length} bytes, max ${MAX_PLAN_FILE_BYTES})`,
+    );
+  }
+
   const filePath = resolveEntityPath(projectPath, entityType, milestoneSlug, sliceSlug, taskSlug);
   if (!existsSync(filePath)) throw new NotFoundError("Plan file");
 
   // Parse the new content as markdown with frontmatter and write it back
+  // through `writeMdAsync` so the disk write doesn't block the event
+  // loop while we await the JSON serialisation.
   const fmMatch = content.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
   if (fmMatch) {
     const { parse: parseYaml } = await import("yaml");
-    const frontmatter = parseYaml(fmMatch[1] ?? "") ?? {};
+    // `maxAliasCount: 100` blocks billion-laughs-style YAML expansion
+    // (audit-round-7 SECURITY finding); 100 is far higher than any
+    // legitimate frontmatter alias count.
+    const frontmatter = parseYaml(fmMatch[1] ?? "", { maxAliasCount: 100 }) ?? {};
     const body2 = (fmMatch[2] ?? "").trim();
-    writeMd(filePath, frontmatter, body2);
+    await writeMdAsync(filePath, frontmatter, body2);
   } else {
     // No frontmatter — write as plain body with empty frontmatter
-    writeMd(filePath, {}, content.trim());
+    await writeMdAsync(filePath, {}, content.trim());
   }
 
   return c.json({ ok: true });

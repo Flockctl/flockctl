@@ -4,8 +4,18 @@ import type { PermissionMode } from "./permission";
 
 export const TaskStatus = {
   queued: "queued",
-  assigned: "assigned",
   running: "running",
+  /**
+   * Suspend state: task emitted an AskUserQuestion and is blocked awaiting a
+   * human answer. Backend transitions: running → waiting_for_input → running
+   * (on answer) | cancelled | timed_out. UI renders a "needs answer" badge.
+   *
+   * Added to the enum to fix a UI/backend desync — previously the runtime
+   * value flowed through but TypeScript had no entry for it, so type-aware
+   * branches (status badges, kanban filters) silently fell through to the
+   * "unknown" arm.
+   */
+  waiting_for_input: "waiting_for_input",
   pending_approval: "pending_approval",
   /** Parked due to a provider rate-limit / usage-limit. Will auto-resume at
    *  `resume_at` via the daemon's rate-limit scheduler. The UI renders a
@@ -13,6 +23,17 @@ export const TaskStatus = {
   rate_limited: "rate_limited",
   done: "done",
   failed: "failed",
+  /**
+   * User-initiated abort (DELETE /tasks/:id) or the cancellation arm of a
+   * `waiting_for_input` task. Terminal — only `cancelled → queued` is allowed
+   * (rerun) per `TASK_STATUS_TRANSITIONS`.
+   *
+   * Same desync fix as `waiting_for_input`: the runtime value was already
+   * flowing in payloads (`task_status` WebSocket frames, `tasks` list rows)
+   * but the enum didn't expose it, so type-aware UI code lacked a stable
+   * symbol to reference.
+   */
+  cancelled: "cancelled",
   timed_out: "timed_out",
 } as const;
 export type TaskStatus = (typeof TaskStatus)[keyof typeof TaskStatus];
@@ -42,6 +63,15 @@ export interface Task {
    * `model` when surfacing what really ran.
    */
   actual_model_used: string | null;
+  /**
+   * Total USD cost for this task, summed across every `usage_records` row
+   * tied to it. The API computes `COALESCE(SUM(total_cost_usd), 0)` so this
+   * is always a number — `0` for tasks that never produced usage (queued,
+   * failed before first turn, providers that don't report usage). Use this
+   * for the COST column in finished tasks; `liveMetrics.total_cost_usd`
+   * is only populated while a worker is actively streaming.
+   */
+  cost_usd?: number;
   timeout_seconds: number;
   project_id: string | null;
   assigned_key_id: number | null;
@@ -71,6 +101,26 @@ export interface Task {
    * The countdown badge subtracts this from `Date.now()` once per second.
    */
   resume_at?: number | null;
+  /**
+   * Isolation mode requested at task creation time. `'worktree'` means
+   * the executor materialises a per-task git worktree under
+   * `<project>/.flockctl/worktrees/task-<id>/` before launching the
+   * agent. NULL = legacy shared-cwd behaviour. See migration 0060.
+   */
+  isolation?: "worktree" | null;
+  /**
+   * Absolute path to the per-task git worktree, populated by the
+   * executor once the worktree has been materialised. NULL until then,
+   * NULL again after a clean cleanup; non-NULL while the worktree is
+   * still on disk (clean cleanup happens on success terminals; dirty
+   * worktrees survive for operator review).
+   */
+  worktree_path?: string | null;
+  /**
+   * Branch name created with the worktree (`flockctl/task-<id>`).
+   * NULL iff `worktree_path` is NULL.
+   */
+  worktree_branch?: string | null;
 }
 
 export interface TaskFilters {
@@ -98,6 +148,11 @@ export interface TaskCreate {
   timeout_seconds?: number;
   assigned_key_id?: number | null;
   permission_mode?: PermissionMode | null;
+  /**
+   * Opt-in isolation mode. Currently only `'worktree'` is supported —
+   * see migration 0060. Omit / null = legacy shared-cwd behaviour.
+   */
+  isolation?: "worktree" | null;
 }
 
 export interface TaskUpdate {
@@ -127,8 +182,24 @@ export interface TaskMetrics {
 export interface TaskStats {
   total: number;
   queued: number;
+  /**
+   * @deprecated Always 0 — the backend's `GET /tasks/stats` initialises
+   * this key for backward compatibility (the FSM never produces an
+   * `assigned` row), so the field is kept on the wire-format type to
+   * match the API response, but no UI code branches on it. New code
+   * MUST NOT read `stats.assigned`.
+   */
   assigned: number;
   running: number;
+  /**
+   * Tasks blocked on AskUserQuestion. Mirrors `TaskStatus.waiting_for_input`.
+   * Backend reports the count under this key when at least one task is in
+   * the suspend state; absent (i.e. `undefined`) when none are. Kept
+   * optional so older API responses (pre-status-FSM) don't break the type.
+   */
+  waiting_for_input?: number;
+  pending_approval?: number;
+  rate_limited?: number;
   completed: number;
   done: number;
   failed: number;
@@ -170,6 +241,13 @@ export interface TaskTemplate {
   timeout_seconds: number | null;
   label_selector: string | null;
   image: string | null;
+  /**
+   * Default isolation mode applied to every task spawned from this
+   * template (manual or scheduled). Persisted in the template JSON
+   * file under `<scope>/.flockctl/templates/<name>.json`. Currently
+   * only `'worktree'` is supported. NULL = legacy behaviour.
+   */
+  isolation?: "worktree" | null;
   source_path: string;
   created_at: string;
   updated_at: string;
@@ -191,6 +269,8 @@ export interface TaskTemplateCreate {
   timeout_seconds?: number | null;
   label_selector?: string | null;
   image?: string | null;
+  /** Opt-in default isolation for tasks spawned from this template. */
+  isolation?: "worktree" | null;
 }
 
 /** Composite client-side key used for React `key` and cache entries. */

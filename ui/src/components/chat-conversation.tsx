@@ -3,6 +3,19 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Card, CardContent } from "@/components/ui/card";
+/**
+ * Tailwind class string applied to every selector trigger inside the chat
+ * composer footer. Strips the default bordered framing (border / bg /
+ * shadow) so the controls read as pill-style children of the composer card
+ * rather than free-standing form fields. Hover lifts the background to the
+ * `--muted` surface — same affordance the rest of the ghost buttons use.
+ *
+ * Pulled out as a constant rather than inlined four times because every
+ * trigger needs the same set of override tokens, and a typo in any of them
+ * surfaces as a one-control "this one looks different from the rest" bug.
+ */
+const INLINE_TRIGGER_CLS =
+  "h-7 gap-1 rounded-md border-transparent bg-transparent px-2 text-xs shadow-none hover:bg-muted dark:bg-transparent dark:hover:bg-muted/50";
 import {
   Select,
   SelectContent,
@@ -28,7 +41,9 @@ import {
   ListOrdered,
 } from "lucide-react";
 import { ChatComposer } from "@/components/ChatComposer";
+import { QueuedMessagesList } from "@/components/QueuedMessagesList";
 import { ChatMessage } from "@/components/chat-message";
+import { cn } from "@/lib/utils";
 import { AgentQuestionPrompt } from "@/components/AgentQuestionPrompt";
 import { TodoProgress } from "@/components/TodoProgress";
 import { TodoHistoryDrawer } from "@/components/TodoHistoryDrawer";
@@ -54,6 +69,7 @@ import {
   useAnswerAgentQuestion,
   useProjectConfig,
   useProjectAllowedKeys,
+  useWorkspaceAllowedKeys,
 } from "@/lib/hooks";
 import { respondToChatPermission } from "@/lib/api";
 import type { ChatMessageResponse, PermissionMode, ChatMessageCreate, EffortLevel } from "@/lib/types";
@@ -126,6 +142,40 @@ export function ChatConversation({
   const [todoHistoryOpen, setTodoHistoryOpen] = useState(false);
 
   const { data: chatDetail, isLoading: chatLoading } = useChat(chatId);
+  const { permissionRequests, dismissPermissionRequest, sessionRunning } =
+    useChatEventStream(chatId);
+  // "Is the server still working on this chat?" — true when EITHER the live
+  // WS signal (`sessionRunning`) or the persisted `is_running` flag says so,
+  // OR while the chat detail itself is still loading (we haven't seen
+  // `is_running` yet, so we MUST NOT trigger a queue drain optimistically —
+  // that would race the actual backend state on first chat mount).
+  // Computed BEFORE useChatStream so we can hand it in as `serverBusy`,
+  // which gates the queue drain and prevents a queued prompt from kicking
+  // off a parallel turn during the SSE-`done`-to-WS-`session_ended` window
+  // (or during the initial GET /chats/:id round-trip).
+  //
+  // We intentionally use an OR over both sources instead of the previous
+  // `sessionRunning ?? chatDetail?.is_running` coalescing. `??` treats `false`
+  // as non-nullish, so the moment `session_ended` flipped `sessionRunning` to
+  // `false` for turn N, the optimistic `is_running=true` from turn N+1's
+  // `startStream` was silently ignored — leaving a brief window where
+  // `serverRunning=false` even though the UI had already kicked off a new
+  // turn. That window is exactly the "Response was not received" flash this
+  // component keeps accreting fixes for. Using OR means any source reporting
+  // "running" wins, and we only report "idle" when BOTH explicitly say so.
+  //
+  // The field is snake_case because apiFetch deep-converts response keys —
+  // reading `chatDetail.isRunning` would always be `undefined`, hiding the
+  // Stop button after a page reload while a turn was still in flight on the
+  // daemon. See the 2026-04-23 fix that renamed the field.
+  const serverRunning =
+    sessionRunning === true ||
+    chatDetail?.is_running === true ||
+    // Treat "still loading" as busy: until `useChat` resolves we don't
+    // know whether the server is mid-turn, and dispatching a queued
+    // prompt now could open a parallel turn next to one that's already
+    // in flight on the daemon.
+    (!!chatId && chatLoading);
   const {
     startStream,
     cancelStream,
@@ -134,10 +184,11 @@ export function ChatConversation({
     queuedMessages,
     enqueueMessage,
     removeFromQueue,
+    clearQueue,
+    reorderQueue,
+    clearChat,
     error: streamError,
-  } = useChatStream();
-  const { permissionRequests, dismissPermissionRequest, sessionRunning } =
-    useChatEventStream(chatId);
+  } = useChatStream({ chatId, serverBusy: serverRunning });
   const { question: agentQuestion } = useAgentQuestions({ kind: "chat", id: chatId });
   const answerAgentQuestionMutation = useAnswerAgentQuestion();
   const { data: chatTodos } = useChatTodos(chatId);
@@ -152,14 +203,43 @@ export function ChatConversation({
   const updateWorkspaceMutation = useUpdateWorkspace();
 
   const projectIdForConfig = chatDetail?.project_id ? String(chatDetail.project_id) : "";
+  // Workspace-only chats (started from the workspace page) have a
+  // workspaceId but no projectId — the key picker would otherwise fall
+  // back to "every active key" and silently ignore the workspace's
+  // own whitelist.
+  const workspaceIdForConfig = chatDetail?.workspace_id
+    ? String(chatDetail.workspace_id)
+    : "";
   const { data: chatProjectConfig } = useProjectConfig(projectIdForConfig);
   // Resolve the project's effective AI-key allow-list (with workspace
   // inheritance applied server-side) so we only surface keys the user is
   // actually permitted to use for this project. Chats without a project —
   // e.g. the global /chats page — fall back to every active key.
-  const { data: chatAllowedKeys } = useProjectAllowedKeys(projectIdForConfig, {
-    enabled: !!projectIdForConfig,
-  });
+  const { data: chatProjectAllowedKeys } = useProjectAllowedKeys(
+    projectIdForConfig,
+    { enabled: !!projectIdForConfig },
+  );
+  // Symmetric workspace-level lookup. Only fires for workspace-only chats
+  // (no project), so project-scoped chats keep their existing one-query
+  // behaviour and unscoped /chats sessions don't issue any allow-list
+  // request at all.
+  const { data: chatWorkspaceAllowedKeys } = useWorkspaceAllowedKeys(
+    workspaceIdForConfig,
+    { enabled: !!workspaceIdForConfig && !projectIdForConfig },
+  );
+  // Project allow-list wins when present (matches backend inheritance
+  // rules — project overrides workspace, no merge); otherwise the
+  // workspace list applies. `chatAllowedKeys` is the unified shape the
+  // selection hook consumes.
+  const chatAllowedKeys = projectIdForConfig
+    ? chatProjectAllowedKeys
+    : chatWorkspaceAllowedKeys;
+  // The selection hook's `projectIdForConfig` argument is overloaded as
+  // "is there an allow-list scope to wait for?" — pass the workspace id in
+  // when there's no project, so the auto-pick effect blocks until the
+  // workspace allow-list resolves the same way it currently does for
+  // project-scoped chats.
+  const allowListScopeId = projectIdForConfig || workspaceIdForConfig;
 
   // Key + model dropdowns share reconciliation logic (persisted seed,
   // project allow-list filter, auto-pick on key change). All of that lives
@@ -177,31 +257,36 @@ export function ChatConversation({
     allModels,
     defaultModel,
     defaultKeyId,
-    projectIdForConfig,
+    projectIdForConfig: allowListScopeId,
     chatAllowedKeys,
     chatProjectConfig,
     persistedKeyId: chatDetail?.ai_provider_key_id ?? null,
     persistedModel: chatDetail?.model ?? null,
   });
 
-  // "Is the server still working on this chat?" — true when EITHER the live
-  // WS signal (`sessionRunning`) or the persisted `is_running` flag says so.
+  // Drop residual liveBlocks once the turn is fully closed (no local stream,
+  // no server session). useChatStream intentionally keeps liveBlocks across
+  // the SSE `done` boundary to avoid a re-render flash where the live
+  // transcript disappeared before the persisted rows landed in
+  // `chatDetail.messages`. By the time BOTH flags are false here, the
+  // `session_ended` handler in useChatEventStream has already awaited the
+  // chat refetch — so messages cache contains the persisted assistant /
+  // tool rows, and dropping liveBlocks is safe (no flash, just the same
+  // transcript backed by the DB rows instead of in-memory blocks).
   //
-  // We intentionally use an OR over both sources instead of the previous
-  // `sessionRunning ?? chatDetail?.is_running` coalescing. `??` treats `false`
-  // as non-nullish, so the moment `session_ended` flipped `sessionRunning` to
-  // `false` for turn N, the optimistic `is_running=true` from turn N+1's
-  // `startStream` was silently ignored — leaving a brief window where
-  // `serverRunning=false` even though the UI had already kicked off a new
-  // turn. That window is exactly the "Response was not received" flash this
-  // component keeps accreting fixes for. Using OR means any source reporting
-  // "running" wins, and we only report "idle" when BOTH explicitly say so.
-  //
-  // The field is snake_case because apiFetch deep-converts response keys —
-  // reading `chatDetail.isRunning` would always be `undefined`, hiding the
-  // Stop button after a page reload while a turn was still in flight on the
-  // daemon. See the 2026-04-23 fix that renamed the field.
-  const serverRunning = sessionRunning === true || chatDetail?.is_running === true;
+  // Without this, a second user turn in the same chat could briefly render
+  // both `liveBlocks` (turn N) AND the just-persisted `messages` rows
+  // (also turn N) because the optimistic `is_running: true` from
+  // startStream flips `serverRunning` back to true, re-opening the
+  // `(isStreaming || serverRunning) && liveBlocks.map(...)` gate before
+  // `setLiveBlocks([])` from the same call has rendered. After a page
+  // reload everything is fine — the in-memory liveBlocks are gone — so
+  // the duplicates were always purely a frontend-state artefact.
+  useEffect(() => {
+    if (!isStreaming && !serverRunning && liveBlocks.length > 0) {
+      clearChat();
+    }
+  }, [isStreaming, serverRunning, liveBlocks.length, clearChat]);
 
   // Reset per-chat local state when switching chats
   useEffect(() => {
@@ -229,7 +314,37 @@ export function ChatConversation({
     setShowPromptHistory(false);
   }, [chatId]);
 
-  const messages = chatDetail?.messages ?? [];
+  const allMessages = chatDetail?.messages ?? [];
+
+  // ─── Visible window (audit-round-3 mitigation for long-chat jank) ───
+  //
+  // Long chats accumulate hundreds of messages, each carrying its own
+  // markdown bubble (with `ReactMarkdown` + `rehypeHighlight` highlighting
+  // every block on every parent re-render). Full virtualization here is
+  // tricky because rows are heterogeneous (tool / thinking / multi-select
+  // / user / assistant) and the streaming tail row keeps changing height.
+  //
+  // Practical compromise: only render the most recent `visibleCount`
+  // messages. Older messages stay in `allMessages` (for selection state,
+  // search-as-you-type, anchor IDs) but skip the markdown render until
+  // the user clicks "Show older messages". Default 200 — handles every
+  // common case without touching the visual layout. Bumped by +200 on
+  // each click; "Show all" once the user has bumped past the total.
+  const VISIBLE_PAGE_SIZE = 200;
+  const [visibleCount, setVisibleCount] = useState<number>(VISIBLE_PAGE_SIZE);
+  // Reset on chat switch so a freshly opened chat starts from the latest
+  // 200, not whatever the previous chat had expanded.
+  useEffect(() => {
+    setVisibleCount(VISIBLE_PAGE_SIZE);
+  }, [chatId]);
+
+  // Backwards-compat alias — the existing render path uses `messages`.
+  // Slicing from the tail keeps the latest turn at the bottom (which is
+  // what auto-scroll cares about) and drops older history that isn't on
+  // screen anyway.
+  const hiddenOlderCount = Math.max(0, allMessages.length - visibleCount);
+  const messages =
+    hiddenOlderCount > 0 ? allMessages.slice(hiddenOlderCount) : allMessages;
 
   // "Response was not received" fallback is a silent-failure detector: when
   // nothing is actively streaming (`isStreaming`), nothing is server-running
@@ -368,7 +483,7 @@ export function ChatConversation({
   }
 
   return (
-    <div className="flex min-w-0 flex-1 flex-col">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       {headerSlot}
 
       {/* Multi-select action bar */}
@@ -414,11 +529,46 @@ export function ChatConversation({
           here it overflows the chat area and triggers a horizontal page
           scroll. */}
       <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
-      <div ref={scrollRef} className="flex-1 overflow-auto p-4 space-y-4">
+      {/*
+        `aria-live="polite"` + `aria-busy={...}` so assistive tech
+        announces streaming tokens / turn completion without interrupting
+        the user mid-edit. `polite` is the right level — `assertive`
+        would barge in. Audit-round-7 finding.
+      */}
+      <div
+        ref={scrollRef}
+        aria-live="polite"
+        aria-busy={isStreaming || serverRunning ? true : undefined}
+        className="flex-1 overflow-auto p-4 space-y-4"
+      >
+        {hiddenOlderCount > 0 && !chatLoading && (
+          <div
+            data-testid="chat-show-older"
+            className="flex justify-center"
+          >
+            <Button
+              variant="ghost"
+              size="sm"
+              type="button"
+              className="text-xs text-muted-foreground"
+              onClick={() =>
+                setVisibleCount((prev) =>
+                  Math.min(allMessages.length, prev + VISIBLE_PAGE_SIZE),
+                )
+              }
+            >
+              Show {Math.min(VISIBLE_PAGE_SIZE, hiddenOlderCount)} older
+              message{hiddenOlderCount === 1 ? "" : "s"}
+              {hiddenOlderCount > VISIBLE_PAGE_SIZE
+                ? ` (${hiddenOlderCount} hidden)`
+                : ""}
+            </Button>
+          </div>
+        )}
         {chatLoading &&
           Array.from({ length: 3 }).map((_, i) => (
             <div
-              key={i}
+              key={`skeleton-${i}`}
               className={`flex ${i % 2 === 0 ? "justify-end" : "justify-start"}`}
             >
               <Skeleton className="h-10 w-48 rounded-lg" />
@@ -427,12 +577,25 @@ export function ChatConversation({
         {!chatLoading && messages.length === 0 && !isStreaming && (emptyState ?? (
           <DefaultEmptyState onPick={(prompt) => setInputValue(prompt)} />
         ))}
-        {messages.map((msg: ChatMessageResponse) => {
+        {messages.map((msg: ChatMessageResponse, i: number) => {
+          // Latest assistant turn that's still receiving deltas wears the
+          // `.agent-glow` left-rule walk so the active turn reads as alive
+          // (CSS handles `prefers-reduced-motion: reduce` — no JS branch
+          // needed). Only ever true for the LAST row in `messages` to avoid
+          // stale streaming flags on older rows from glowing forever.
+          const isLatestStreaming =
+            i === messages.length - 1 &&
+            msg.role === "assistant" &&
+            !!msg.is_streaming;
           if (msg.role === "tool") {
             return (
               <div key={msg.id} className="flex justify-start" data-testid="tool-message">
                 <div className="max-w-[92%] sm:max-w-[85%] lg:max-w-[80%] min-w-0 flex-1">
-                  <StoredToolMessageItem id={msg.id} content={msg.content} />
+                  <StoredToolMessageItem
+                    id={msg.id}
+                    content={msg.content}
+                    createdAt={msg.created_at}
+                  />
                 </div>
               </div>
             );
@@ -479,9 +642,8 @@ export function ChatConversation({
               </div>
             );
           }
-          return (
+          const rendered = (
             <ChatMessage
-              key={msg.id}
               role={msg.role as "user" | "assistant"}
               content={msg.content}
               inputTokens={msg.input_tokens}
@@ -492,6 +654,16 @@ export function ChatConversation({
               attachments={msg.attachments}
               messageId={msg.id}
             />
+          );
+          const justify = msg.role === "user" ? "justify-end" : "justify-start";
+          return (
+            <div
+              key={msg.id}
+              className={cn("flex", justify, isLatestStreaming && "agent-glow")}
+              data-testid={isLatestStreaming ? "agent-glow-turn" : undefined}
+            >
+              {rendered}
+            </div>
           );
         })}
         {/*
@@ -523,6 +695,7 @@ export function ChatConversation({
                   <StoredToolMessageItem
                     id={block.id}
                     content={{ kind: "call", name: block.name, input: block.input, summary: block.summary }}
+                    createdAt={block.createdAt}
                   />
                 </div>
               </div>
@@ -535,6 +708,7 @@ export function ChatConversation({
                   <StoredToolMessageItem
                     id={block.id}
                     content={{ kind: "result", name: block.name, output: block.output, summary: block.summary }}
+                    createdAt={block.createdAt}
                   />
                 </div>
               </div>
@@ -657,42 +831,73 @@ export function ChatConversation({
           </div>
         )}
 
-        {/* Synthesized diff card — lists files the agent has edited in this
+        {/* Synthesized diff chip — lists files the agent has edited in this
             chat and, on demand, expands to the full unified diff. Summary
             and diff are both session-isolated (journal-based, not
             `git diff` of the shared working tree) — see
             src/services/file-edit-journal.ts for why. Hidden when the
-            agent has not made any Edit/Write/MultiEdit calls yet. */}
-        {chatDiff && chatDiff.total_entries > 0 && chatDiff.summary && (
-          <div className="space-y-2" data-testid="chat-diff-card">
-            {/* Collapsed summary: the Card itself already supplies `py-4`, so
-                CardContent must not add its own vertical padding — otherwise
-                the paddings stack and the one-line summary sits in a ~64px
-                block. Zeroing CardContent's py- here halves the height. */}
-            <Card>
-              <CardContent className="flex items-center gap-4 py-0">
-                <div className="flex-1">
-                  <p className="font-mono text-sm">{chatDiff.summary}</p>
-                </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setShowChatDiff(v => !v)}
+            agent has not made any Edit/Write/MultiEdit calls yet.
+
+            M25 redesign — collapsed summary renders as a compact pill (file
+            count, +added / -removed in semantic colours, "Show diff"
+            affordance) instead of a full-width card. The expanded unified
+            diff still lives in a Card so monospace diff rendering keeps the
+            same surface treatment as before.
+
+            Counts are pulled from `chatDiff.summary` ("N files changed,
+            +A / -R") because the API returns the human-readable string
+            rather than typed fields — see `summarizeJournal` in
+            src/services/file-edit-journal.ts. The regex tolerates both
+            singular ("1 file changed") and plural variants. If the parse
+            fails for any reason, we fall back to rendering the raw summary
+            string so the user still sees something useful. */}
+        {chatDiff && chatDiff.total_entries > 0 && chatDiff.summary && (() => {
+          const parsed = chatDiff.summary.match(
+            /^(\d+)\s+files?\s+changed,\s+\+(\d+)\s+\/\s+-(\d+)$/,
+          );
+          const files = parsed ? Number(parsed[1]) : null;
+          const added = parsed ? Number(parsed[2]) : null;
+          const removed = parsed ? Number(parsed[3]) : null;
+          return (
+            <div className="space-y-2" data-testid="chat-diff-card">
+              <div className="flex">
+                <button
+                  type="button"
+                  onClick={() => setShowChatDiff((v) => !v)}
+                  className="inline-flex items-center gap-2 rounded-full border bg-card px-3 py-1 text-xs font-medium text-foreground transition-colors hover:bg-muted"
                   data-testid="chat-diff-toggle"
+                  aria-expanded={showChatDiff}
                 >
-                  {showChatDiff ? "Hide Diff" : "Show Diff"}
-                </Button>
-              </CardContent>
-            </Card>
-            {showChatDiff && (
-              <Card>
-                <CardContent>
-                  <InlineDiff diff={chatDiff.diff} truncated={chatDiff.truncated} />
-                </CardContent>
-              </Card>
-            )}
-          </div>
-        )}
+                  {parsed && files !== null && added !== null && removed !== null ? (
+                    <>
+                      <span className="font-mono text-muted-foreground">
+                        {files} {files === 1 ? "file" : "files"}
+                      </span>
+                      <span className="font-mono text-emerald-500 dark:text-emerald-400">
+                        +{added.toLocaleString()}
+                      </span>
+                      <span className="font-mono text-rose-500 dark:text-rose-400">
+                        −{removed.toLocaleString()}
+                      </span>
+                    </>
+                  ) : (
+                    <span className="font-mono">{chatDiff.summary}</span>
+                  )}
+                  <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                    {showChatDiff ? "Hide" : "Show"}
+                  </span>
+                </button>
+              </div>
+              {showChatDiff && (
+                <Card>
+                  <CardContent>
+                    <InlineDiff diff={chatDiff.diff} truncated={chatDiff.truncated} />
+                  </CardContent>
+                </Card>
+              )}
+            </div>
+          );
+        })()}
       </div>
 
         {/* Floating "your prompts" toggle — lists every user turn in this
@@ -822,44 +1027,27 @@ export function ChatConversation({
       {/*
         Queued-messages bar — shows prompts the user lined up while a turn
         was in flight. Matches Claude Code: queued items drain automatically
-        into the next turn as soon as the current one ends. Each chip has a
-        ✕ to un-queue before it runs. Pressing Stop (in the composer) only
-        aborts the turn in flight; the queue keeps draining.
+        into the next turn as soon as the current one ends. M25 redesign
+        moved the markup into <QueuedMessagesList /> with numbered
+        positions, drag-and-drop reorder (Alt+↑/↓ keyboard fallback), and
+        an indigo head badge. Pressing Stop in the composer aborts only
+        the turn in flight; the queue keeps draining — "Clear all" drops
+        the rest at once.
+
+        `disabled` mirrors `serverRunning`: while a drain is in flight the
+        store rejects reorders to avoid the head-race documented in
+        chat-queue-store.ts → reorderQueue. Surfacing it here makes the
+        rejection visible (cursor turns into not-allowed, items lose
+        hover affordance) instead of making the user wonder why their
+        drag silently bounced.
       */}
-      {queuedMessages.length > 0 && (
-        <div
-          className="border-t bg-muted/20 px-3 py-2 space-y-1"
-          data-testid="chat-queued-bar"
-        >
-          <div className="text-[11px] font-medium text-muted-foreground">
-            Queued ({queuedMessages.length})
-          </div>
-          <div className="space-y-1">
-            {queuedMessages.map((q) => (
-              <div
-                key={q.id}
-                className="flex items-center gap-2 rounded bg-background px-2 py-1 text-xs"
-                data-testid="chat-queued-item"
-              >
-                <span className="min-w-0 flex-1 truncate" title={q.data.content}>
-                  {q.data.content}
-                </span>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  className="h-5 w-5 shrink-0"
-                  onClick={() => removeFromQueue(q.id)}
-                  aria-label="Remove from queue"
-                  data-testid="chat-queued-remove"
-                >
-                  <X className="h-3 w-3" />
-                </Button>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
+      <QueuedMessagesList
+        items={queuedMessages}
+        onRemove={removeFromQueue}
+        onClearAll={clearQueue}
+        onReorder={reorderQueue}
+        disabled={serverRunning}
+      />
 
       <ChatComposer
         chatId={chatId}
@@ -884,6 +1072,13 @@ export function ChatConversation({
         placeholder={placeholder}
         toolbar={
           <>
+            {/*
+              All four selectors share INLINE_TRIGGER_CLS so the composer
+              footer reads as a single uniform row rather than four
+              free-floating bordered fields. Width caps (max-w-[10rem]) keep
+              long labels (e.g. "Claude Code Personal") truncating with an
+              ellipsis instead of pushing Stop/Send off the row.
+            */}
             <Select
               value={chatKeyId}
               onValueChange={(v) => {
@@ -901,7 +1096,7 @@ export function ChatConversation({
               }}
             >
               <SelectTrigger
-                className="h-8 w-40 text-xs"
+                className={cn(INLINE_TRIGGER_CLS, "max-w-[10rem]")}
                 data-testid="chat-key-select"
               >
                 <SelectValue placeholder="Key..." />
@@ -926,7 +1121,9 @@ export function ChatConversation({
                 }
               }}
             >
-              <SelectTrigger className="h-8 w-44 text-xs">
+              <SelectTrigger
+                className={cn(INLINE_TRIGGER_CLS, "max-w-[11rem]")}
+              >
                 <SelectValue placeholder="Model" />
               </SelectTrigger>
               <SelectContent>
@@ -937,20 +1134,18 @@ export function ChatConversation({
                 ))}
               </SelectContent>
             </Select>
-            <div className="w-56">
-              <PermissionModeSelect
-                value={chatDetail?.permission_mode}
-                onChange={(mode: PermissionMode | null) => {
-                  if (!chatId) return;
-                  updateChatMutation.mutate({
-                    chatId,
-                    data: { permission_mode: mode },
-                  });
-                }}
-                inheritLabel="inherit from project / workspace"
-                compact
-              />
-            </div>
+            <PermissionModeSelect
+              value={chatDetail?.permission_mode}
+              onChange={(mode: PermissionMode | null) => {
+                if (!chatId) return;
+                updateChatMutation.mutate({
+                  chatId,
+                  data: { permission_mode: mode },
+                });
+              }}
+              inheritLabel="inherit from project / workspace"
+              triggerClassName={cn(INLINE_TRIGGER_CLS, "w-fit max-w-[14rem]")}
+            />
             <ChatThinkingEffortControl
               // Default to "adaptive thinking on" whenever the chat detail
               // hasn't resolved yet — matches the DB default + SDK default.
@@ -960,6 +1155,8 @@ export function ChatConversation({
               thinkingEnabled={chatDetail?.thinking_enabled ?? true}
               effort={(chatDetail?.effort as EffortLevel | null | undefined) ?? null}
               disabled={!chatId}
+              inline
+              triggerClassName="h-7"
               onThinkingChange={(next) => {
                 if (!chatId) return;
                 updateChatMutation.mutate({

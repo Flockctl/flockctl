@@ -18,8 +18,33 @@ export function getDb(dbPath?: string): FlockctlDb {
 
   const path = dbPath ?? join(dataDir, "flockctl.db");
   _sqlite = new Database(path);
+  // WAL gives us concurrent readers vs a writer (vs the default journal
+  // mode that locks the whole DB on every write). Required for the
+  // daemon's "many small reads + occasional writes" workload — every
+  // route handler that does `db.select(...).get()` would otherwise queue
+  // behind a single in-flight task-status update.
   _sqlite.pragma("journal_mode = WAL");
+  // `synchronous = NORMAL` (vs the SQLite default `FULL`) skips the
+  // per-write fsync between transaction boundaries. With WAL this is
+  // SQLite's recommended setting — durability remains crash-safe (the
+  // checkpoint on commit is still synced) and write throughput
+  // increases ~2-3× under our typical task-execution load. The
+  // tradeoff is a narrow window in which an OS-level crash (kernel
+  // panic, sudden power loss; NOT a process crash) can lose the last
+  // few committed transactions. For a single-user developer daemon the
+  // tradeoff is overwhelmingly worth it; the next task run rebuilds
+  // any lost state.
+  _sqlite.pragma("synchronous = NORMAL");
   _sqlite.pragma("foreign_keys = ON");
+  // busy_timeout (audit-round-7 finding): WAL mode lets concurrent
+  // readers coexist with a single writer, but two writers (e.g. the
+  // rate-limit scheduler firing while a route is processing a PATCH)
+  // still serialise. Without busy_timeout, contention raises
+  // SQLITE_BUSY as a synchronous Error → the catching handler returns
+  // 500 (or worse, bubbles to server-entry's `unhandledRejection`
+  // which calls process.exit). 5s is far more than any realistic
+  // contention window and lets SQLite retry transparently.
+  _sqlite.pragma("busy_timeout = 5000");
 
   _db = drizzle(_sqlite, { schema });
   return _db;

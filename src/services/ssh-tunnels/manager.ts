@@ -32,6 +32,23 @@ import type {
 } from "./types.js";
 
 /**
+ * Bound the per-tunnel stderr buffer so a misbehaving remote that
+ * spams stderr (verbose `-v`, infinite reconnect noise, broken host)
+ * cannot OOM the daemon over a long-lived tunnel. Mirrors the
+ * `maxBuffer` semantics of Node's `execFile`.
+ *
+ * 64 KiB keeps the most recent error context for the classifier
+ * (which only looks at the tail anyway) while capping growth.
+ */
+const SSH_STDERR_MAX_BYTES = 64 * 1024;
+
+function appendBoundedStderr(prev: string, chunk: string): string {
+  const combined = prev + chunk;
+  if (combined.length <= SSH_STDERR_MAX_BYTES) return combined;
+  return combined.slice(-SSH_STDERR_MAX_BYTES);
+}
+
+/**
  * Signature of the ready-gate probe. Injectable via the manager constructor
  * so tests can substitute a fast-resolving stub instead of waiting on a real
  * fetch loop against the live port.
@@ -328,7 +345,7 @@ export class SshTunnelManager {
 
     child.stderr?.setEncoding("utf8");
     child.stderr?.on("data", (chunk: string) => {
-      stderrBuffer.value += chunk;
+      stderrBuffer.value = appendBoundedStderr(stderrBuffer.value, chunk);
       // Reclassify-on-read — if we see a host-key warning before the
       // child has exited, the UI shouldn't have to wait for `exit` to
       // show a useful error. `exitCode` is still null here, so the
@@ -460,11 +477,12 @@ export class SshTunnelManager {
     // keeps the production path (real ssh emits Buffer) and the test path
     // on a single code line.
     child.stderr?.on("data", (chunk: Buffer | string) => {
-      thisEntry.stderrBuffer +=
+      const text =
         /* v8 ignore next — tests only exercise the string-payload limb via
            PassThrough; the Buffer path is the production one but no test
            synthesises a real Buffer chunk. */
         typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      thisEntry.stderrBuffer = appendBoundedStderr(thisEntry.stderrBuffer, text);
     });
 
     // If the ssh child dies during the probe, abort the probe, classify

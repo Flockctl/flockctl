@@ -489,6 +489,15 @@ function parseMissionEventEnvelope(
 }
 
 /**
+ * Hard cap on the in-memory live-events overlay. On a long-running mission
+ * the WS-streamed event tail would grow without bound; the timeline UI
+ * only ever renders the head, so older rows can be safely dropped from the
+ * overlay (they're still queryable via the canonical paginated GET when
+ * the user scrolls or reloads).
+ */
+const MAX_LIVE_EVENTS_RETENTION = 500;
+
+/**
  * Live mission timeline. Combines an initial GET with a RAF-coalesced WS
  * stream. See header comment block above for the design rationale.
  */
@@ -530,13 +539,28 @@ export function useMissionEvents(missionId: string): UseMissionEventsResult {
     pendingRef.current = [];
     setLiveEvents((prev) => {
       // De-dupe by event id. The seen set is updated as we go.
-      const out = [...prev];
+      //
+      // Build the new-prefix with `push` (O(1)) and reverse it once at
+      // the end so newest stays first inside the prefix, then concat with
+      // `prev`. Previously this used `out.unshift(ev)` per event against
+      // the FULL buffer, which is O(n) per call (memmove); on a busy
+      // mission with `k` new events arriving against `n` rows the total
+      // was O(n*k). New shape: O(n+k).
+      const dedupedNewest: MissionEvent[] = [];
       for (const ev of incoming) {
         if (seenIdsRef.current.has(ev.id)) continue;
         seenIdsRef.current.add(ev.id);
-        out.unshift(ev); // newest-first
+        dedupedNewest.push(ev);
       }
-      return out;
+      if (dedupedNewest.length === 0) return prev;
+      dedupedNewest.reverse(); // newest-first inside the new prefix
+      const merged = dedupedNewest.concat(prev);
+      // Bound the live overlay to avoid an unbounded buffer on a long-running
+      // mission: the timeline UI only needs the newest N events. Older rows
+      // remain queryable via the canonical paginated GET.
+      return merged.length > MAX_LIVE_EVENTS_RETENTION
+        ? merged.slice(0, MAX_LIVE_EVENTS_RETENTION)
+        : merged;
     });
   }, []);
 

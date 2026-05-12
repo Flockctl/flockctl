@@ -25,8 +25,18 @@ describe("AgentQuestionPrompt picker variants", () => {
       document.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')
     );
   }
+  /**
+   * Count the prompt's free-text input regardless of whether it renders as
+   * `<textarea>` (with-options "Other" field) or `<input type="text">` (the
+   * no-options minimal form). Both use the same `agent-question-textarea`
+   * test id, so we can drive off that.
+   */
   function getTextareas() {
-    return Array.from(document.querySelectorAll<HTMLTextAreaElement>("textarea"));
+    return Array.from(
+      document.querySelectorAll<HTMLElement>(
+        '[data-testid="agent-question-textarea"]',
+      ),
+    );
   }
 
   it("textarea_when_no_options: renders only a textarea, no radio/checkbox; submits typed value", async () => {

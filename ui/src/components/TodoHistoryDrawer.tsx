@@ -16,7 +16,7 @@ import {
   TabsTrigger,
 } from "@/components/ui/tabs";
 import { useChatTodoAgents, useChatTodoHistory } from "@/lib/hooks";
-import { timeAgo } from "@/lib/utils";
+import { timeAgo, parseServerTimestamp } from "@/lib/utils";
 import {
   CheckCircle2,
   Circle,
@@ -206,7 +206,7 @@ function AgentPane({ chatId, agent }: { chatId: string | null; agent: ChatTodoAg
                 Latest snapshot
               </h3>
               <p className="text-[11px] text-muted-foreground tabular-nums">
-                {new Date(latest.created_at).toLocaleString()} ·{" "}
+                {parseServerTimestamp(latest.created_at).toLocaleString()} ·{" "}
                 {latest.counts.completed} / {latest.counts.total} done
                 {latest.counts.in_progress > 0 &&
                   ` · ${latest.counts.in_progress} in progress`}
@@ -220,7 +220,14 @@ function AgentPane({ chatId, agent }: { chatId: string | null; agent: ChatTodoAg
           ) : (
             <ul className="space-y-1.5">
               {latest.todos.map((todo, i) => (
-                <TodoRow key={i} todo={todo} />
+                // Stable key derived from `content` (TodoWrite enforces
+                // uniqueness within a snapshot). Falls back to a
+                // positional key when content is empty — only happens
+                // for malformed legacy rows.
+                <TodoRow
+                  key={todo.content ? `c:${todo.content}` : `pos:${i}`}
+                  todo={todo}
+                />
               ))}
             </ul>
           )}
@@ -369,7 +376,10 @@ function OlderSnapshotItem({ snap }: { snap: ChatTodoHistoryItem }) {
       {open && (
         <ul className="px-3 pb-3 pt-1 space-y-1.5 border-t">
           {snap.todos.map((todo, i) => (
-            <TodoRow key={i} todo={todo} />
+            <TodoRow
+              key={todo.content ? `c:${todo.content}` : `pos:${i}`}
+              todo={todo}
+            />
           ))}
         </ul>
       )}
@@ -418,7 +428,7 @@ function TodoRow({
         {completedAt && (
           <span
             className="ml-2 text-[10px] text-muted-foreground tabular-nums"
-            title={new Date(completedAt).toLocaleString()}
+            title={parseServerTimestamp(completedAt).toLocaleString()}
             data-testid="todo-completed-at"
           >
             ✓ {timeAgo(completedAt)}

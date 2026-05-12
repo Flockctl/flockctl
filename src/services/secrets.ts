@@ -4,6 +4,7 @@ import { randomBytes, createCipheriv, createDecipheriv } from "crypto";
 import { and, eq, isNull } from "drizzle-orm";
 import { getDb } from "../db/index.js";
 import { secrets, projects, workspaces } from "../db/schema.js";
+import { getProjectById } from "../lib/db-helpers.js";
 import { getFlockctlHome } from "../config/index.js";
 
 export type SecretScope = "global" | "workspace" | "project";
@@ -52,11 +53,18 @@ function loadOrCreateMasterKey(): Buffer {
 
   mkdirSync(dirname(keyPath), { recursive: true });
   const buf = randomBytes(KEY_LEN);
-  writeFileSync(keyPath, buf.toString("base64") + "\n", "utf-8");
+  // Pass mode in the open() syscall so the master key never exists on disk
+  // with anything looser than 0o600, eliminating the TOCTOU window between
+  // writeFileSync and a follow-up chmod. Node honours `mode` as the perm
+  // bits applied at O_CREAT time on POSIX.
+  writeFileSync(keyPath, buf.toString("base64") + "\n", { encoding: "utf-8", mode: 0o600 });
+  // Belt-and-braces: writeFileSync respects existing perms when the file
+  // already exists, so re-chmod handles the (rare) overwrite path. Failure
+  // is non-fatal — Windows is unsupported per CLAUDE.md rule 6 anyway.
   try {
     chmodSync(keyPath, 0o600);
   } catch {
-    // chmod may fail on some filesystems (Windows) — non-fatal
+    /* v8 ignore next — non-POSIX filesystems may reject chmod; the open() mode bits already applied. */
   }
   _cachedKey = buf;
   return buf;
@@ -235,7 +243,7 @@ export function resolveSecretValue(name: string, projectId: number | null): stri
     ).get();
     if (row) return decryptValue(row.value);
 
-    const project = db.select().from(projects).where(eq(projects.id, projectId)).get();
+    const project = getProjectById(projectId);
     workspaceId = project?.workspaceId ?? null;
   }
 

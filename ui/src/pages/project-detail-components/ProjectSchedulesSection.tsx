@@ -4,6 +4,7 @@ import {
   useResumeSchedule,
   useDeleteSchedule,
 } from "@/lib/hooks";
+import { useWsAwarePolling } from "@/lib/global-ws";
 import type { Schedule } from "@/lib/types";
 import { ScheduleStatus, ScheduleType } from "@/lib/types";
 import { Badge } from "@/components/ui/badge";
@@ -20,17 +21,18 @@ import {
 } from "@/components/ui/table";
 import { CreateScheduleDialog } from "@/pages/schedules";
 import { ScheduleStatusBadge } from "@/components/schedule-status-badge";
+import { formatDateTime } from "@/lib/format";
 
 // --- Scheduled Tasks Section ---
 
-function formatScheduleTime(iso: string | null): string {
-  if (!iso) return "\u2014";
-  return new Date(iso).toLocaleString();
-}
+const formatScheduleTime = formatDateTime;
 
 export function ProjectSchedulesSection({ projectId }: { projectId: string }) {
+  // Pause polling on hidden tabs; collapse to no-op when WS is up (we
+  // get schedule-status pushes through the global socket).
+  const refetchInterval = useWsAwarePolling(10_000);
   const { data, isLoading } = useProjectSchedules(projectId, 0, 50, {
-    refetchInterval: 10_000,
+    refetchInterval,
   });
   const pauseSchedule = usePauseSchedule();
   const resumeSchedule = useResumeSchedule();
@@ -41,8 +43,8 @@ export function ProjectSchedulesSection({ projectId }: { projectId: string }) {
 
   return (
     <div>
-      <div className="flex items-center justify-between mb-4">
-        <h2 className="text-lg font-semibold">Scheduled Tasks</h2>
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-[13px] font-semibold leading-tight">Scheduled Tasks</h2>
         <CreateScheduleDialog projectId={projectId} buttonSize="sm" />
       </div>
 

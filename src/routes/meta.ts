@@ -97,31 +97,61 @@ async function parseBody<T>(c: import("hono").Context, schema: z.ZodType<T>): Pr
   return parsed.data;
 }
 
+// In-memory cache for the npm registry response. The UI polls
+// /meta/version on settings load + after a daemon restart, so multiple
+// near-simultaneous requests would each hit npmjs.org over a fresh TLS
+// connection. A 5-minute TTL is well below the cadence at which a new
+// flockctl release lands (multiple weeks between tags) but cheap enough
+// that we'll catch a new version on the next probe.
+interface VersionCacheEntry {
+  latest: string | null;
+  error: string | null;
+  fetchedAt: number; // Date.now()
+}
+const VERSION_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+let versionCache: VersionCacheEntry | null = null;
+
+/** @internal — test seam. Drops the cached npm registry response so the next
+ *  /meta/version request hits `fetch()` fresh. Tests that swap globalThis.fetch
+ *  between cases call this in `beforeEach` to avoid cross-test pollution. */
+export function __resetVersionCacheForTests(): void {
+  versionCache = null;
+}
+
 // GET /meta/version — current daemon version + latest from npm registry
 metaRoutes.get("/version", async (c) => {
   const current = getPackageVersion();
   const name = getPackageName();
   let latest: string | null = null;
   let error: string | null = null;
-  try {
-    const controller = new AbortController();
-    const to = setTimeout(() => controller.abort(), 5000);
-    const res = await fetch(`https://registry.npmjs.org/${name}`, {
-      signal: controller.signal,
-      headers: { Accept: "application/json" },
-    });
-    clearTimeout(to);
-    if (!res.ok) throw new Error(`npm registry responded with ${res.status}`);
-    const body = (await res.json()) as {
-      "dist-tags"?: Record<string, string>;
-    };
-    const tags = body["dist-tags"] ?? {};
-    const preferNext = current.includes("-");
-    latest =
-      (preferNext && tags.next) ? tags.next : (tags.latest ?? tags.next ?? null);
-  } catch (e) {
-    error = e instanceof Error ? e.message : String(e);
+
+  // Cache hit — return immediately without touching the network.
+  if (versionCache && Date.now() - versionCache.fetchedAt < VERSION_CACHE_TTL_MS) {
+    latest = versionCache.latest;
+    error = versionCache.error;
+  } else {
+    try {
+      const controller = new AbortController();
+      const to = setTimeout(() => controller.abort(), 5000);
+      const res = await fetch(`https://registry.npmjs.org/${name}`, {
+        signal: controller.signal,
+        headers: { Accept: "application/json" },
+      });
+      clearTimeout(to);
+      if (!res.ok) throw new Error(`npm registry responded with ${res.status}`);
+      const body = (await res.json()) as {
+        "dist-tags"?: Record<string, string>;
+      };
+      const tags = body["dist-tags"] ?? {};
+      const preferNext = current.includes("-");
+      latest =
+        (preferNext && tags.next) ? tags.next : (tags.latest ?? tags.next ?? null);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
+    versionCache = { latest, error, fetchedAt: Date.now() };
   }
+
   const updateAvailable =
     !!latest && current !== "unknown" && semverGt(latest, current);
   const install = getInstallInfo();
@@ -980,7 +1010,14 @@ metaRoutes.post("/remote-servers/:id/tunnel/restart", requireLoopback, async (c)
 });
 
 // POST /meta/remote-servers/:id/proxy-token — hand token to the local UI
-metaRoutes.post("/remote-servers/:id/proxy-token", (c) => {
+//
+// `requireLoopback` (audit-round-7 SECURITY finding): without this gate,
+// any holder of a bearer token to THIS daemon could fetch every OTHER
+// registered remote-server's token — a privilege escalation across
+// remote scopes. Aligns with the existing requireLoopback gates on
+// `POST /remote-servers`, `PATCH /remote-servers/:id`, the DELETE, and
+// the tunnel-control endpoints further down in this file.
+metaRoutes.post("/remote-servers/:id/proxy-token", requireLoopback, (c) => {
   const { id } = c.req.param();
   const server = getRemoteServers().find((s) => s.id === id);
   if (!server) throw new NotFoundError("Server", id);

@@ -114,6 +114,63 @@ describe("classifyLimit", () => {
       expect(r!.kind).toBe("usage_limit");
     });
 
+    it("recognises Claude Code CLI 'hit your limit · resets …' wording and parses the reset time", () => {
+      // Verbatim shape produced by client.ts:432 wrapping the CLI's stderr
+      // for a session-cap hit. NOW is 2023-11-14T22:13:20Z, Istanbul is
+      // UTC+3 (no DST since 2016) so the operator's wall-clock is
+      // 2023-11-15T01:13:20. 9:30pm Istanbul on 2023-11-15 is
+      // 2023-11-15T18:30:00Z — i.e. NOW + 73,000,000 ms, plus the 30s
+      // grace buffer the parser adds.
+      const e = new Error(
+        "AI stream error: Claude Code returned an error result: You've hit your limit · resets 9:30pm (Europe/Istanbul)",
+      );
+      const r = classifyLimit(e, { now: fixedNow });
+      expect(r).not.toBeNull();
+      expect(r!.kind).toBe("usage_limit");
+      expect(r!.provider).toBe("anthropic");
+      expect(r!.confidence).toBe("exact");
+      expect(r!.resumeAtMs).toBe(NOW + 73_000_000 + _internals.RESET_TIME_GRACE_MS);
+    });
+
+    it("rolls reset time over to tomorrow when it has already passed today", () => {
+      // NOW Istanbul wall-clock is 01:13:20 on 2023-11-15. A reset advertised
+      // as "12:30am (Europe/Istanbul)" already happened at 00:30 today, so
+      // the target must be 00:30 on 2023-11-16 = 2023-11-15T21:30:00Z.
+      const e = new Error(
+        "You've hit your limit · resets 12:30am (Europe/Istanbul)",
+      );
+      const r = classifyLimit(e, { now: fixedNow });
+      expect(r!.confidence).toBe("exact");
+      // From 22:13:20 UTC → 21:30:00 UTC the next day = 23h 16m 40s = 83,800,000 ms.
+      expect(r!.resumeAtMs).toBe(NOW + 83_800_000 + _internals.RESET_TIME_GRACE_MS);
+    });
+
+    it("falls back to estimated when timezone is missing", () => {
+      // No "(TZ)" suffix → wall-clock is ambiguous. Must NOT silently assume UTC.
+      const e = new Error("You've hit your limit · resets 10:50pm");
+      const r = classifyLimit(e, { now: fixedNow });
+      expect(r!.confidence).toBe("estimated");
+      expect(r!.resumeAtMs).toBe(NOW + _internals.MIN_ESTIMATED_DELAY_MS);
+    });
+
+    it("falls back to estimated when timezone is unknown to ICU", () => {
+      const e = new Error(
+        "You've hit your limit · resets 10:50pm (Mars/Olympus_Mons)",
+      );
+      const r = classifyLimit(e, { now: fixedNow });
+      expect(r!.confidence).toBe("estimated");
+      expect(r!.resumeAtMs).toBe(NOW + _internals.MIN_ESTIMATED_DELAY_MS);
+    });
+
+    it("accepts the bare-hour shape 'resets 10pm (TZ)' without minutes", () => {
+      const e = new Error("You've hit your limit · resets 10pm (Europe/Istanbul)");
+      const r = classifyLimit(e, { now: fixedNow });
+      expect(r!.confidence).toBe("exact");
+      // 10pm Istanbul on 2023-11-15 = 2023-11-15T19:00:00Z. From NOW
+      // (2023-11-14T22:13:20Z) → 20h 46m 40s = 74,800,000 ms.
+      expect(r!.resumeAtMs).toBe(NOW + 74_800_000 + _internals.RESET_TIME_GRACE_MS);
+    });
+
     it("recognises nested .error.type === billing_error", () => {
       const e = Object.assign(new Error("nested"), {
         error: { type: "billing_error" },

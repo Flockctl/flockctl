@@ -181,6 +181,10 @@ export function createTestDb(): {
       decision_table TEXT,
       file_edits TEXT,
       resume_at INTEGER,
+      -- Mirrors migration 0060 — per-task git-worktree isolation.
+      isolation TEXT,
+      worktree_path TEXT,
+      worktree_branch TEXT,
       created_at TEXT DEFAULT (datetime('now')),
       started_at TEXT,
       completed_at TEXT,
@@ -195,6 +199,8 @@ export function createTestDb(): {
       stream_type TEXT DEFAULT 'stdout',
       timestamp TEXT DEFAULT (datetime('now'))
     );
+    -- Mirrors migration 0058_task_logs_index.
+    CREATE INDEX idx_task_logs_task_timestamp ON task_logs (task_id, timestamp);
 
     -- task_templates table is gone; templates now live on disk as JSON files
     -- managed by src/services/templates.ts. See migration 0037.
@@ -248,6 +254,10 @@ export function createTestDb(): {
       pinned INTEGER DEFAULT 0 NOT NULL,
       status TEXT NOT NULL DEFAULT 'idle',
       resume_at INTEGER,
+      -- Mirrors migration 0060 — per-chat git-worktree isolation.
+      isolation TEXT,
+      worktree_path TEXT,
+      worktree_branch TEXT,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );
@@ -306,6 +316,11 @@ export function createTestDb(): {
     );
     CREATE INDEX idx_usage_records_activity_type
       ON usage_records (activity_type) WHERE activity_type IS NOT NULL;
+    -- Mirrors migration 0057_fk_indexes — keep test schema in sync so the
+    -- query planner picks the same paths in tests as in production.
+    CREATE INDEX idx_usage_records_task ON usage_records (task_id);
+    CREATE INDEX idx_usage_records_chat_message ON usage_records (chat_message_id);
+    CREATE INDEX idx_usage_records_project ON usage_records (project_id);
 
     CREATE TABLE budget_limits (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -346,6 +361,8 @@ export function createTestDb(): {
     );
     CREATE INDEX idx_incidents_project ON incidents (project_id);
     CREATE INDEX idx_incidents_created ON incidents (created_at);
+    -- Mirrors migration 0057_fk_indexes.
+    CREATE INDEX idx_incidents_chat ON incidents (created_by_chat_id);
 
     -- FTS5 virtual table + triggers, mirroring migration 0025_add_incidents.sql.
     -- Required so services that issue MATCH queries against incidents_fts work
@@ -402,6 +419,112 @@ export function createTestDb(): {
     CREATE INDEX idx_agent_questions_task_status ON agent_questions (task_id, status);
     CREATE INDEX idx_agent_questions_chat_status ON agent_questions (chat_id, status);
     CREATE INDEX idx_agent_questions_status_created ON agent_questions (status, created_at);
+
+    -- Append-only forensic record of git mutations performed by Flockctl.
+    -- Mirrors migration 0046_git_audit_log.sql so service-layer unit tests
+    -- that exercise runGitCommand can verify the write happened without
+    -- having to run the full migration suite against an in-memory DB.
+    CREATE TABLE git_audit_log (
+      id TEXT PRIMARY KEY,
+      project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+      workspace_id INTEGER REFERENCES workspaces(id) ON DELETE SET NULL,
+      action TEXT NOT NULL,
+      args_json TEXT NOT NULL,
+      exit_code INTEGER,
+      reason TEXT,
+      stderr_truncated TEXT,
+      duration_ms INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      CONSTRAINT git_audit_log_action_check
+        CHECK (action IN ('pull','commit','push','log','branch_list','checkout','branch_delete','diff','discard','fetch','show','stash_push','stash_list','stash_pop','stash_drop')),
+      CONSTRAINT git_audit_log_scope_check
+        CHECK (project_id IS NOT NULL OR workspace_id IS NOT NULL)
+    );
+    CREATE INDEX idx_git_audit_log_project_created
+      ON git_audit_log (project_id, created_at DESC)
+      WHERE project_id IS NOT NULL;
+    CREATE INDEX idx_git_audit_log_workspace_created
+      ON git_audit_log (workspace_id, created_at DESC)
+      WHERE workspace_id IS NOT NULL;
+
+    -- FS audit log: append-only forensic record of project- / workspace-
+    -- scoped FS operations exposed by the API. v1 is read-only ('read');
+    -- subsequent slices broaden the action enum. Mirrors migration
+    -- 0049_fs_audit_log.sql.
+    CREATE TABLE fs_audit_log (
+      id TEXT PRIMARY KEY,
+      entity_type TEXT NOT NULL,
+      entity_id INTEGER NOT NULL,
+      project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+      workspace_id INTEGER REFERENCES workspaces(id) ON DELETE SET NULL,
+      action TEXT NOT NULL,
+      path TEXT NOT NULL,
+      ok INTEGER NOT NULL,
+      error_code TEXT,
+      ts INTEGER NOT NULL,
+      sha_before TEXT,
+      sha_after TEXT,
+      bytes INTEGER,
+      CONSTRAINT fs_audit_log_entity_type_check
+        CHECK (entity_type IN ('project','workspace')),
+      CONSTRAINT fs_audit_log_action_check
+        CHECK (action IN ('read','write','mkdir','create','rename','delete')),
+      CONSTRAINT fs_audit_log_ok_check
+        CHECK (ok IN (0,1)),
+      CONSTRAINT fs_audit_log_scope_check
+        CHECK (project_id IS NOT NULL OR workspace_id IS NOT NULL)
+    );
+    CREATE INDEX idx_fs_audit_log_project_ts
+      ON fs_audit_log (project_id, ts DESC)
+      WHERE project_id IS NOT NULL;
+    CREATE INDEX idx_fs_audit_log_workspace_ts
+      ON fs_audit_log (workspace_id, ts DESC)
+      WHERE workspace_id IS NOT NULL;
+
+    -- Scheduled wakeups: persist agent intent-to-resume so a daemon-side
+    -- worker can fire it even when the originating chat has no /loop
+    -- dispatcher attached. Mirrors migration 0047_scheduled_wakeups.sql.
+    CREATE TABLE scheduled_wakeups (
+      id TEXT PRIMARY KEY,
+      chat_id INTEGER REFERENCES chats(id) ON DELETE CASCADE,
+      task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+      claude_session_id TEXT NOT NULL,
+      fire_at INTEGER NOT NULL,
+      prompt TEXT NOT NULL,
+      reason TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      fired_at INTEGER,
+      missed_at INTEGER,
+      cancelled_at INTEGER,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      CONSTRAINT scheduled_wakeups_status_check
+        CHECK (status IN ('pending','fired','cancelled','missed')),
+      CONSTRAINT scheduled_wakeups_scope_check
+        CHECK (chat_id IS NOT NULL OR task_id IS NOT NULL)
+    );
+    CREATE INDEX idx_scheduled_wakeups_pending
+      ON scheduled_wakeups (fire_at)
+      WHERE status = 'pending';
+    CREATE INDEX idx_scheduled_wakeups_chat
+      ON scheduled_wakeups (chat_id, created_at DESC)
+      WHERE chat_id IS NOT NULL;
+    CREATE INDEX idx_scheduled_wakeups_task
+      ON scheduled_wakeups (task_id, created_at DESC)
+      WHERE task_id IS NOT NULL;
+
+    -- Plan-task → execution-task inverse index (migration 0062). Stores the
+    -- (execution_task_id → location) mapping so the auto-executor resolver
+    -- can do a PK lookup instead of an O(P×M×S×T) FS walk.
+    CREATE TABLE plan_task_execution_index (
+      execution_task_id INTEGER PRIMARY KEY,
+      project_id        INTEGER NOT NULL,
+      milestone_slug    TEXT NOT NULL,
+      slice_slug        TEXT NOT NULL,
+      task_slug         TEXT NOT NULL,
+      updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX idx_plan_task_exec_index_project
+      ON plan_task_execution_index (project_id);
   `);
 
   return { db, sqlite };

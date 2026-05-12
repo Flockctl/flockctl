@@ -166,7 +166,7 @@ export function WorkspaceConfigTab({ workspaceId }: { workspaceId: string }) {
   }
 
   return (
-    <div className="space-y-6" data-testid="workspace-config-tab">
+    <div className="space-y-4" data-testid="workspace-config-tab">
       {/* Save bar — pinned to the top of the tab. The tab already lives
           under a page header with the workspace title, so we don't repeat
           the title here. */}
@@ -177,6 +177,7 @@ export function WorkspaceConfigTab({ workspaceId }: { workspaceId: string }) {
           </Badge>
         )}
         <Button
+          size="sm"
           onClick={handleSave}
           disabled={updateWorkspace.isPending || allowedKeyIds.length === 0}
           data-testid="workspace-config-save"
@@ -197,7 +198,7 @@ export function WorkspaceConfigTab({ workspaceId }: { workspaceId: string }) {
         <CardHeader>
           <CardTitle>General</CardTitle>
         </CardHeader>
-        <CardContent className="space-y-4">
+        <CardContent className="space-y-3">
           <div className="space-y-2">
             <Label htmlFor="ws-name">Name *</Label>
             <Input
@@ -235,7 +236,7 @@ export function WorkspaceConfigTab({ workspaceId }: { workspaceId: string }) {
         <CardHeader>
           <CardTitle>AI Configuration</CardTitle>
         </CardHeader>
-        <CardContent className="space-y-4">
+        <CardContent className="space-y-3">
           <div className="space-y-2">
             <Label>Allowed AI Keys *</Label>
             <p className="text-xs text-muted-foreground">

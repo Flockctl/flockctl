@@ -92,14 +92,14 @@ export function _EditWorkspaceDialog({
           Edit
         </Button>
       </DialogTrigger>
-      <DialogContent className="max-w-lg">
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Edit Workspace</DialogTitle>
           <DialogDescription>
             Update workspace name or description.
           </DialogDescription>
         </DialogHeader>
-        <form onSubmit={handleSubmit} className="space-y-4">
+        <form onSubmit={handleSubmit} className="space-y-3">
           <div className="space-y-2">
             <Label htmlFor="edit-ws-name">Name *</Label>
             <Input

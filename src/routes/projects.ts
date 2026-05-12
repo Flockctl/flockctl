@@ -4,12 +4,14 @@ import { projects, tasks, schedules, usageRecords, workspaces } from "../db/sche
 import { eq, and, sql, desc, inArray } from "drizzle-orm";
 import { paginationParams } from "../lib/pagination.js";
 import { NotFoundError, ValidationError } from "../lib/errors.js";
-import { parseIdParam } from "../lib/route-params.js";
-import { execSync, execFileSync } from "child_process";
+import { parseIdParam, parseJsonBodySafe } from "../lib/route-params.js";
+import { computeEtag, etagMatches } from "../lib/etag.js";
+import { runReconcileWithObservability } from "../lib/reconcile-observability.js";
+import { execa } from "execa";
 import { existsSync, mkdirSync } from "fs";
 import { slugify } from "../lib/slugify.js";
 import { join } from "path";
-import { homedir } from "os";
+import { assertSafeWritePath, defaultProjectPath } from "../lib/safe-fs-path.js";
 import { listMilestones, listSlices, getProjectTree } from "../services/plan-store/index.js";
 import { loadProjectConfig, saveProjectConfig, type ProjectConfig } from "../services/project-config.js";
 import { parsePermissionModeBody } from "./_permission-mode.js";
@@ -43,7 +45,8 @@ import {
   initTodoFile,
   TODO_FILE_MAX_BYTES,
 } from "../services/todo-file.js";
-import { runGitPull } from "../services/git-operations.js";
+import { makeGitRouteHandlers } from "./git-route-handlers.js";
+import { makeFsRouteHandlers } from "./fs-route-handlers.js";
 
 const CONFIG_KEYS = [
   "model",
@@ -84,14 +87,15 @@ function mergeProjectConfig(path: string, incoming: Partial<ProjectConfig>): voi
 }
 
 function queueProjectReconcile(projectId: number) {
-  setImmediate(() => {
-    try {
-      reconcileClaudeSkillsForProject(projectId);
-      reconcileMcpForProject(projectId);
-    } catch (err) {
-      console.error(`[projects] reconcile ${projectId} failed:`, err);
-    }
-  });
+  setImmediate(() =>
+    runReconcileWithObservability(
+      { scope: "projects:reconcile", target: projectId },
+      () => {
+        reconcileClaudeSkillsForProject(projectId);
+        reconcileMcpForProject(projectId);
+      },
+    ),
+  );
 }
 
 export const projectRoutes = new Hono();
@@ -130,9 +134,19 @@ projectRoutes.get("/:id", (c) => {
 // POST /projects
 projectRoutes.post("/", async (c) => {
   const db = getDb();
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
 
-  if (!body.name) throw new ValidationError("name is required");
+  // Audit-round-7: trim and validate name — `if (!body.name)` accepted
+  // whitespace-only strings like "   " as truthy, which then landed in
+  // the DB as a "blank" project. Forbid blank-after-trim and cap the
+  // length defensively so we don't persist a 10 MB blob as a name.
+  if (typeof body.name !== "string" || !body.name.trim()) {
+    throw new ValidationError("name is required");
+  }
+  body.name = body.name.trim().slice(0, 200);
+  if (typeof body.description === "string") {
+    body.description = body.description.slice(0, 10_000);
+  }
 
   // Key selection is mandatory on create — pick at least one active key.
   // See src/routes/_allowed-keys.ts for the exact contract and why PATCH
@@ -143,16 +157,17 @@ projectRoutes.post("/", async (c) => {
   const hasExplicitPath = !!body.path;
   let projectPath: string = body.path ?? "";
   if (!projectPath) {
+    let workspacePath: string | null = null;
     if (body.workspaceId) {
       const { workspaces } = await import("../db/schema.js");
       const ws = db.select().from(workspaces).where(eq(workspaces.id, body.workspaceId)).get();
-      if (ws?.path) {
-        projectPath = join(ws.path, slugify(body.name));
-      }
+      workspacePath = ws?.path ?? null;
     }
-    if (!projectPath) {
-      projectPath = join(homedir(), "flockctl", "projects", slugify(body.name));
-    }
+    projectPath = defaultProjectPath(slugify(body.name), workspacePath);
+  } else {
+    // Path safety check: only validate when the caller explicitly supplied a
+    // path. The auto-derived fallback is always safe by construction.
+    assertSafeWritePath(projectPath);
   }
 
   let resolvedRepoUrl: string | null = body.repoUrl ?? null;
@@ -162,13 +177,15 @@ projectRoutes.post("/", async (c) => {
       throw new ValidationError("Directory already contains a git repository");
     }
     try {
-      // execFileSync (no shell) — argv passed directly to git, so repoUrl
+      // execa (no shell, async) — argv passed directly to git, so repoUrl
       // cannot be interpreted as shell metacharacters even if it contains
-      // quotes, semicolons, or backticks.
-      execFileSync("git", ["clone", "--", body.repoUrl, projectPath], { stdio: "pipe", timeout: 120_000 });
+      // quotes, semicolons, or backticks. Async variant frees the event
+      // loop during the (potentially slow) clone — see workspaces.ts for
+      // the same migration with rationale.
+      await execa("git", ["clone", "--", body.repoUrl, projectPath], { timeout: 120_000 });
     } catch (err: unknown) {
-      const e = err as { stderr?: Buffer; message?: string };
-      throw new ValidationError(`Git clone failed: ${e.stderr?.toString().trim() || e.message || "unknown error"}`);
+      const e = err as { stderr?: string; message?: string };
+      throw new ValidationError(`Git clone failed: ${(typeof e.stderr === "string" && e.stderr.trim()) || e.message || "unknown error"}`);
     }
   } else {
     const dirExists = existsSync(projectPath);
@@ -180,13 +197,14 @@ projectRoutes.post("/", async (c) => {
 
     if (!hasGit) {
       try {
-        execSync("git init", { cwd: projectPath, stdio: "pipe" });
+        await execa("git", ["init"], { cwd: projectPath });
       } catch {
         // Non-fatal
       }
     } else if (!resolvedRepoUrl) {
       try {
-        const remoteUrl = execSync("git remote get-url origin", { cwd: projectPath, stdio: ["pipe", "pipe", "pipe"] }).toString().trim();
+        const { stdout } = await execa("git", ["remote", "get-url", "origin"], { cwd: projectPath });
+        const remoteUrl = (typeof stdout === "string" ? stdout : "").trim();
         if (remoteUrl) resolvedRepoUrl = remoteUrl;
       } catch {
         // No 'origin' remote — leave repoUrl null
@@ -280,7 +298,7 @@ projectRoutes.patch("/:id", async (c) => {
   const id = parseIdParam(c);
   const existing = getProjectOrThrow(id);
 
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
   const permissionMode = parsePermissionModeBody(body);
   const gitignoreToggles = parseGitignoreToggles(body);
   // Same mandatory-keys rule as POST — when the caller sends the field,
@@ -290,6 +308,12 @@ projectRoutes.patch("/:id", async (c) => {
     body.allowedKeyIds,
     Object.prototype.hasOwnProperty.call(body, "allowedKeyIds"),
   );
+  // Path safety on adopt/move: a PATCH that re-points the project at a new
+  // directory must clear the same gate as create. Without this check a remote
+  // token holder could adopt `/etc` or `/var/log` after the fact.
+  if (typeof body.path === "string" && body.path.length > 0) {
+    assertSafeWritePath(body.path);
+  }
   db.update(projects)
     .set({
       ...(body.name !== undefined && { name: body.name }),
@@ -463,7 +487,21 @@ projectRoutes.get("/:id/tree", (c) => {
     }
   }
 
-  return c.json({ project, milestones: tree.milestones });
+  // ETag/304 — `/projects/:id/tree` is polled every 10-30s by the
+  // project-detail page; most polls return an identical payload (no
+  // plan change since last tick). 304 saves body transfer + spares
+  // the client a React re-render via React Query's structural
+  // sharing fallback.
+  const body = { project, milestones: tree.milestones };
+  const tag = computeEtag(body);
+  if (etagMatches(c, tag)) {
+    return new Response(null, {
+      status: 304,
+      headers: { ETag: tag },
+    });
+  }
+  c.header("ETag", tag);
+  return c.json(body);
 });
 
 // GET /projects/:id/allowed-keys — effective key allow-list for this project
@@ -631,7 +669,7 @@ projectRoutes.put("/:id/config", async (c) => {
 
   if (!project.path) throw new ValidationError("Project has no path — cannot save config file");
 
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
   const patch = extractConfigFromBody(body);
   mergeProjectConfig(project.path, patch);
   if (Object.keys(patch).length > 0) queueProjectReconcile(id);
@@ -740,7 +778,7 @@ projectRoutes.put("/:id/todo", async (c) => {
   const project = getProjectOrThrow(id);
   if (!project.path) throw new ValidationError("Project has no path — cannot save TODO.md");
 
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
   const content = typeof body?.content === "string" ? body.content : "";
   if (Buffer.byteLength(content, "utf-8") > TODO_FILE_MAX_BYTES) {
     throw new ValidationError(`TODO.md exceeds ${TODO_FILE_MAX_BYTES} bytes`);
@@ -749,27 +787,79 @@ projectRoutes.put("/:id/todo", async (c) => {
   return c.json(saveTodoFile(project.path, content));
 });
 
-// POST /projects/:id/git-pull — fast-forward pull from origin.
+// POST /projects/:id/git-{pull,commit,push}
 //
-// Wraps `git pull --ff-only` with a set of pre-flight guardrails (working
-// tree must be clean, branch must have an upstream, project must be a git
-// repo) and structured error reporting. See `src/services/git-operations.ts`
-// for the full contract — including why we deliberately refuse to merge or
-// rebase from this surface (those are terminal-grade decisions, not
-// button-grade).
-//
-// Response is *always* HTTP 200 with a discriminated `{ ok, ... }` body —
-// failures are encoded in the body, not the status code, so the UI's
-// `apiFetch` wrapper does not throw away the structured `reason` and
-// `stderr` fields when a pull legitimately fails (e.g. dirty working
-// tree). The route returns a 4xx only for project-shape errors that
-// happen *before* git is even invoked (missing project, missing path).
-projectRoutes.post("/:id/git-pull", async (c) => {
-  const id = parseIdParam(c);
-  const project = getProjectOrThrow(id);
-  if (!project.path) {
-    throw new ValidationError("Project has no path — cannot run git pull");
-  }
-  const result = await runGitPull(project.path);
-  return c.json(result);
+// These three endpoints share their entire shape (auth, error envelope,
+// audit-row attribution, body validation) with the workspace router's
+// future git endpoints — see `src/routes/git-route-handlers.ts` for the
+// full contract. The factory takes a `getEntity` that throws NotFoundError
+// on miss (project lookup) and an `attribution` that maps the entity onto
+// the `{ projectId, workspaceId }` pair the audit-row writer expects, so
+// the same handler can attribute project-router invocations to `project_id`
+// and a workspace-router invocation to `workspace_id` without any runtime
+// branching inside the handler itself.
+const projectGit = makeGitRouteHandlers({
+  resourceLabel: "Project",
+  getEntity: (id) => getProjectOrThrow(id),
+  attribution: (project) => ({ projectId: project.id }),
 });
+
+projectRoutes.get("/:id/git-status", projectGit.status);
+projectRoutes.get("/:id/git-log", projectGit.log);
+projectRoutes.get("/:id/git-diff", projectGit.diff);
+projectRoutes.get("/:id/git-show", projectGit.show);
+projectRoutes.post("/:id/git-pull", projectGit.pull);
+projectRoutes.post("/:id/git-commit", projectGit.commit);
+projectRoutes.post("/:id/git-push", projectGit.push);
+projectRoutes.post("/:id/git-discard", projectGit.discard);
+projectRoutes.post("/:id/git-fetch", projectGit.fetch);
+
+// Branch operations: list / checkout / delete. The `:name{.+}` wildcard on
+// the delete route is required so branch names containing `/` (e.g.
+// `feature/foo`) reach the handler — Hono's default `:name` segment
+// otherwise stops at the first slash. The handler re-validates the decoded
+// name against the public `BRANCH_NAME` regex regardless.
+projectRoutes.get("/:id/git-branches", projectGit.branchList);
+projectRoutes.post("/:id/git-checkout", projectGit.checkout);
+projectRoutes.delete("/:id/git-branches/:name{.+}", projectGit.branchDelete);
+
+// Stash operations: push / list / pop / drop. The `:ref{.+}` wildcard on
+// the drop route is required so the canonical `stash@{N}` ref (which
+// includes `@`, `{`, `}`) round-trips cleanly even when the client sends
+// it URL-encoded; the handler re-validates the decoded form against the
+// canonical regex regardless.
+projectRoutes.post("/:id/git-stash-push", projectGit.stashPush);
+projectRoutes.get("/:id/git-stash-list", projectGit.stashList);
+projectRoutes.post("/:id/git-stash-pop", projectGit.stashPop);
+projectRoutes.delete("/:id/git-stash/:ref{.+}", projectGit.stashDrop);
+
+// Filesystem read endpoints — entity-scoped variant that jails every relative
+// path inside `project.path`. The factory pattern mirrors `projectGit` above
+// so the same handler powers the workspace router (see workspaces.ts) without
+// runtime branching on entity type.
+const projectFs = makeFsRouteHandlers({
+  resourceLabel: "Project",
+  entityType: "project",
+  getEntity: (id) => getProjectOrThrow(id),
+  attribution: (project) => ({ projectId: project.id }),
+});
+
+projectRoutes.get("/:id/fs/list", projectFs.list);
+projectRoutes.get("/:id/fs/file", projectFs.readFile);
+
+// Flat-path enumeration backing the quick-open / fuzzy-finder UI. Returns
+// every non-ignored file path under `project.path`, capped at INDEX_PATH_CAP
+// with a `truncated` flag. Best-effort 30 s in-process cache keyed on
+// (projectRoot, mtime-of-root) — see `indexProjectPaths` in fs-operations.ts.
+projectRoutes.get("/:id/fs/index", projectFs.index);
+
+// Optimistic-concurrency write: PUT body { content, expectedSha, allowCreate? }.
+// Atomic temp+rename inside a per-file mutex; sha mismatch returns
+// `{ ok: false, error_code: 'fs_sha_conflict', currentSha }` in-body. See
+// `writeProjectFile` in fs-operations.ts for the full contract.
+projectRoutes.put("/:id/fs/file", projectFs.writeFile);
+
+// Mutations: mkdir / create / rename / delete via a single discriminated
+// endpoint. Same factory as the read paths so the workspace router gets
+// byte-identical wire semantics — see workspaces.ts.
+projectRoutes.post("/:id/fs/op", projectFs.op);

@@ -3,6 +3,7 @@ import type {
   QuestionRequest,
   QuestionOption,
 } from "./agent-session/index.js";
+import { parseQuestionOptions } from "./agent-session/parse-question-options.js";
 import { getDb } from "../db/index.js";
 import { agentQuestions } from "../db/schema.js";
 import { wsManager } from "./ws-manager.js";
@@ -192,16 +193,7 @@ export function broadcastAgentQuestionFromRow(
   },
   extraPayload: Record<string, unknown> = {},
 ): void {
-  let options: QuestionOption[] | null = null;
-  if (row.options != null) {
-    try {
-      const parsed = JSON.parse(row.options);
-      if (Array.isArray(parsed)) options = parsed as QuestionOption[];
-    } catch {
-      // Malformed JSON in the DB row is non-fatal: drop to free-form.
-      options = null;
-    }
-  }
+  const options: QuestionOption[] | null = parseQuestionOptions(row.options);
   broadcastOnChannel(ref, {
     type: "agent_question",
     payload: {

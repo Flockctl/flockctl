@@ -15,6 +15,7 @@ import { dirname, isAbsolute, join } from "path";
 import { eq } from "drizzle-orm";
 import { getDb } from "../../db/index.js";
 import { projects, workspaces } from "../../db/schema.js";
+import { getProjectById } from "../../lib/db-helpers.js";
 import { resolveSkillsForProject, resolveSkillsForWorkspace, type Skill } from "../skills.js";
 
 interface ManifestEntry {
@@ -28,8 +29,7 @@ interface ManifestEntry {
  * manifest to <project>/.flockctl/skills-state.json.
  */
 export function reconcileClaudeSkillsForProject(projectId: number): void {
-  const db = getDb();
-  const project = db.select().from(projects).where(eq(projects.id, projectId)).get();
+  const project = getProjectById(projectId);
   if (!project?.path || !existsSync(project.path)) return;
 
   const skills = resolveSkillsForProject(projectId);

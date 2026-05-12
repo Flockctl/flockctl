@@ -3,11 +3,16 @@
  * Tasks and chats both render them the same way, so the logic lives here.
  */
 
-function parseToolInput(raw: any): Record<string, unknown> {
-  if (typeof raw === "object" && raw !== null) return raw;
+function parseToolInput(raw: unknown): Record<string, unknown> {
+  if (typeof raw === "object" && raw !== null) {
+    return raw as Record<string, unknown>;
+  }
   if (typeof raw !== "string") return {};
   try {
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null
+      ? (parsed as Record<string, unknown>)
+      : { raw };
   } catch {
     return { raw };
   }
@@ -17,7 +22,7 @@ export function truncate(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + "…" : s;
 }
 
-export function formatToolCall(name: string, rawInput: any): string {
+export function formatToolCall(name: string, rawInput: unknown): string {
   const input = parseToolInput(rawInput);
 
   switch (name) {

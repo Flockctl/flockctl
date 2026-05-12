@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { Card, CardContent } from "@/components/ui/card";
+import { FlatCard } from "@/components/design/FlatCard";
 import { HelpCircle, Loader2, Send } from "lucide-react";
 
 export interface AgentQuestionOption {
@@ -35,7 +36,7 @@ export interface AgentQuestionPromptProps {
   header?: string;
   /**
    * Optional pre-baked answer choices. When omitted or empty the prompt
-   * collapses back to a single free-form textarea (the original UI). When
+   * collapses back to a single free-form input (the original UI). When
    * present, the prompt renders a radio (or checkbox, see `multiSelect`)
    * picker plus an "Other" escape hatch.
    */
@@ -54,17 +55,19 @@ export interface AgentQuestionPromptProps {
 }
 
 /**
- * Yellow-bordered prompt block mirroring the layout of the blue-bordered
- * permission prompt in task-detail / chats. Shows the agent's question and
- * either:
+ * Amber-tinted prompt block (slice 03 of 24-ui-redesign-working-surfaces /
+ * 03-chat-conversation). Shows the agent's question and either:
  *
- *   - a free-form textarea (no `options` provided — original UI), or
- *   - a radio / checkbox picker over the supplied `options`, with an "Other"
- *     textarea escape hatch beneath.
+ *   - a single-line free-form `<Input>` (no `options` provided), where
+ *     plain `Enter` submits the answer, or
+ *   - a radio / checkbox picker over the supplied `options`, with an
+ *     "Other" multi-line textarea escape hatch beneath. In picker mode
+ *     plain Enter inside the multi-line override behaves normally
+ *     (newline) — Cmd/Ctrl+Enter submits.
  *
- * Send is disabled while no answer is selected/typed or while a POST is in
- * flight. The wire format is always a single string passed to `onAnswer`,
- * matching the slice 01 REST body shape `{ answer: string }`.
+ * Submit is disabled while no answer is selected/typed or while a POST is
+ * in flight. The wire format is always a single string passed to
+ * `onAnswer`, matching the slice 01 REST body shape `{ answer: string }`.
  */
 export function AgentQuestionPrompt({
   question,
@@ -150,23 +153,33 @@ export function AgentQuestionPrompt({
     }
   }
 
+  function onInputKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    // Plain Enter submits when the user is in the single-line free-form
+    // input — the slice 03 contract says "Enter submits" for the input
+    // path. Shift+Enter is preserved as a no-op (Inputs don't have
+    // newlines; the modifier just bypasses the submit handler so the
+    // event doesn't surprise screen-reader users mid-typing).
+    if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
+      e.preventDefault();
+      void handleSubmit();
+    }
+  }
+
   // Stable id base so each input/label pair gets a unique id even when
   // multiple AgentQuestionPrompts are mounted simultaneously.
   const idBase = `aq-${requestId}`;
 
   return (
-    <Card
-      className="border-yellow-500"
-      data-testid="agent-question-prompt"
-    >
-      <CardContent
-        className="flex flex-col gap-3 py-4"
+    <FlatCard className="border-amber-500/60 bg-amber-50/60 dark:bg-amber-950/20">
+      <div
+        className="flex flex-col gap-3 p-4"
+        data-testid="agent-question-prompt"
         onKeyDown={onAnyKeyDown}
       >
         {header && (
           <div>
             <span
-              className="inline-block max-w-full truncate rounded-full bg-yellow-500/15 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-yellow-700 dark:text-yellow-300"
+              className="inline-block max-w-full truncate rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-700 dark:text-amber-300"
               data-testid="agent-question-header"
               title={header}
             >
@@ -175,7 +188,7 @@ export function AgentQuestionPrompt({
           </div>
         )}
         <div className="flex items-start gap-2">
-          <HelpCircle className="mt-0.5 h-4 w-4 shrink-0 text-yellow-600 dark:text-yellow-400" />
+          <HelpCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
           <div className="flex-1 min-w-0">
             <p className="font-medium">The agent has a question</p>
             <p
@@ -258,13 +271,13 @@ export function AgentQuestionPrompt({
             </div>
           </>
         ) : (
-          <Textarea
+          <Input
             autoFocus
             data-testid="agent-question-textarea"
             value={answer}
             onChange={(e) => setAnswer(e.target.value)}
+            onKeyDown={onInputKeyDown}
             placeholder="Type your answer..."
-            rows={3}
             disabled={pending}
           />
         )}
@@ -284,17 +297,17 @@ export function AgentQuestionPrompt({
             {pending ? (
               <>
                 <Loader2 className="mr-1 h-3 w-3 animate-spin" />
-                Sending...
+                Submitting...
               </>
             ) : (
               <>
                 <Send className="mr-1 h-3 w-3" />
-                Send
+                Submit
               </>
             )}
           </Button>
         </div>
-      </CardContent>
-    </Card>
+      </div>
+    </FlatCard>
   );
 }

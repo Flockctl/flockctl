@@ -23,6 +23,12 @@ export interface ChatCreate {
   aiProviderKeyId?: number | null;
   /** Persisted model id (e.g. "claude-sonnet-4-20250514"). */
   model?: string | null;
+  /**
+   * Opt-in isolation mode. `'worktree'` lazily materialises a per-chat
+   * git worktree on the first message and pins every subsequent turn
+   * to that filesystem. See migration 0060 + worktree-manager.ts.
+   */
+  isolation?: "worktree" | null;
 }
 
 export interface ChatMetrics {
@@ -37,6 +43,14 @@ export interface ChatMetrics {
    *  quota rather than per-token billing. 0 when no Copilot usage. */
   total_copilot_quota: number;
   last_message_at: string | null;
+  /**
+   * First ~140 chars of the latest message body, single-line and
+   * whitespace-collapsed. Null when the chat has no messages yet.
+   * Projected by `getChatMetrics` from the same row already fetched
+   * for `last_message_at` (zero extra query). Consumed by the chats
+   * list row preview (slice 24-02 T01).
+   */
+  last_message_excerpt: string | null;
   /** Latest TodoWrite snapshot counts, or null when the chat has never
    *  received a TodoWrite call. Projected into the list response so the
    *  chat-list todo badge renders from the existing payload — no per-row
@@ -52,10 +66,11 @@ export interface ChatMetrics {
 
 /**
  * Reasoning effort level. Mirrors the Claude Agent SDK's `EffortLevel`.
- * `high` is the pre-toggle default; `null` on the chat row means "fall back
- * to the default" (also `high` today).
+ * `xhigh` is the default; `null` on the chat row means "fall back to the
+ * default". The SDK silently degrades `xhigh` to `high` on models that
+ * don't support it (Opus 4.7 is the only model that does today).
  */
-export type EffortLevel = "low" | "medium" | "high" | "max";
+export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface ChatResponse {
   id: string;
@@ -96,7 +111,28 @@ export interface ChatResponse {
   pinned: boolean;
   created_at: string;
   updated_at: string;
+  /**
+   * True while the chat-executor is actively running a turn. Mirrors the
+   * detail endpoint's `is_running` (named `is_streaming` on the list to
+   * match the slice spec language — both are sourced from
+   * `chatExecutor.isRunning(id)`). Consumed by the chats list row to
+   * paint the live-dot + "live" emerald text (slice 24-02 T01).
+   */
+  is_streaming?: boolean;
   metrics?: ChatMetrics;
+  /**
+   * Per-chat isolation mode (NULL = legacy shared cwd, `'worktree'` =
+   * per-chat git worktree). See migration 0060.
+   */
+  isolation?: "worktree" | null;
+  /**
+   * Absolute path to the per-chat git worktree once the first message
+   * has materialised it. NULL until then; NULL again after operator
+   * cleanup (POST /chats/:id/end-session, DELETE /chats/:id/worktree).
+   */
+  worktree_path?: string | null;
+  /** Branch name created with the worktree. NULL iff `worktree_path` is. */
+  worktree_branch?: string | null;
 }
 
 export interface ChatUpdate {
@@ -177,6 +213,15 @@ export interface ChatMessageResponse {
    * with an empty array.
    */
   attachments?: ChatMessageAttachment[];
+  /**
+   * Optional client-side flag — true when the daemon is still actively
+   * appending content to this assistant row (e.g. the persisted assistant
+   * row that's being filled in mid-turn). Drives the `.agent-glow` left-rule
+   * walk on the latest streaming turn so the message visually reads as
+   * "alive" without us having to chase liveBlocks vs persisted-row identity.
+   * Server typically only sets this on the in-flight assistant row.
+   */
+  is_streaming?: boolean;
 }
 
 export interface ChatDetailResponse extends ChatResponse {
@@ -235,6 +280,13 @@ export type LiveChatBlock =
       name: string;
       input: unknown;
       summary: string;
+      /**
+       * Wall-clock ISO 8601 instant the block was appended to the live
+       * transcript. Stamped client-side at append time (the SSE event itself
+       * doesn't carry a timestamp), so it reflects when the UI saw the call —
+       * which is what the "is the agent hung?" check actually wants.
+       */
+      createdAt: string;
     }
   | {
       id: string;
@@ -242,4 +294,5 @@ export type LiveChatBlock =
       name: string;
       output: string;
       summary: string;
+      createdAt: string;
     };

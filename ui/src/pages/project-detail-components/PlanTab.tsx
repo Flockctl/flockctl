@@ -1,11 +1,13 @@
 import { Loader2, Zap } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog, useConfirmDialog } from "@/components/confirm-dialog";
 import {
   useGeneratePlanStatus,
   useProjectTree,
   useStartAutoExecuteAll,
 } from "@/lib/hooks";
+import { useWsAwarePolling } from "@/lib/global-ws";
 
 import { GeneratePlanDialog } from "./GeneratePlanDialog";
 import { PlanEditorProvider } from "./plan-editor-context";
@@ -39,10 +41,16 @@ export function PlanTab({ projectId }: { projectId: string }) {
   });
   const planGenerating = !!planGenStatus?.generating;
 
+  // Plan generation runs in the background — when active we want a
+  // fast 3s poll so the UI catches the new tree promptly; otherwise
+  // gate behind the WS-aware helper which silences the 30s fallback
+  // when the WS is up (project tree changes broadcast via WS already).
+  const idleRefetchInterval = useWsAwarePolling(30_000);
   const { data: tree } = useProjectTree(projectId, {
-    refetchInterval: planGenerating ? 3_000 : 30_000,
+    refetchInterval: planGenerating ? 3_000 : idleRefetchInterval,
   });
   const autoExecAll = useStartAutoExecuteAll(projectId);
+  const autoExecConfirm = useConfirmDialog();
 
   const hasMilestones = !!tree && tree.milestones.length > 0;
 
@@ -75,15 +83,7 @@ export function PlanTab({ projectId }: { projectId: string }) {
                     ? "Plan is still being generated"
                     : undefined
                 }
-                onClick={() => {
-                  if (
-                    window.confirm(
-                      "Start auto-execution for all milestones?",
-                    )
-                  ) {
-                    autoExecAll.mutate();
-                  }
-                }}
+                onClick={() => autoExecConfirm.requestConfirm("auto-exec-all")}
                 data-testid="plan-tab-auto-execute-all"
               >
                 {autoExecAll.isPending ? (
@@ -94,6 +94,15 @@ export function PlanTab({ projectId }: { projectId: string }) {
                 Auto-Execute All
               </Button>
             )}
+            <ConfirmDialog
+              open={autoExecConfirm.open}
+              onOpenChange={autoExecConfirm.onOpenChange}
+              title="Start auto-execution?"
+              description="Run auto-execution across every milestone in this project."
+              confirmLabel="Start"
+              isPending={autoExecAll.isPending}
+              onConfirm={() => autoExecAll.mutate()}
+            />
             <GeneratePlanDialog projectId={projectId} />
           </div>
         </div>

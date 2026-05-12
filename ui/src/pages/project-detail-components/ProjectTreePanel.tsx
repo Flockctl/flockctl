@@ -7,7 +7,7 @@ import {
   type KeyboardEvent,
 } from "react";
 import { useProjectTree, useMissions, type Mission } from "@/lib/hooks";
-import type { MilestoneTree, PlanSliceTree } from "@/lib/types";
+import type { MilestoneTree, PlanSliceTree, PlanTask } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -18,6 +18,8 @@ import {
   Layers,
   Plus,
   CheckCircle2,
+  CheckSquare,
+  Square,
   Compass,
 } from "lucide-react";
 
@@ -25,16 +27,18 @@ import {
  * Compact aria-tree rendering of a project's missions + milestones + slices
  * for the left slot of the mission-control `ProjectDetailBoardView`.
  *
- * Hierarchy (slice 11/04 — "mission level above milestones"):
+ * Hierarchy (slice 11/04 — "mission level above milestones", extended
+ * with tasks underneath each slice):
  *
  *   mission (level 1)            ← from `useMissions(projectId)`
  *     milestone (level 2)        ← `MilestoneTree` rows whose `mission_id`
  *                                  matches the parent mission's id
  *       slice (level 3)
+ *         task (level 4)         ← `PlanTask` rows from `slice.tasks`
  *
  *   milestone (level 1, orphan)  ← `MilestoneTree` rows with no mission_id
  *     slice (level 2)              OR with a mission_id pointing at a row
- *                                  that does not exist in the missions
+ *       task (level 3)             that does not exist in the missions
  *                                  list (dangling-mission tolerance).
  *
  * The flat-node nav model + roving tabindex pattern from the milestone-only
@@ -123,6 +127,17 @@ export interface ProjectTreePanelProps {
   /** Click handler for a slice row. */
   onSelectSlice?: (milestoneId: string, sliceId: string) => void;
   /**
+   * Click handler for a task row. Tasks are displayed as expandable
+   * children of slices. The parent typically forwards selection to the
+   * Plan tab focused on the task's parent slice — task-level URL state
+   * is not part of `useSelection`.
+   */
+  onSelectTask?: (
+    milestoneId: string,
+    sliceId: string,
+    taskId: string,
+  ) => void;
+  /**
    * Click handler for the empty-state CTA. If omitted, the empty state
    * renders as a plain muted hint (no button).
    */
@@ -152,10 +167,81 @@ type FlatNode =
       kind: "slice";
       id: string;
       milestoneId: string;
+      hasChildren: boolean;
+      expanded: boolean;
       level: 2 | 3;
+    }
+  | {
+      kind: "task";
+      id: string;
+      sliceId: string;
+      milestoneId: string;
+      level: 3 | 4;
     };
 
-// --- Slice leaf -------------------------------------------------------------
+// --- Task leaf --------------------------------------------------------------
+
+interface TaskNodeProps {
+  task: PlanTask;
+  sliceId: string;
+  milestoneId: string;
+  /** Aria-level — slices live at 2 (orphan) or 3 (under mission), so
+   *  tasks land one deeper. */
+  level: 3 | 4;
+  active: boolean;
+  onSelect?: (milestoneId: string, sliceId: string, taskId: string) => void;
+  registerRef: (id: string, el: HTMLLIElement | null) => void;
+  onFocusNode: (id: string) => void;
+}
+
+function TaskNode({
+  task,
+  sliceId,
+  milestoneId,
+  level,
+  active,
+  onSelect,
+  registerRef,
+  onFocusNode,
+}: TaskNodeProps) {
+  const isCompleted = task.status === "completed";
+  return (
+    <li
+      ref={(el) => registerRef(task.id, el)}
+      role="treeitem"
+      aria-level={level}
+      aria-selected={active}
+      tabIndex={active ? 0 : -1}
+      data-testid={`tree-task-${task.id}`}
+      className={cn(
+        "flex cursor-pointer items-center gap-1.5 rounded px-1.5 py-1 text-xs outline-none",
+        "hover:bg-muted/60 focus-visible:ring-2 focus-visible:ring-ring",
+        active && "bg-accent text-accent-foreground ring-1 ring-ring",
+      )}
+      onClick={() => {
+        onFocusNode(task.id);
+        onSelect?.(milestoneId, sliceId, task.id);
+      }}
+      onFocus={() => onFocusNode(task.id)}
+    >
+      {isCompleted ? (
+        <CheckSquare
+          className="h-3 w-3 shrink-0 text-green-600 dark:text-green-500"
+          aria-label="Completed"
+          data-testid={`tree-task-${task.id}-completed`}
+        />
+      ) : (
+        <Square
+          className="h-3 w-3 shrink-0 text-muted-foreground"
+          aria-hidden
+        />
+      )}
+      <span className="truncate text-muted-foreground">{task.title}</span>
+    </li>
+  );
+}
+
+// --- Slice parent -----------------------------------------------------------
 
 interface SliceNodeProps {
   slice: PlanSliceTree;
@@ -163,8 +249,18 @@ interface SliceNodeProps {
   level: 2 | 3;
   /** True iff this row is the roving-tabindex target. */
   active: boolean;
+  /** Id of the currently-active node (used to resolve child activity). */
+  activeId: string | undefined;
+  /** Whether this slice's tasks are visible. */
+  expanded: boolean;
+  onToggle: (sliceId: string) => void;
   /** Forwarded click handler. */
   onSelect?: (milestoneId: string, sliceId: string) => void;
+  onSelectTask?: (
+    milestoneId: string,
+    sliceId: string,
+    taskId: string,
+  ) => void;
   /** Register the `<li>` DOM ref with the parent so keyboard nav can focus it. */
   registerRef: (id: string, el: HTMLLIElement | null) => void;
   /** Sync the parent's focus state when the row receives browser focus. */
@@ -176,39 +272,96 @@ function SliceNode({
   milestoneId,
   level,
   active,
+  activeId,
+  expanded,
+  onToggle,
   onSelect,
+  onSelectTask,
   registerRef,
   onFocusNode,
 }: SliceNodeProps) {
+  const tasks = slice.tasks ?? [];
+  const hasTasks = tasks.length > 0;
+  // Tasks nest one level deeper than the slice they belong to.
+  const taskLevel: 3 | 4 = level === 2 ? 3 : 4;
+
   return (
     <li
       ref={(el) => registerRef(slice.id, el)}
       role="treeitem"
       aria-level={level}
+      aria-expanded={hasTasks ? expanded : undefined}
       aria-selected={active}
       tabIndex={active ? 0 : -1}
       data-testid={`tree-slice-${slice.id}`}
-      className={cn(
-        "flex cursor-pointer items-center gap-1.5 rounded px-1.5 py-1 text-xs outline-none",
-        "hover:bg-muted/60 focus-visible:ring-2 focus-visible:ring-ring",
-        active && "bg-accent text-accent-foreground ring-1 ring-ring",
-      )}
-      onClick={() => {
-        onFocusNode(slice.id);
-        onSelect?.(milestoneId, slice.id);
+      className="outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      onFocus={(e) => {
+        // Only fire for focus landing on the <li> itself, not bubbling from
+        // a child treeitem (which manages its own focusedId).
+        if (e.target === e.currentTarget) onFocusNode(slice.id);
       }}
-      onFocus={() => onFocusNode(slice.id)}
     >
-      {slice.status === "completed" ? (
-        <CheckCircle2
-          className="h-3 w-3 shrink-0 text-green-600 dark:text-green-500"
-          aria-label="Completed"
-          data-testid={`tree-slice-${slice.id}-completed`}
-        />
-      ) : (
-        <Layers className="h-3 w-3 shrink-0 text-muted-foreground" aria-hidden />
+      <div
+        className={cn(
+          "flex cursor-pointer items-center gap-1 rounded px-1 py-1 text-xs",
+          "hover:bg-muted/60",
+          active && "bg-accent text-accent-foreground ring-1 ring-ring",
+        )}
+        onClick={() => {
+          onFocusNode(slice.id);
+          onSelect?.(milestoneId, slice.id);
+        }}
+      >
+        <button
+          type="button"
+          // Stops the row click from firing twice. Keyboard expansion is
+          // handled at the tree level (ArrowRight / ArrowLeft).
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggle(slice.id);
+          }}
+          aria-label={expanded ? "Collapse slice" : "Expand slice"}
+          aria-hidden={!hasTasks}
+          tabIndex={-1}
+          className={cn(
+            "flex h-4 w-4 shrink-0 items-center justify-center text-muted-foreground",
+            !hasTasks && "invisible",
+          )}
+        >
+          {expanded ? (
+            <ChevronDown className="h-3 w-3" aria-hidden />
+          ) : (
+            <ChevronRight className="h-3 w-3" aria-hidden />
+          )}
+        </button>
+        {slice.status === "completed" ? (
+          <CheckCircle2
+            className="h-3 w-3 shrink-0 text-green-600 dark:text-green-500"
+            aria-label="Completed"
+            data-testid={`tree-slice-${slice.id}-completed`}
+          />
+        ) : (
+          <Layers className="h-3 w-3 shrink-0 text-muted-foreground" aria-hidden />
+        )}
+        <span className="truncate">{slice.title}</span>
+      </div>
+      {expanded && hasTasks && (
+        <ul role="group" className="ml-5 mt-0.5 space-y-0.5">
+          {tasks.map((task) => (
+            <TaskNode
+              key={task.id}
+              task={task}
+              sliceId={slice.id}
+              milestoneId={milestoneId}
+              level={taskLevel}
+              active={activeId === task.id}
+              onSelect={onSelectTask}
+              registerRef={registerRef}
+              onFocusNode={onFocusNode}
+            />
+          ))}
+        </ul>
       )}
-      <span className="truncate">{slice.title}</span>
     </li>
   );
 }
@@ -224,9 +377,16 @@ interface MilestoneNodeProps {
   active: boolean;
   /** Id of the currently-active node (used to resolve child activity). */
   activeId: string | undefined;
-  onToggle: (milestoneId: string) => void;
+  /** Lookup for child slice expansion state. */
+  isSliceExpanded: (sliceId: string) => boolean;
+  onToggle: (id: string) => void;
   onSelectMilestone?: (milestoneId: string) => void;
   onSelectSlice?: (milestoneId: string, sliceId: string) => void;
+  onSelectTask?: (
+    milestoneId: string,
+    sliceId: string,
+    taskId: string,
+  ) => void;
   registerRef: (id: string, el: HTMLLIElement | null) => void;
   onFocusNode: (id: string) => void;
 }
@@ -237,9 +397,11 @@ function MilestoneNode({
   level,
   active,
   activeId,
+  isSliceExpanded,
   onToggle,
   onSelectMilestone,
   onSelectSlice,
+  onSelectTask,
   registerRef,
   onFocusNode,
 }: MilestoneNodeProps) {
@@ -317,7 +479,11 @@ function MilestoneNode({
               milestoneId={milestone.id}
               level={sliceLevel}
               active={activeId === slice.id}
+              activeId={activeId}
+              expanded={isSliceExpanded(slice.id)}
+              onToggle={onToggle}
               onSelect={onSelectSlice}
+              onSelectTask={onSelectTask}
               registerRef={registerRef}
               onFocusNode={onFocusNode}
             />
@@ -337,10 +503,16 @@ interface MissionNodeProps {
   active: boolean;
   activeId: string | undefined;
   isMilestoneExpanded: (milestoneId: string) => boolean;
+  isSliceExpanded: (sliceId: string) => boolean;
   onToggle: (id: string) => void;
   onSelectMission?: (missionId: string) => void;
   onSelectMilestone?: (milestoneId: string) => void;
   onSelectSlice?: (milestoneId: string, sliceId: string) => void;
+  onSelectTask?: (
+    milestoneId: string,
+    sliceId: string,
+    taskId: string,
+  ) => void;
   registerRef: (id: string, el: HTMLLIElement | null) => void;
   onFocusNode: (id: string) => void;
 }
@@ -362,10 +534,12 @@ function MissionNode({
   active,
   activeId,
   isMilestoneExpanded,
+  isSliceExpanded,
   onToggle,
   onSelectMission,
   onSelectMilestone,
   onSelectSlice,
+  onSelectTask,
   registerRef,
   onFocusNode,
 }: MissionNodeProps) {
@@ -432,9 +606,11 @@ function MissionNode({
               level={2}
               active={activeId === m.id}
               activeId={activeId}
+              isSliceExpanded={isSliceExpanded}
               onToggle={onToggle}
               onSelectMilestone={onSelectMilestone}
               onSelectSlice={onSelectSlice}
+              onSelectTask={onSelectTask}
               registerRef={registerRef}
               onFocusNode={onFocusNode}
             />
@@ -469,6 +645,7 @@ export function ProjectTreePanel({
   onSelectMission,
   onSelectMilestone,
   onSelectSlice,
+  onSelectTask,
   onGeneratePlan,
   className,
 }: ProjectTreePanelProps) {
@@ -606,6 +783,34 @@ export function ProjectTreePanel({
   // API) → orphan milestones (in the order returned by the project tree).
   const flatNodes = useMemo<FlatNode[]>(() => {
     const out: FlatNode[] = [];
+    const pushSliceWithTasks = (
+      s: PlanSliceTree,
+      milestoneId: string,
+      sliceLevel: 2 | 3,
+    ) => {
+      const sliceExpanded = isExpanded(s.id);
+      const tasks = s.tasks ?? [];
+      out.push({
+        kind: "slice",
+        id: s.id,
+        milestoneId,
+        hasChildren: tasks.length > 0,
+        expanded: sliceExpanded,
+        level: sliceLevel,
+      });
+      if (sliceExpanded) {
+        const taskLevel: 3 | 4 = sliceLevel === 2 ? 3 : 4;
+        for (const t of tasks) {
+          out.push({
+            kind: "task",
+            id: t.id,
+            sliceId: s.id,
+            milestoneId,
+            level: taskLevel,
+          });
+        }
+      }
+    };
     for (const mission of missionsList) {
       const children = missionGroups.get(mission.id) ?? [];
       const missionExpanded = isExpanded(mission.id);
@@ -628,12 +833,7 @@ export function ProjectTreePanel({
           });
           if (milestoneExpanded) {
             for (const s of m.slices) {
-              out.push({
-                kind: "slice",
-                id: s.id,
-                milestoneId: m.id,
-                level: 3,
-              });
+              pushSliceWithTasks(s, m.id, 3);
             }
           }
         }
@@ -651,12 +851,7 @@ export function ProjectTreePanel({
       });
       if (milestoneExpanded) {
         for (const s of m.slices) {
-          out.push({
-            kind: "slice",
-            id: s.id,
-            milestoneId: m.id,
-            level: 2,
-          });
+          pushSliceWithTasks(s, m.id, 2);
         }
       }
     }
@@ -756,7 +951,9 @@ export function ProjectTreePanel({
             return;
           }
           if (
-            (node.kind === "milestone" || node.kind === "mission") &&
+            (node.kind === "milestone" ||
+              node.kind === "mission" ||
+              node.kind === "slice") &&
             node.hasChildren
           ) {
             if (!node.expanded) {
@@ -783,9 +980,12 @@ export function ProjectTreePanel({
             else if (node.missionId) {
               setFocusedId(node.missionId);
             }
+          } else if (node.kind === "slice") {
+            if (node.expanded) toggle(node.id);
+            else setFocusedId(node.milestoneId);
           } else {
-            // Slice → jump up to its parent milestone.
-            setFocusedId(node.milestoneId);
+            // Task → jump up to its parent slice.
+            setFocusedId(node.sliceId);
           }
           return;
         }
@@ -795,8 +995,11 @@ export function ProjectTreePanel({
             if (first) setFocusedId(first.id);
             return;
           }
-          if (node.kind === "slice") {
+          if (node.kind === "task") {
+            onSelectTask?.(node.milestoneId, node.sliceId, node.id);
+          } else if (node.kind === "slice") {
             onSelectSlice?.(node.milestoneId, node.id);
+            if (node.hasChildren && !node.expanded) toggle(node.id);
           } else if (node.kind === "milestone") {
             onSelectMilestone?.(node.id);
             if (node.hasChildren && !node.expanded) toggle(node.id);
@@ -816,6 +1019,7 @@ export function ProjectTreePanel({
       onSelectMission,
       onSelectMilestone,
       onSelectSlice,
+      onSelectTask,
       toggle,
     ],
   );
@@ -893,10 +1097,12 @@ export function ProjectTreePanel({
             active={activeId === mission.id}
             activeId={activeId}
             isMilestoneExpanded={isExpanded}
+            isSliceExpanded={isExpanded}
             onToggle={toggle}
             onSelectMission={onSelectMission}
             onSelectMilestone={onSelectMilestone}
             onSelectSlice={onSelectSlice}
+            onSelectTask={onSelectTask}
             registerRef={registerRef}
             onFocusNode={setFocusedId}
           />
@@ -909,9 +1115,11 @@ export function ProjectTreePanel({
             level={1}
             active={activeId === milestone.id}
             activeId={activeId}
+            isSliceExpanded={isExpanded}
             onToggle={toggle}
             onSelectMilestone={onSelectMilestone}
             onSelectSlice={onSelectSlice}
+            onSelectTask={onSelectTask}
             registerRef={registerRef}
             onFocusNode={setFocusedId}
           />

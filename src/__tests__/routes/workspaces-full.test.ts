@@ -7,9 +7,50 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync
 import { join } from "path";
 import { tmpdir } from "os";
 
+// Routes now use `execa` for git operations (async). Forward to the
+// legacy `execSync` mock so test stubs continue to drive behaviour;
+// reshape result into execa's `{ stdout, stderr, exitCode }` envelope.
 vi.mock("child_process", async () => {
   const actual = await vi.importActual<any>("child_process");
   return { ...actual, execSync: vi.fn(actual.execSync) };
+});
+
+vi.mock("execa", async () => {
+  return {
+    execa: vi.fn(async (file: string, args: readonly string[]) => {
+      const fake = (execSync as unknown as { getMockImplementation?: () => (cmd: string) => unknown })
+        .getMockImplementation?.();
+      const rebuiltCmd = `${file} ${args.join(" ")}`;
+      if (!fake) return { stdout: "", stderr: "", exitCode: 0 };
+      try {
+        const result = fake(rebuiltCmd);
+        const stdout =
+          typeof result === "string"
+            ? result
+            : result && typeof (result as Buffer).toString === "function"
+              ? (result as Buffer).toString()
+              : "";
+        return { stdout, stderr: "", exitCode: 0 };
+      } catch (err) {
+        // Preserve the raw thrown shape so the route catch-block
+        // fallback (stderr → message → "unknown error") drives the
+        // expected error path.
+        const e = err as { stderr?: Buffer | string; message?: string };
+        const stderrText =
+          typeof e.stderr === "string"
+            ? e.stderr
+            : e.stderr
+              ? e.stderr.toString()
+              : undefined;
+        const wrapped: { stderr?: string; message?: string; exitCode: number } = {
+          exitCode: 1,
+        };
+        if (stderrText !== undefined) wrapped.stderr = stderrText;
+        if (typeof e.message === "string") wrapped.message = e.message;
+        throw wrapped;
+      }
+    }),
+  };
 });
 
 import { app } from "../../server.js";

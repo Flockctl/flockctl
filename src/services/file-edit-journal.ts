@@ -199,19 +199,24 @@ function countLcsDelta(oldStr: string, newStr: string): { added: number; removed
   if (n * m > 250_000) {
     return { added: m, removed: n };
   }
-  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  // Flat Int32Array buffer instead of nested `number[][]`. The DP grid holds
+  // up to 250 000 cells; allocating it as a single contiguous TypedArray
+  // (vs ~(n+1) boxed Array objects of boxed-Number values) eliminates GC
+  // pressure on every tool_call and gets V8 to use the monomorphic indexed-
+  // property path. Indexed via `i*stride + j` where stride = m+1.
+  const stride = m + 1;
+  const dp = new Int32Array((n + 1) * stride);
   for (let i = n - 1; i >= 0; i--) {
-    const row = dp[i]!;
-    const nextRow = dp[i + 1]!;
+    const rowOff = i * stride;
+    const nextOff = (i + 1) * stride;
     for (let j = m - 1; j >= 0; j--) {
-      /* v8 ignore next — the dp grid is pre-filled with 0 and indexed via
-         valid loop bounds; ?? 0 is TS null-safety glue that never fires. */
-      row[j] = a[i] === b[j] ? (nextRow[j + 1] ?? 0) + 1 : Math.max(nextRow[j] ?? 0, row[j + 1] ?? 0);
+      dp[rowOff + j] =
+        a[i] === b[j]
+          ? dp[nextOff + j + 1]! + 1
+          : Math.max(dp[nextOff + j]!, dp[rowOff + j + 1]!);
     }
   }
-  /* v8 ignore next — dp[0][0] is always a number because the grid is built
-     with fill(0); the ?? 0 is TS glue only. */
-  const common = dp[0]?.[0] ?? 0;
+  const common = dp[0]!;
   return { added: m - common, removed: n - common };
 }
 
@@ -273,13 +278,18 @@ function lcsLineDiff(a: string[], b: string[]): LcsOp[] {
       ...b.map((t): LcsOp => ({ kind: "add", text: t })),
     ];
   }
-  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  // Flat Int32Array DP grid — same shape + rationale as `countLcsDelta`
+  // above. Indexed via `i*stride + j` where stride = m+1.
+  const stride = m + 1;
+  const dp = new Int32Array((n + 1) * stride);
   for (let i = n - 1; i >= 0; i--) {
-    const row = dp[i]!;
-    const nextRow = dp[i + 1]!;
+    const rowOff = i * stride;
+    const nextOff = (i + 1) * stride;
     for (let j = m - 1; j >= 0; j--) {
-      /* v8 ignore next — dp is pre-filled with 0, so ?? 0 never fires. */
-      row[j] = a[i] === b[j] ? (nextRow[j + 1] ?? 0) + 1 : Math.max(nextRow[j] ?? 0, row[j + 1] ?? 0);
+      dp[rowOff + j] =
+        a[i] === b[j]
+          ? dp[nextOff + j + 1]! + 1
+          : Math.max(dp[nextOff + j]!, dp[rowOff + j + 1]!);
     }
   }
   const ops: LcsOp[] = [];
@@ -292,8 +302,7 @@ function lcsLineDiff(a: string[], b: string[]): LcsOp[] {
       ops.push({ kind: "context", text: ai });
       i++;
       j++;
-      /* v8 ignore next — dp bounds are valid during this while-loop; ?? 0 is glue. */
-    } else if ((dp[i + 1]?.[j] ?? 0) >= (dp[i]?.[j + 1] ?? 0)) {
+    } else if (dp[(i + 1) * stride + j]! >= dp[i * stride + j + 1]!) {
       ops.push({ kind: "remove", text: ai });
       i++;
     } else {

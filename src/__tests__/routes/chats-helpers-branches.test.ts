@@ -85,6 +85,7 @@ describe("chats/helpers — branch coverage", () => {
       expect(parseEffortBody({ effort: "high" })).toBe("high");
       expect(parseEffortBody({ effort: "low" })).toBe("low");
       expect(parseEffortBody({ effort: "medium" })).toBe("medium");
+      expect(parseEffortBody({ effort: "xhigh" })).toBe("xhigh");
       expect(parseEffortBody({ effort: "max" })).toBe("max");
     });
     it("throws on invalid string", () => {
@@ -564,6 +565,49 @@ describe("chats/helpers — branch coverage", () => {
       const chat = { workspaceId: 9999, projectId: p.id } as any;
       expect(resolveChatCwd(db, chat)).toBe("/tmp/p2");
     });
+    it("returns persisted worktree_path when chat already has one (fast path)", () => {
+      const chat = {
+        id: 100,
+        workspaceId: null,
+        projectId: 1,
+        isolation: "worktree",
+        worktreePath: "/already/created/wt",
+        worktreeBranch: "flockctl/chat-100",
+      } as any;
+      // Doesn't even need a real project lookup — fast path short-circuits.
+      expect(resolveChatCwd(db, chat)).toBe("/already/created/wt");
+    });
+    it("isolation='worktree' but no project: skip creation, fall back to default", () => {
+      const chat = {
+        id: 200,
+        workspaceId: null,
+        projectId: null,
+        isolation: "worktree",
+        worktreePath: null,
+        worktreeBranch: null,
+      } as any;
+      const r = resolveChatCwd(db, chat);
+      // Falls back to flockctl home (or whatever the unset path resolves to).
+      expect(typeof r).toBe("string");
+    });
+    it("isolation='worktree' with project that's not a git repo: silent fallback to project path", () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const p = db.insert(projects).values({ name: "P3", path: "/tmp/non-git-project" } as any).returning().get()!;
+      const chat = {
+        id: 300,
+        workspaceId: null,
+        projectId: p.id,
+        isolation: "worktree",
+        worktreePath: null,
+        worktreeBranch: null,
+      } as any;
+      try {
+        expect(resolveChatCwd(db, chat)).toBe("/tmp/non-git-project");
+        expect(warnSpy).toHaveBeenCalled();
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
   });
 
   // ─── resolveChatContext ─────────────────────────────────
@@ -661,20 +705,29 @@ describe("chats/helpers — branch coverage", () => {
       const chat = { workspaceId: null, projectId: p.id } as any;
       expect(resolveChatWorkspaceContext(db, chat)).toBeUndefined();
     });
-    it("walks project.workspaceId → workspace row", () => {
+    it("returns undefined for a project-scoped chat even when the project belongs to a workspace (project selection is authoritative — sibling projects must not leak)", () => {
       const w = db.insert(workspaces).values({ name: "W", path: "/tmp/w" } as any).returning().get()!;
-      const p = db.insert(projects).values({ name: "P", workspaceId: w.id } as any).returning().get()!;
+      const p = db.insert(projects).values({ name: "P", workspaceId: w.id, path: "/tmp/p" } as any).returning().get()!;
+      // Sibling that the agent must NOT learn about from a project-scoped chat.
+      db.insert(projects).values({ name: "Sibling", workspaceId: w.id, path: "/tmp/sibling" } as any).run();
       const chat = { workspaceId: null, projectId: p.id } as any;
-      const r = resolveChatWorkspaceContext(db, chat);
-      expect(r?.name).toBe("W");
-      expect(r?.path).toBe("/tmp/w");
+      expect(resolveChatWorkspaceContext(db, chat)).toBeUndefined();
     });
-    it("returns workspace + projects list", () => {
+    it("returns workspace + projects list for a workspace-scoped chat", () => {
       const w = db.insert(workspaces).values({ name: "W2", path: "/tmp/w2" } as any).returning().get()!;
       db.insert(projects).values({ name: "P1", workspaceId: w.id, path: "/tmp/p1" } as any).run();
       const chat = { workspaceId: w.id, projectId: null } as any;
       const r = resolveChatWorkspaceContext(db, chat);
       expect(r?.projects.length).toBe(1);
+    });
+    it("returns full sibling list when the chat is workspace-scoped (cross-project visibility is the whole point of opening a chat at the workspace level)", () => {
+      const w = db.insert(workspaces).values({ name: "W3", path: "/tmp/w3" } as any).returning().get()!;
+      db.insert(projects).values({ name: "A", workspaceId: w.id, path: "/tmp/a" } as any).run();
+      db.insert(projects).values({ name: "B", workspaceId: w.id, path: "/tmp/b" } as any).run();
+      db.insert(projects).values({ name: "C", workspaceId: w.id, path: "/tmp/c" } as any).run();
+      const chat = { workspaceId: w.id, projectId: null } as any;
+      const r = resolveChatWorkspaceContext(db, chat);
+      expect(r?.projects.map((p) => p.name).sort()).toEqual(["A", "B", "C"]);
     });
     it("returns undefined when workspace missing or pathless", () => {
       const chat = { workspaceId: 9999, projectId: null } as any;

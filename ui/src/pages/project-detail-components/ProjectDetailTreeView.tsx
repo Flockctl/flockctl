@@ -12,7 +12,13 @@ import {
   useStartAutoExecuteAll,
   useAttention,
 } from "@/lib/hooks";
-import { formatTokens as fmtTokens, formatDuration as fmtDuration } from "@/lib/format";
+import { useWsAwarePolling } from "@/lib/global-ws";
+import {
+  formatTokens as fmtTokens,
+  formatDuration as fmtDuration,
+  formatCost,
+  formatCostFine,
+} from "@/lib/format";
 import {
   Card,
   CardHeader,
@@ -21,6 +27,7 @@ import {
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog, useConfirmDialog } from "@/components/confirm-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Dialog,
@@ -106,9 +113,10 @@ export function ProjectDetailTreeView({ projectId }: { projectId: string }) {
   });
   const planGenerating = !!planGenStatus?.generating;
 
+  const idleTreeRefetchInterval = useWsAwarePolling(30_000);
   const { data: tree, isLoading: treeLoading } = useProjectTree(
     projectId,
-    { refetchInterval: planGenerating ? 3_000 : 30_000 },
+    { refetchInterval: planGenerating ? 3_000 : idleTreeRefetchInterval },
   );
 
   const { data: projectUsage } = useUsageSummary(
@@ -127,6 +135,11 @@ export function ProjectDetailTreeView({ projectId }: { projectId: string }) {
   );
 
   const autoExecAll = useStartAutoExecuteAll(projectId);
+  // Audit-round-8: replace `window.confirm` with shared ConfirmDialog
+  // for the "Auto-Execute All" destructive flow — focus-trap + esc-
+  // close + screen-reader friendly. The dialog targetId is unused (no
+  // per-id payload), so we pass a constant sentinel.
+  const autoExecConfirm = useConfirmDialog();
 
   // Match the projects-tile behavior: surface a "N waiting" badge in the
   // project-detail header whenever this project has attention items
@@ -202,7 +215,7 @@ export function ProjectDetailTreeView({ projectId }: { projectId: string }) {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       {/* Project header */}
       <div className="flex items-start justify-between">
         <div>
@@ -215,7 +228,7 @@ export function ProjectDetailTreeView({ projectId }: { projectId: string }) {
             &larr; Projects
           </Button>
           <div className="mt-2 flex items-center gap-2">
-            <h1 className="text-2xl font-bold">{project.name}</h1>
+            <h1 className="text-[15px] font-semibold leading-tight">{project.name}</h1>
             {attentionCount > 0 && (
               <Badge
                 variant="destructive"
@@ -281,7 +294,7 @@ export function ProjectDetailTreeView({ projectId }: { projectId: string }) {
         <StatCard
           icon={DollarSign}
           label="Project Spend"
-          value={`$${(projectUsage?.total_cost_usd ?? 0).toFixed(2)}`}
+          value={formatCost(projectUsage?.total_cost_usd ?? 0)}
           isLoading={!projectUsage}
         />
         <StatCard
@@ -348,7 +361,7 @@ export function ProjectDetailTreeView({ projectId }: { projectId: string }) {
                   <CartesianGrid strokeDasharray="3 3" stroke={CHART_GRID_STROKE} />
                   <XAxis dataKey="date" tick={CHART_TICK_STYLE} />
                   <YAxis tick={CHART_TICK_STYLE} />
-                  <Tooltip {...CHART_TOOLTIP_PROPS} formatter={(value) => [`$${Number(value).toFixed(4)}`, "Cost"]} />
+                  <Tooltip {...CHART_TOOLTIP_PROPS} formatter={(value) => [formatCostFine(Number(value)), "Cost"]} />
                   <Line type="monotone" dataKey="cost" stroke="var(--primary)" strokeWidth={2} dot={false} />
                 </LineChart>
               </ResponsiveContainer>
@@ -387,8 +400,8 @@ export function ProjectDetailTreeView({ projectId }: { projectId: string }) {
 
       {/* Planning tree + editor+chat modal */}
       <div>
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-lg font-semibold">Planning Tree</h2>
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-[13px] font-semibold leading-tight">Planning Tree</h2>
           <div className="flex items-center gap-2">
             {tree && tree.milestones.length > 0 && (
               <Button
@@ -396,16 +409,21 @@ export function ProjectDetailTreeView({ projectId }: { projectId: string }) {
                 variant="outline"
                 disabled={autoExecAll.isPending || planGenerating}
                 title={planGenerating ? "Plan is still being generated" : undefined}
-                onClick={() => {
-                  if (window.confirm("Start auto-execution for all milestones?")) {
-                    autoExecAll.mutate();
-                  }
-                }}
+                onClick={() => autoExecConfirm.requestConfirm("auto-exec-all")}
               >
                 {autoExecAll.isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Zap className="h-4 w-4 mr-1" />}
                 Auto-Execute All
               </Button>
             )}
+            <ConfirmDialog
+              open={autoExecConfirm.open}
+              onOpenChange={autoExecConfirm.onOpenChange}
+              title="Start auto-execution?"
+              description="Run auto-execution across every milestone in this project. The agent will progress through milestones / slices / tasks until each one is complete or the budget cap fires."
+              confirmLabel="Start"
+              isPending={autoExecAll.isPending}
+              onConfirm={() => autoExecAll.mutate()}
+            />
             <GeneratePlanDialog projectId={projectId} />
             <CreateMilestoneDialog projectId={projectId} />
           </div>
@@ -464,7 +482,13 @@ export function ProjectDetailTreeView({ projectId }: { projectId: string }) {
               <Badge variant="outline" className="text-xs capitalize">{chatContext?.entity_type}</Badge>
               <span className="text-base font-semibold">{chatContext?.title}</span>
             </div>
-            <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" onClick={() => setChatContext(null)}>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7 shrink-0"
+              onClick={() => setChatContext(null)}
+              aria-label="Close chat context"
+            >
               <X className="h-4 w-4" />
             </Button>
           </div>

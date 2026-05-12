@@ -1,6 +1,9 @@
-import { memo, useMemo, useState } from "react";
-import { ChevronRight, Loader2, Check, X, Wrench, Brain } from "lucide-react";
+import { memo, useMemo, useState, type ReactNode } from "react";
+import { ChevronRight, Loader2, Wrench, Brain } from "lucide-react";
 import { InlineDiff, synthesizeDiffFromEdit } from "@/components/InlineDiff";
+import { StatusPill, type StatusPillTone } from "@/components/design/StatusPill";
+import { cn, parseServerTimestamp } from "@/lib/utils";
+import { formatDurationMs } from "@/lib/format";
 
 export interface ToolExecution {
   id: string;
@@ -9,6 +12,12 @@ export interface ToolExecution {
   status: "pending" | "success" | "error";
   result?: Record<string, unknown> | string;
   error?: string;
+  /**
+   * Wall-clock duration of the tool call. Rendered in the header in mono
+   * (e.g. `850ms`, `1.2s`, `1m 30s`) when present. Optional — most live
+   * stream callers don't compute it until the result event arrives.
+   */
+  durationMs?: number;
 }
 
 /**
@@ -52,13 +61,20 @@ function parseStoredTool(content: string | Record<string, unknown>): StoredToolP
  * showing the tool name and summary, with the raw input/output available on
  * demand. Used for chat transcripts — the live streaming counterpart is
  * `ToolExecutionItem`.
+ *
+ * `createdAt` (ISO 8601) is rendered as a `HH:mm` clock on the right of the
+ * row so an operator can spot a hung agent at a glance — e.g. a tool call
+ * stamped 10:16 with no follow-up means the run has been wedged ever since
+ * that point. Mirrors the timestamp footer on `ChatMessage` for parity.
  */
 export function StoredToolMessageItem({
   id,
   content,
+  createdAt,
 }: {
   id: string | number;
   content: string | Record<string, unknown>;
+  createdAt?: string;
 }) {
   const [expanded, setExpanded] = useState(false);
   const payload = useMemo(() => parseStoredTool(content), [content]);
@@ -67,18 +83,16 @@ export function StoredToolMessageItem({
 
   const detail =
     payload.kind === "call" ? payload.input : payload.output;
-  const detailText =
-    typeof detail === "string"
-      ? detail
-      : detail === undefined
-        ? ""
-        : JSON.stringify(detail, null, 2);
 
   // When the tool call is an edit (Edit / Write / str_replace variants),
   // synthesize a unified diff from the call input so the expanded body
   // shows the same structured diff view used in the task page instead
   // of a raw JSON blob.
   const editDiff = payload.kind === "call" ? tryBuildEditDiff(payload.name, payload.input) : null;
+
+  const formattedTime = createdAt
+    ? formatToolTimestamp(createdAt)
+    : null;
 
   return (
     <div
@@ -100,16 +114,25 @@ export function StoredToolMessageItem({
         <span className="ml-auto shrink-0 text-[10px] uppercase text-muted-foreground">
           {payload.kind}
         </span>
+        {formattedTime && (
+          <span
+            className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground"
+            data-testid="stored-tool-timestamp"
+            title={parseServerTimestamp(createdAt!).toLocaleString()}
+          >
+            {formattedTime}
+          </span>
+        )}
       </button>
       {expanded && editDiff && (
         <div className="border-t border-border bg-background/60 p-2">
           <InlineDiff diff={editDiff} />
         </div>
       )}
-      {expanded && !editDiff && detailText && (
-        <pre className="max-h-48 overflow-auto border-t border-border bg-muted/40 p-2 text-[10px]">
-          {detailText}
-        </pre>
+      {expanded && !editDiff && detail !== undefined && (
+        <div className="border-t border-border bg-background/40 p-2">
+          <JsonCodeView value={detail} />
+        </div>
       )}
     </div>
   );
@@ -175,7 +198,7 @@ export function ThinkingBlock({
   const [expanded, setExpanded] = useState(false);
 
   const label = streaming
-    ? "Thinking\u2026"
+    ? "Thinking…"
     : durationMs != null
       ? `Thought for ${Math.max(1, Math.round(durationMs / 1000))}s`
       : "Thought";
@@ -205,49 +228,254 @@ export function ThinkingBlock({
   );
 }
 
-export const ToolExecutionItem = memo(function ToolExecutionItem({ tool }: { tool: ToolExecution }) {
-  const [expanded, setExpanded] = useState(false);
+// ---------------------------------------------------------------------------
+// JSON code view — renders a value as numbered lines using the shared
+// `editor-line` + `tok-*` utilities (see ui/src/index.css). Long values are
+// capped with a "show more" affordance so a 500-line tool result doesn't
+// blow out the chat scrollback.
+// ---------------------------------------------------------------------------
 
-  const statusIcon = tool.status === "pending"
-    ? <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
-    : tool.status === "success"
-    ? <Check className="h-3 w-3 text-green-500" />
-    : <X className="h-3 w-3 text-destructive" />;
+const DEFAULT_MAX_LINES = 20;
+
+/**
+ * Match every JSON token kind we colour. The order matters — strings (which
+ * may include escaped quotes) come first, then numbers, then literals, then
+ * single-character punctuation. Anything that doesn't match falls through as
+ * the default "punctuation" colour (no token class).
+ *
+ * The `g` flag is required for `matchAll`.
+ */
+const JSON_TOKEN_RE =
+  /"(?:[^"\\]|\\.)*"(?:\s*:)?|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|\b(?:true|false|null)\b|[{}[\],:]/g;
+
+function tokenizeJsonLine(line: string): ReactNode[] {
+  const out: ReactNode[] = [];
+  let last = 0;
+  let key = 0;
+  for (const m of line.matchAll(JSON_TOKEN_RE)) {
+    const start = m.index!;
+    if (start > last) out.push(line.slice(last, start));
+    const tok = m[0];
+    if (tok.startsWith('"')) {
+      // String literal. If it ends with `:` (with optional whitespace), it's
+      // an object key — render the quoted portion as `tok-type` and the
+      // trailing `:` as plain punctuation so the key colour stops at the
+      // quote.
+      const colonIdx = tok.lastIndexOf(":");
+      const isKey = colonIdx > tok.lastIndexOf('"');
+      if (isKey) {
+        const strPart = tok.slice(0, colonIdx).trimEnd();
+        const tail = tok.slice(strPart.length);
+        out.push(
+          <span key={`k${key++}`} className="tok-type">{strPart}</span>,
+          <span key={`k${key++}`}>{tail}</span>,
+        );
+      } else {
+        out.push(<span key={`k${key++}`} className="tok-str">{tok}</span>);
+      }
+    } else if (/^-?\d/.test(tok)) {
+      out.push(<span key={`k${key++}`} className="tok-num">{tok}</span>);
+    } else if (tok === "true" || tok === "false" || tok === "null") {
+      out.push(<span key={`k${key++}`} className="tok-kw">{tok}</span>);
+    } else {
+      out.push(tok);
+    }
+    last = start + tok.length;
+  }
+  if (last < line.length) out.push(line.slice(last));
+  return out;
+}
+
+/**
+ * Defensive guard around the canonical {@link formatDurationMs} for the
+ * tool-execution row's millisecond input. The shared helper does not
+ * sanity-check the value (Infinity / NaN / negative would render as
+ * `"NaNms"` or `"-1s"`), so we keep the local guard but delegate the
+ * actual formatting to the shared module to avoid drift.
+ */
+function formatToolDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "";
+  return formatDurationMs(ms);
+}
+
+/**
+ * Render an ISO 8601 timestamp as `HH:mm` (locale-aware, 24h or 12h based on
+ * the user's locale defaults). Returns `null` for unparseable input so the
+ * caller can omit the slot rather than rendering `Invalid Date`.
+ *
+ * Used by the tool-call row header so operators can correlate a stalled
+ * stream with when the last tool fired.
+ */
+function formatToolTimestamp(iso: string): string | null {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/**
+ * Render an arbitrary value (string, object, array, …) as numbered code
+ * lines using the shared `.editor-line` + `.tok-*` utilities. Falls back
+ * to plain text for non-JSON-stringifiable values (e.g. circular refs).
+ */
+export function JsonCodeView({
+  value,
+  maxLines = DEFAULT_MAX_LINES,
+}: {
+  value: unknown;
+  maxLines?: number;
+}) {
+  const { text, isJson } = useMemo(() => {
+    if (typeof value === "string") return { text: value, isJson: false };
+    try {
+      return { text: JSON.stringify(value, null, 2) ?? "", isJson: true };
+    } catch {
+      // Circular references or BigInt — render the raw `String(value)` so
+      // we never throw inside the chat scrollback.
+      return { text: String(value), isJson: false };
+    }
+  }, [value]);
+
+  const [expanded, setExpanded] = useState(false);
+  const lines = useMemo(() => text.split("\n"), [text]);
+  const overflow = lines.length > maxLines;
+  const visible = !overflow || expanded ? lines : lines.slice(0, maxLines);
 
   return (
-    <div className="rounded border border-border text-xs">
+    <div
+      className="rounded border border-border bg-muted/30 py-1 font-mono text-[11px]"
+      data-testid="tool-code-view"
+    >
+      {visible.map((line, i) => (
+        <div key={i} className="editor-line">
+          <span className="ln">{i + 1}</span>
+          <span className="whitespace-pre-wrap break-all pr-2">
+            {isJson ? tokenizeJsonLine(line) : line}
+          </span>
+        </div>
+      ))}
+      {overflow && !expanded && (
+        <button
+          type="button"
+          data-testid="tool-show-more"
+          onClick={() => setExpanded(true)}
+          className="ml-[56px] mt-1 text-[11px] text-indigo-500 hover:underline"
+        >
+          Show more ({lines.length - maxLines} more lines)
+        </button>
+      )}
+      {overflow && expanded && (
+        <button
+          type="button"
+          data-testid="tool-show-less"
+          onClick={() => setExpanded(false)}
+          className="ml-[56px] mt-1 text-[11px] text-indigo-500 hover:underline"
+        >
+          Show less
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ToolExecutionItem — live tool-call accordion.
+// ---------------------------------------------------------------------------
+
+const STATUS_TONE: Record<ToolExecution["status"], StatusPillTone> = {
+  pending: "info",
+  success: "success",
+  error: "danger",
+};
+
+const STATUS_LABEL: Record<ToolExecution["status"], string> = {
+  pending: "running",
+  success: "done",
+  error: "error",
+};
+
+export const ToolExecutionItem = memo(function ToolExecutionItem({
+  tool,
+}: {
+  tool: ToolExecution;
+}) {
+  const [expanded, setExpanded] = useState(false);
+
+  const tone = STATUS_TONE[tool.status];
+  const label = STATUS_LABEL[tool.status];
+  const duration = tool.durationMs != null ? formatToolDuration(tool.durationMs) : null;
+
+  return (
+    <div
+      className="rounded-md border border-border text-[12px] my-1"
+      data-testid="tool-execution"
+      data-status={tool.status}
+    >
       <button
         type="button"
-        className="flex w-full items-center gap-1.5 px-2 py-1 hover:bg-accent/50"
+        aria-expanded={expanded}
         onClick={() => setExpanded(v => !v)}
+        className="flex w-full items-center gap-2 px-2 py-1.5 rounded-md text-left hover:bg-zinc-100 dark:hover:bg-zinc-800/50 text-[12px]"
       >
-        <ChevronRight className={`h-3 w-3 transition-transform ${expanded ? "rotate-90" : ""}`} />
-        <Wrench className="h-3 w-3 text-muted-foreground" />
-        <span className="font-medium">{tool.name}</span>
-        <span className="ml-auto">{statusIcon}</span>
+        <Wrench
+          aria-hidden="true"
+          data-testid="tool-icon"
+          className="h-3.5 w-3.5 shrink-0 text-muted-foreground"
+        />
+        <span className="font-mono font-medium" data-testid="tool-name">
+          {tool.name}
+        </span>
+        <StatusPill
+          tone={tone}
+          size="sm"
+          data-testid="tool-status-pill"
+          aria-label={`tool ${label}`}
+        >
+          {tool.status === "pending" && (
+            <Loader2 aria-hidden="true" className="mr-1 h-2.5 w-2.5 animate-spin" />
+          )}
+          {label}
+        </StatusPill>
+        {duration && (
+          <span
+            className="font-mono text-[10px] text-muted-foreground"
+            data-testid="tool-duration"
+          >
+            {duration}
+          </span>
+        )}
+        <ChevronRight
+          aria-hidden="true"
+          data-testid="tool-chevron"
+          className={cn(
+            "ml-auto h-3.5 w-3.5 shrink-0 transition-transform",
+            expanded && "rotate-90",
+          )}
+        />
       </button>
       {expanded && (
-        <div className="border-t border-border px-2 py-1.5 space-y-1">
+        <div className="border-t border-border bg-background/40 p-2 space-y-2">
           {tool.input != null && (
-            <div>
-              <span className="text-muted-foreground">Input:</span>
-              <pre className="mt-0.5 max-h-32 overflow-auto rounded bg-muted p-1 text-[10px]">
-                {typeof tool.input === "string" ? tool.input : JSON.stringify(tool.input, null, 2)}
-              </pre>
+            <div data-testid="tool-args-section">
+              <div className="mb-1 text-[10px] uppercase tracking-wider text-muted-foreground">
+                Args
+              </div>
+              <JsonCodeView value={tool.input} />
             </div>
           )}
           {tool.result != null && (
-            <div>
-              <span className="text-muted-foreground">Result:</span>
-              <pre className="mt-0.5 max-h-32 overflow-auto rounded bg-muted p-1 text-[10px]">
-                {typeof tool.result === "string" ? tool.result : JSON.stringify(tool.result, null, 2)}
-              </pre>
+            <div data-testid="tool-result-section">
+              <div className="mb-1 text-[10px] uppercase tracking-wider text-muted-foreground">
+                Result
+              </div>
+              <JsonCodeView value={tool.result} />
             </div>
           )}
           {tool.error != null && (
-            <div>
-              <span className="text-destructive">Error:</span>
-              <pre className="mt-0.5 max-h-32 overflow-auto rounded bg-destructive/10 p-1 text-[10px] text-destructive">
+            <div data-testid="tool-error-section">
+              <div className="mb-1 text-[10px] uppercase tracking-wider text-destructive">
+                Error
+              </div>
+              <pre className="whitespace-pre-wrap rounded bg-destructive/10 p-2 font-mono text-[11px] text-destructive">
                 {tool.error}
               </pre>
             </div>

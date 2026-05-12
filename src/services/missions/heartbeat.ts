@@ -56,7 +56,33 @@
 //   races with a status flip is a no-op, not a stale heartbeat.
 
 import cron from "node-cron";
+import type Database from "better-sqlite3";
 import { getRawDb } from "../../db/index.js";
+
+// Per-handle prepared-statement cache. The two SELECTs below run on every
+// cron tick (every 15 minutes per active mission) plus the boot path; caching
+// matches the WeakMap pattern proven in `supervisor.ts:69`, `wakeup-service.ts`,
+// and `budget-enforcer.ts`. Keyed on the Database handle so tests that swap
+// the DB get a fresh cache.
+interface HeartbeatStmts {
+  activeMissionIds: Database.Statement;
+  missionStatus: Database.Statement;
+}
+
+const stmtCache = new WeakMap<Database.Database, HeartbeatStmts>();
+
+function getStmts(sqlite: Database.Database): HeartbeatStmts {
+  let cached = stmtCache.get(sqlite);
+  if (cached) return cached;
+  cached = {
+    activeMissionIds: sqlite.prepare(
+      "SELECT id FROM missions WHERE status = 'active'",
+    ),
+    missionStatus: sqlite.prepare("SELECT status FROM missions WHERE id = ?"),
+  };
+  stmtCache.set(sqlite, cached);
+  return cached;
+}
 
 /** Cron expression for the heartbeat tick. Exported so tests can pin the
  *  literal without re-typing it. */
@@ -112,17 +138,15 @@ export interface HeartbeatDeps {
 
 function defaultReadActiveMissionIds(): string[] {
   const sqlite = getRawDb();
-  const rows = sqlite
-    .prepare("SELECT id FROM missions WHERE status = 'active'")
-    .all() as Array<{ id: string }>;
+  const rows = getStmts(sqlite).activeMissionIds.all() as Array<{ id: string }>;
   return rows.map((r) => r.id);
 }
 
 function defaultReadMissionStatus(missionId: string): string | null {
   const sqlite = getRawDb();
-  const row = sqlite
-    .prepare("SELECT status FROM missions WHERE id = ?")
-    .get(missionId) as { status: string } | undefined;
+  const row = getStmts(sqlite).missionStatus.get(missionId) as
+    | { status: string }
+    | undefined;
   return row ? row.status : null;
 }
 

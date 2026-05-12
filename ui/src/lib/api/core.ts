@@ -117,6 +117,32 @@ function tryParseJsonString(val: unknown): unknown {
 
 // --- Generic API fetcher (no auth — local tool) ---
 
+/**
+ * Error thrown by {@link apiFetch} on a non-2xx response. Carries the HTTP
+ * `status` and the parsed JSON body's `details` field so callers can
+ * distinguish 409-with-`details.reason === "dirty"` (worktree gate) from a
+ * bare 409, and surface bespoke UI for each. A plain `Error` would force
+ * callers to brittle-match on the message string.
+ *
+ * Subclasses Error so `.message`-based matching (and existing
+ * `expect(...).rejects.toThrow("...")` tests) keep working.
+ */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly details?: Record<string, unknown>;
+
+  constructor(
+    message: string,
+    status: number,
+    details?: Record<string, unknown>,
+  ) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.details = details;
+  }
+}
+
 export async function apiFetch<T>(
   path: string,
   options?: RequestInit & { rawKeys?: boolean },
@@ -144,7 +170,17 @@ export async function apiFetch<T>(
 
   if (!res.ok) {
     const errBody = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(errBody.error ?? errBody.detail ?? `API error ${res.status}`);
+    const message =
+      errBody.error ?? errBody.detail ?? `API error ${res.status}`;
+    // The server's ConflictError / ValidationError wrappers attach a
+    // `details` object alongside the message — preserve it so 409-handlers
+    // (worktree-dirty discard prompts, etc.) can branch on `details.reason`
+    // without re-parsing the message string.
+    const details =
+      errBody.details && typeof errBody.details === "object"
+        ? (errBody.details as Record<string, unknown>)
+        : undefined;
+    throw new ApiError(message, res.status, details);
   }
 
   // Convert incoming response keys: camelCase → snake_case + parse JSON strings

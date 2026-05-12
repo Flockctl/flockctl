@@ -6,6 +6,7 @@ import { getDb } from "../../db/index.js";
 import { chats, chatAttachments } from "../../db/schema.js";
 import { eq } from "drizzle-orm";
 import { NotFoundError, ValidationError } from "../../lib/errors.js";
+import { parseIdParam } from "../../lib/route-params.js";
 import {
   saveAttachment,
   AttachmentError,
@@ -14,12 +15,9 @@ import {
 import { getChatOrThrow } from "../../lib/db-helpers.js";
 
 // ─── Attachments ────────────────────────────────────────────────────────────
-// Zod-validates only the path param — the body is multipart/form-data, parsed
-// manually via c.req.parseBody().
-export const attachmentIdParamSchema = z.object({
-  id: z.coerce.number().int().positive(),
-});
-
+// Single-param routes (`:id`) go through `parseIdParam(c)`; the two-param
+// `:id/:attId` shape still uses zod because we want a single failure envelope
+// across both segments.
 export const attachmentBlobParamsSchema = z.object({
   id: z.coerce.number().int().positive(),
   attId: z.coerce.number().int().positive(),
@@ -31,10 +29,7 @@ export function registerChatAttachments(router: Hono): void {
   // all live in the service; the handler only translates AttachmentError →
   // 422 and shape-checks the multipart envelope.
   router.post("/:id/attachments", async (c) => {
-    const paramParse = attachmentIdParamSchema.safeParse({ id: c.req.param("id") });
-    if (!paramParse.success) throw new ValidationError("invalid chat id");
-    const chatId = paramParse.data.id;
-
+    const chatId = parseIdParam(c);
     getChatOrThrow(chatId);
 
     let body: Record<string, unknown>;
@@ -107,6 +102,21 @@ export function registerChatAttachments(router: Hono): void {
     if (!row || row.chatId !== chatId) throw new NotFoundError("Attachment");
     if (!existsSync(row.path)) throw new NotFoundError("Attachment");
 
+    // ETag = attachment id. Attachments are content-addressed (UUID-named
+    // and immutable after upload), so the id IS a strong validator for the
+    // bytes — no need to hash the file contents.
+    const etag = `"${attId}"`;
+    const ifNoneMatch = c.req.header("If-None-Match");
+    if (ifNoneMatch && ifNoneMatch === etag) {
+      // 304 Not Modified — saves re-streaming the file on transcript
+      // rerender / scrollback. Headers mirror the 200 path so a cache
+      // primed with the previous response stays valid.
+      return c.body(null, 304, {
+        ETag: etag,
+        "Cache-Control": "private, max-age=3600, immutable",
+      });
+    }
+
     const nodeStream = createReadStream(row.path);
     const webStream = Readable.toWeb(nodeStream) as ReadableStream;
 
@@ -119,10 +129,13 @@ export function registerChatAttachments(router: Hono): void {
       "X-Content-Type-Options": "nosniff",
       "Content-Length": String(row.sizeBytes),
       "Content-Disposition": `inline; filename*=UTF-8''${safeName}`,
-      // Blobs are immutable once uploaded (the UUID filename is regenerated on
-      // every upload) so a short private cache is safe and avoids re-streaming
-      // the same thumbnail on every transcript rerender.
-      "Cache-Control": "private, max-age=3600",
+      // Blobs are immutable once uploaded (the UUID filename is regenerated
+      // on every upload). `immutable` tells modern browsers never to
+      // revalidate within the freshness window, eliminating the 304
+      // round-trip on chat scrollback entirely; the ETag above is the
+      // fallback for cache-busting fetchers that ignore `immutable`.
+      "Cache-Control": "private, max-age=3600, immutable",
+      ETag: etag,
     });
   });
 }

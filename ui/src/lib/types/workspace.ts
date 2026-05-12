@@ -17,6 +17,19 @@ export interface Workspace {
   gitignore_agents_md: boolean;
   created_at: string;
   updated_at: string;
+  /**
+   * Aggregate count of tasks currently `status='running'` across every
+   * project owned by this workspace. Computed in a single correlated
+   * subquery on `GET /workspaces` (see `services/workspaces/list.ts`)
+   * so a list of N workspaces costs one round-trip, not N+1.
+   *
+   * Surfaced on the redesigned `/workspaces` grid as a live-tasks
+   * indicator on each `<WorkspaceCard>`. Older endpoints that return a
+   * `Workspace` without computing the aggregate (e.g. `POST /workspaces`
+   * which returns the freshly-inserted row) may omit the field — treat
+   * `undefined` as `0` at the call site.
+   */
+  active_task_count?: number;
 }
 
 export interface WorkspaceConfig {
@@ -69,6 +82,20 @@ export interface WorkspaceProject {
 
 export interface WorkspaceWithProjects extends Workspace {
   projects: Project[];
+}
+
+/**
+ * Result of `GET /workspaces/:id/allowed-keys`. Encodes both the effective
+ * allow-list and where it came from. Mirrors {@link ProjectAllowedKeys} so the
+ * chat key picker can apply the same filter logic regardless of whether the
+ * chat is project-scoped or workspace-only.
+ *
+ * `allowedKeyIds === null` means no restriction is configured (any active
+ * key may be used).
+ */
+export interface WorkspaceAllowedKeys {
+  allowedKeyIds: number[] | null;
+  source: "workspace" | "none";
 }
 
 // --- Workspace Dependency Graph ---

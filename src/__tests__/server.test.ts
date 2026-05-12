@@ -1,9 +1,10 @@
-import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
 import { app } from "../server.js";
 import { createTestDb } from "./helpers.js";
 import { setDb, type FlockctlDb } from "../db/index.js";
 import Database from "better-sqlite3";
 import { AppError } from "../lib/errors.js";
+import * as config from "../config/index.js";
 
 let db: FlockctlDb;
 let sqlite: Database.Database;
@@ -38,6 +39,14 @@ describe("Server integration", () => {
   });
 
   describe("CORS", () => {
+    // Mocks installed inside individual tests must be torn down on the way
+    // out, otherwise `hasRemoteAuth() = true` leaks to downstream tests
+    // (404 handler, AppError handler, etc.) and the auth/rate-limit pipeline
+    // starts rejecting their requests.
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
     it("responds with CORS headers", async () => {
       const res = await app.request("/health", {
         headers: { "Origin": "http://localhost:5173" },
@@ -57,6 +66,82 @@ describe("Server integration", () => {
       });
       // Should return 2xx for preflight
       expect(res.status).toBeLessThan(300);
+    });
+
+    /*
+     * Regression for the "remote auth on + empty corsOrigins falls back to
+     * `*`" bug. Prior code:
+     *   origin: allowed && allowed.length > 0 ? allowed : "*"
+     * When an operator enabled a remote-access token but forgot to populate
+     * `rc.corsOrigins`, every browser tab on the internet could speak to the
+     * daemon. Now an empty whitelist must result in NO Allow-Origin header
+     * (cross-origin XHR rejected by the browser; same-origin still works
+     * because no Origin enforcement applies).
+     */
+    it("rejects cross-origin requests when remote auth is on but corsOrigins is empty", async () => {
+      vi.spyOn(config, "hasRemoteAuth").mockReturnValue(true);
+      vi.spyOn(config, "getCorsAllowedOrigins").mockReturnValue(null);
+      // Suppress the one-shot misconfig warning so it doesn't leak into the
+      // test transcript on every run.
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const res = await app.request("/health", {
+        headers: { Origin: "https://evil.example.com" },
+      });
+      expect(res.status).toBe(200); // request itself succeeds
+      // …but no Allow-Origin header → browsers refuse to expose the response.
+      expect(res.headers.get("access-control-allow-origin")).toBeNull();
+
+      warnSpy.mockRestore();
+    });
+
+    it("rejects cross-origin preflight when remote auth is on but corsOrigins is empty", async () => {
+      vi.spyOn(config, "hasRemoteAuth").mockReturnValue(true);
+      vi.spyOn(config, "getCorsAllowedOrigins").mockReturnValue([]);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const res = await app.request("/health", {
+        method: "OPTIONS",
+        headers: {
+          Origin: "https://evil.example.com",
+          "Access-Control-Request-Method": "POST",
+        },
+      });
+      // Allow-Origin must be absent — preflight without it fails browser CORS.
+      expect(res.headers.get("access-control-allow-origin")).toBeNull();
+
+      warnSpy.mockRestore();
+    });
+
+    it("allows whitelisted origin when corsOrigins is configured", async () => {
+      vi.spyOn(config, "hasRemoteAuth").mockReturnValue(true);
+      vi.spyOn(config, "getCorsAllowedOrigins").mockReturnValue([
+        "https://my-ui.example.com",
+      ]);
+
+      const res = await app.request("/health", {
+        headers: { Origin: "https://my-ui.example.com" },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("access-control-allow-origin")).toBe(
+        "https://my-ui.example.com",
+      );
+    });
+
+    it("rejects non-whitelisted origin even when corsOrigins is set", async () => {
+      vi.spyOn(config, "hasRemoteAuth").mockReturnValue(true);
+      vi.spyOn(config, "getCorsAllowedOrigins").mockReturnValue([
+        "https://my-ui.example.com",
+      ]);
+
+      const res = await app.request("/health", {
+        headers: { Origin: "https://evil.example.com" },
+      });
+      // Hono's cors with origin: string[] returns no Allow-Origin for an
+      // origin that isn't on the list.
+      expect(res.headers.get("access-control-allow-origin")).not.toBe(
+        "https://evil.example.com",
+      );
     });
   });
 

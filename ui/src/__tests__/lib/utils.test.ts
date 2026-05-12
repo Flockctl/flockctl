@@ -20,20 +20,22 @@ describe("cn", () => {
 });
 
 describe("slugify", () => {
-  it("replaces spaces with underscores", () => {
-    expect(slugify("my project")).toBe("my_project");
+  it("emits lowercase kebab-case for spaces", () => {
+    expect(slugify("my project")).toBe("my-project");
   });
 
-  it("strips unsafe characters", () => {
-    expect(slugify("Hello, World!")).toBe("Hello_World");
+  it("strips unsafe characters and lowercases", () => {
+    expect(slugify("Hello, World!")).toBe("hello-world");
   });
 
-  it("collapses multiple underscores", () => {
-    expect(slugify("a    b    c")).toBe("a_b_c");
+  it("collapses multiple separators into single dash", () => {
+    expect(slugify("a    b    c")).toBe("a-b-c");
+    expect(slugify("a___b")).toBe("a-b");
   });
 
   it("trims leading/trailing separators", () => {
     expect(slugify("  __hello__  ")).toBe("hello");
+    expect(slugify("--bye--")).toBe("bye");
   });
 
   it("preserves hyphens and dots", () => {
@@ -83,5 +85,26 @@ describe("timeAgo", () => {
 
   it("returns days for longer intervals", () => {
     expect(timeAgo(new Date(FIXED_NOW - 5 * 86_400_000).toISOString())).toBe("5d ago");
+  });
+
+  it("treats naïve 'YYYY-MM-DD HH:MM:SS' timestamps as UTC", () => {
+    // SQLite's CURRENT_TIMESTAMP emits this format with no timezone marker.
+    // Without normalisation JS would parse it as local time, giving a value
+    // that drifts by the user's TZ offset. The fix appends `Z` so UTC is
+    // explicit, and a timestamp 5 minutes before the (UTC) "now" reads as
+    // 5 minutes regardless of which timezone the test runs in.
+    const five = new Date(FIXED_NOW - 5 * 60_000)
+      .toISOString()
+      .replace("T", " ")
+      .replace(/\.\d+Z$/, "");
+    expect(timeAgo(five)).toBe("5m ago");
+  });
+
+  it("respects explicit timezone offsets", () => {
+    // ISO with +00:00 should be parsed as UTC, not concatenated with `Z`.
+    const fiveMinAgo = new Date(FIXED_NOW - 5 * 60_000)
+      .toISOString()
+      .replace("Z", "+00:00");
+    expect(timeAgo(fiveMinAgo)).toBe("5m ago");
   });
 });

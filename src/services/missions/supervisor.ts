@@ -45,6 +45,8 @@
 //   consumers can drop it into the same dispatcher without a new branch in
 //   their type guard.
 
+import type Database from "better-sqlite3";
+
 import { getRawDb } from "../../db/index.js";
 import { wsManager } from "../ws-manager.js";
 import {
@@ -52,6 +54,32 @@ import {
   type EvaluatorResult,
   type GuardedEvaluateResult,
 } from "./guarded-evaluate.js";
+
+// ─── Prepared-statement cache (audit hot-path optimisation) ───
+//
+// Both statements below fire on every supervisor turn / objective-met
+// completion. Re-preparing identical SQL per call is wasted work.
+// Cache per-Database via WeakMap so test DB swaps reset cleanly.
+
+interface SupervisorStmts {
+  readObjective: Database.Statement<[string]>;
+  completeMission: Database.Statement<[string]>;
+}
+
+const stmtCache = new WeakMap<Database.Database, SupervisorStmts>();
+
+function getStmts(sqlite: Database.Database): SupervisorStmts {
+  let cached = stmtCache.get(sqlite);
+  if (cached) return cached;
+  cached = {
+    readObjective: sqlite.prepare("SELECT objective FROM missions WHERE id = ?"),
+    completeMission: sqlite.prepare(
+      "UPDATE missions SET status = 'completed', updated_at = unixepoch() WHERE id = ? AND status = 'active'",
+    ),
+  };
+  stmtCache.set(sqlite, cached);
+  return cached;
+}
 
 // Re-export so consumers (notably the event-subscriber test, which treats
 // `supervisor.ts` as the public surface for the supervisor pipeline) can
@@ -128,9 +156,9 @@ interface MissionRow {
  */
 function readMissionObjective(missionId: string): string {
   const sqlite = getRawDb();
-  const row = sqlite
-    .prepare("SELECT objective FROM missions WHERE id = ?")
-    .get(missionId) as MissionRow | undefined;
+  const row = getStmts(sqlite).readObjective.get(missionId) as
+    | MissionRow
+    | undefined;
   if (!row) {
     throw new Error(`SupervisorService: mission not found: ${missionId}`);
   }
@@ -229,7 +257,7 @@ export class SupervisorService {
         return result;
       }
 
-      // Successful parse → route to proposal or no_action.
+      // Successful parse → route to proposal / no_action / objective_met.
       if (parsed.output.kind === "proposal") {
         const result: EvaluatorResult = {
           proposal: {
@@ -242,6 +270,21 @@ export class SupervisorService {
         };
         return result;
       }
+      if (parsed.output.kind === "objective_met") {
+        // Termination signal. We tag the timeline with `objective_met`
+        // here; the post-evaluate block transitions `missions.status` to
+        // `completed`. We do NOT mutate status from inside the evaluator
+        // closure because the closure runs INSIDE guardedEvaluate's
+        // sequencing — moving the UPDATE here would race with the same
+        // transaction's INSERT into mission_events. Status flip lives
+        // on the consumer side of guardedEvaluate's resolved promise.
+        const result: EvaluatorResult = {
+          cost: reply.cost,
+          eventKind: "objective_met",
+          eventPayload: { summary: parsed.output.summary },
+        };
+        return result;
+      }
       const result: EvaluatorResult = {
         cost: reply.cost,
         eventKind: "no_action",
@@ -249,6 +292,23 @@ export class SupervisorService {
       };
       return result;
     });
+
+    // Mission status transition on `objective_met`. MUST happen BEFORE
+    // the broadcast so UI consumers that re-fetch the mission row on
+    // receipt of a `mission_event` envelope see the post-completion
+    // state — otherwise a fast UI refetch could land while the row is
+    // still `active` and we'd flicker through a transient status.
+    //
+    // Idempotent: a second `objective_met` event for an already-completed
+    // mission would still UPDATE status='completed' on a row that already
+    // has it (no-op write). The `WHERE status = 'active'` clause guards
+    // against accidentally pulling a paused/aborted/failed mission back
+    // into `completed` — once a mission has been operator-paused or
+    // aborted, the supervisor should not be able to overwrite that.
+    if (result.allowed && result.eventKind === "objective_met") {
+      const sqlite = getRawDb();
+      getStmts(sqlite).completeMission.run(missionId);
+    }
 
     // Broadcast on the success branch only. The denial branches don't
     // ALWAYS produce a fresh event row (paused / budget-exhausted denials
@@ -285,7 +345,20 @@ type ParseResult =
  *   - JSON that doesn't satisfy `supervisorOutputSchema` (wrong discriminator,
  *     destructive verb in candidate.action, missing required field, …)
  */
+// Upper bound for the supervisor's raw reply. A healthy reply is < 4 KiB;
+// 64 KiB leaves room for verbose error rationales without letting an
+// adversarial / mis-prompted provider blow up the event loop with a multi-MB
+// JSON.parse. The cap is applied BEFORE the parse so quadratic-time pathological
+// inputs cannot reach the parser.
+const MAX_SUPERVISOR_REPLY_BYTES = 64 * 1024;
+
 function parseSupervisorReply(text: string): ParseResult {
+  if (text.length > MAX_SUPERVISOR_REPLY_BYTES) {
+    return {
+      kind: "parse_error",
+      message: `reply too large: ${text.length} bytes (limit ${MAX_SUPERVISOR_REPLY_BYTES})`,
+    };
+  }
   let json: unknown;
   try {
     json = JSON.parse(text);

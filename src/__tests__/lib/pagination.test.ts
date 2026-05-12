@@ -43,11 +43,16 @@ describe("paginationParams", () => {
     expect(result.perPage).toBe(100);
   });
 
-  it("handles NaN values", () => {
+  it("falls back to defaults on non-finite values", () => {
+    // `Number("abc")` is NaN. The previous implementation propagated that
+    // into a SQL `LIMIT NaN OFFSET NaN`, which better-sqlite3 rejects with
+    // a generic 500. The current contract is: silently fall back to the
+    // documented defaults (page 1, perPage 20) so a typo in a query param
+    // doesn't crash the request.
     const result = paginationParams(mockContext({ page: "abc", per_page: "xyz" }));
-    // Number("abc") = NaN, Math.max(1, NaN) = NaN
-    expect(Number.isNaN(result.page)).toBe(true);
-    expect(Number.isNaN(result.perPage)).toBe(true);
+    expect(result.page).toBe(1);
+    expect(result.perPage).toBe(20);
+    expect(result.offset).toBe(0);
   });
 
   it("calculates offset correctly", () => {

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
+import { useTrackRecent } from "@/lib/recent-store";
 import {
   useWorkspace,
   useWorkspaceDashboard,
@@ -19,7 +20,9 @@ import { WorkspacePlanTab } from "./workspace-detail-components/WorkspacePlanTab
 import { WorkspaceRunsTab } from "./workspace-detail-components/WorkspaceRunsTab";
 import { WorkspaceTemplatesSchedulesTab } from "./workspace-detail-components/WorkspaceTemplatesSchedulesTab";
 import { WorkspaceConfigTab } from "./workspace-detail-components/WorkspaceConfigTab";
+import { OverviewTab } from "./workspace-detail-components/OverviewTab";
 import { TodoMdDialog } from "@/components/todo-md-dialog";
+import { GitDropdownButton } from "@/components/git/git-dropdown-button";
 
 // Re-export the (currently unused) Edit/Delete workspace dialogs so any
 // external consumer that imports them from this module path keeps working.
@@ -68,6 +71,13 @@ export default function WorkspaceDetailPage() {
     isLoading,
     error,
   } = useWorkspace(workspaceId ?? "");
+  // Populate the new-shell sidebar Recent list (slice 02 / M17).
+  useTrackRecent({
+    kind: "workspace",
+    id: workspaceId,
+    label: workspace?.name,
+    href: `/workspaces/${workspaceId ?? ""}`,
+  });
   const { data: dashboard, isLoading: dashboardLoading } = useWorkspaceDashboard(
     workspaceId ?? "",
   );
@@ -140,7 +150,7 @@ export default function WorkspaceDetailPage() {
               <Skeleton className="h-7 w-48" />
             ) : (
               <h1
-                className="truncate text-xl font-bold sm:text-2xl"
+                className="truncate text-[15px] font-semibold leading-tight"
                 title={workspace.name}
               >
                 {workspace.name}
@@ -205,6 +215,22 @@ export default function WorkspaceDetailPage() {
               <ListChecks className="mr-1.5 h-4 w-4" />
               TODO
             </Button>
+            {/*
+              Git operations live in the header (mirroring project-detail).
+              The same `<GitDropdownButton>` is reused across both surfaces
+              — `target.kind` decides which mutation hook trio runs.
+              When the workspace has no on-disk path the trigger is
+              disabled with a workspace-specific tooltip.
+            */}
+            {workspace && (
+              <GitDropdownButton
+                target={{
+                  kind: "workspace",
+                  id: workspace.id,
+                  path: workspace.path,
+                }}
+              />
+            )}
           </div>
         </div>
 
@@ -241,6 +267,12 @@ export default function WorkspaceDetailPage() {
         data-testid="workspace-detail-tabs"
       >
         <TabsList className="self-start">
+          <TabsTrigger value="overview" data-testid="workspace-detail-tab-overview">
+            Overview
+          </TabsTrigger>
+          <TabsTrigger value="projects" data-testid="workspace-detail-tab-projects">
+            Projects
+          </TabsTrigger>
           <TabsTrigger value="plan" data-testid="workspace-detail-tab-plan">
             Plan
           </TabsTrigger>
@@ -260,6 +292,30 @@ export default function WorkspaceDetailPage() {
             Config
           </TabsTrigger>
         </TabsList>
+
+        <TabsContent
+          value="overview"
+          className="data-[state=inactive]:hidden space-y-4"
+        >
+          <OverviewTab
+            workspaceId={workspaceId}
+            workspaceName={workspace?.name}
+            projects={workspace?.projects ?? []}
+            createdAt={workspace?.created_at}
+          />
+        </TabsContent>
+
+        <TabsContent
+          value="projects"
+          className="data-[state=inactive]:hidden space-y-4"
+        >
+          <OverviewTab
+            workspaceId={workspaceId}
+            workspaceName={workspace?.name}
+            projects={workspace?.projects ?? []}
+            createdAt={workspace?.created_at}
+          />
+        </TabsContent>
 
         <TabsContent
           value="plan"

@@ -29,11 +29,11 @@ export function StatCard({
         </CardTitle>
       </CardHeader>
       <CardContent>
-        <div className="text-2xl font-bold">
-          {isLoading ? <Skeleton className="h-8 w-16" /> : value}
+        <div className="text-[18px] font-semibold leading-tight">
+          {isLoading ? <Skeleton className="h-6 w-16" /> : value}
         </div>
         {subtitle && !isLoading && (
-          <p className="mt-1 text-xs text-muted-foreground">{subtitle}</p>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">{subtitle}</p>
         )}
       </CardContent>
     </Card>

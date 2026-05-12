@@ -40,6 +40,10 @@ function freshDb() {
       pinned INTEGER DEFAULT 0 NOT NULL,
       status TEXT NOT NULL DEFAULT 'idle',
       resume_at INTEGER,
+      -- Mirrors migration 0060 — per-chat git-worktree isolation.
+      isolation TEXT,
+      worktree_path TEXT,
+      worktree_branch TEXT,
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );

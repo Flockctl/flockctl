@@ -33,6 +33,26 @@
 const MIN_ESTIMATED_DELAY_MS = 15 * 60 * 1000;        // 15 min — first guess
 const MAX_ESTIMATED_DELAY_MS = 60 * 60 * 1000;        // 60 min — hard cap
 const DEFAULT_RATE_LIMIT_FALLBACK_MS = 60 * 1000;     // 1 min — when 429 has no headers (defensive)
+/**
+ * Grace buffer added to a CLI-supplied reset wall-clock. Anthropic's session
+ * reset is approximate from our side: their server clock and ours can drift,
+ * and the message rounds to the nearest minute. Waking 30s *after* the
+ * advertised time avoids the "task → resume → immediately re-park" loop the
+ * old 15-min lattice produced when the reset wall-clock fell inside the next
+ * polling slot.
+ */
+const RESET_TIME_GRACE_MS = 30 * 1000;
+/**
+ * "resets 10:50pm (Europe/Istanbul)" — captured in the CLI's stderr text for
+ * a Pro/Max session-cap hit. The wall-clock time is in the *operator's local
+ * timezone* as observed by Claude Code, NOT UTC. Both `am`/`pm` and the
+ * parenthesised IANA timezone are required: without one of them the wall-
+ * clock is ambiguous and we'd rather fall back to the estimated 15-min
+ * lattice than guess. Optional minutes (`(?::(\d{2}))?`) so we accept the
+ * less common `resets 10pm` shape too.
+ */
+const RESET_TIME_PATTERN =
+  /\bresets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s+\(([^)]+)\)/i;
 
 /** Possible kinds of "you've hit a limit" the classifier can recognise. */
 export type RateLimitKind =
@@ -76,6 +96,13 @@ const ANTHROPIC_USAGE_LIMIT_PATTERNS: RegExp[] = [
   /claude ai usage limit reached/i,
   /\bbilling[_-]?error\b/i,
   /\bquota\s+exceeded\b/i,
+  // Claude Code CLI session-cap wording (Pro/Max plans):
+  //   "You've hit your limit · resets 9:30pm (Europe/Istanbul)"
+  // Surfaces via `AI stream error: Claude Code returned an error result: …`
+  // in the task executor — no 429 status, no structured headers, just text.
+  // Without this entry the executor falls through to the generic FAILED
+  // path and the rate-limit scheduler never gets to park / wake the row.
+  /\bhit your limit\b/i,
 ];
 
 const ANTHROPIC_RATE_LIMIT_MESSAGE_PATTERNS: RegExp[] = [
@@ -191,10 +218,22 @@ export function classifyLimit(err: unknown, opts: ClassifyOptions = {}): RateLim
 
   // 2. Anthropic billing / usage_limit error. Comes through as either
   //    `error.type === 'billing_error'` (structured) or as a CLI/SDK error
-  //    string with one of the patterns below. The CLI path is the only place
-  //    we ever see a Pro/Max weekly cap, and the resumeAt has to be guessed.
+  //    string with one of the patterns below. The CLI text path often
+  //    embeds the precise reset time (e.g. "resets 10:50pm (Europe/Istanbul)")
+  //    — when present we treat it as `confidence: 'exact'` and wake the
+  //    task right at that moment instead of polling on the 15→30→60 lattice.
   const errorType = obj?.type ?? (obj?.error as Record<string, unknown> | undefined)?.type;
   if (errorType === "billing_error" || ANTHROPIC_USAGE_LIMIT_PATTERNS.some((re) => re.test(message))) {
+    const exactResetMs = parseClaudeCliResetTime(message, now);
+    if (exactResetMs !== null) {
+      return {
+        kind: "usage_limit",
+        provider: "anthropic",
+        resumeAtMs: exactResetMs,
+        confidence: "exact",
+        rawMessage: message,
+      };
+    }
     return {
       kind: "usage_limit",
       provider: "anthropic",
@@ -250,12 +289,137 @@ export function nextEstimatedDelayMs(attempt: number): number {
   return MAX_ESTIMATED_DELAY_MS;
 }
 
+// ─── Claude Code CLI reset-time parser ─────────────────────────────────────
+//
+// The Pro/Max session-cap error embeds a wall-clock reset time in the user's
+// local timezone, e.g. "You've hit your limit · resets 10:50pm (Europe/Istanbul)".
+// Parsing this pulls the resume from a 15-minute polling lattice down to a
+// single, precise wake-up. Without it, an operator who hits the cap at 18:45
+// and is told the limit clears at 22:50 still gets woken every 15 min for
+// over four hours of guaranteed-failed attempts.
+//
+// Returns the absolute unix-epoch ms (with a small grace buffer) at which the
+// task should resume, or null if the message lacks a parseable reset stanza
+// (caller falls back to the estimated lattice in that case).
+
+interface TzYmd { year: number; month: number; day: number; }
+
+/** Format `epochMs` in `tz` and pull the calendar date — needed to know
+ *  whether "10:50pm" today has already passed and we should aim for tomorrow. */
+function tzDateParts(epochMs: number, tz: string): TzYmd | null {
+  try {
+    const fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
+    const parts = fmt.formatToParts(new Date(epochMs));
+    const get = (t: string) => Number(parts.find((p) => p.type === t)?.value);
+    const year = get("year");
+    const month = get("month");
+    const day = get("day");
+    if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return null;
+    return { year, month, day };
+  } catch {
+    // Unknown IANA zone — Intl throws RangeError. Caller falls back to estimated.
+    return null;
+  }
+}
+
+/**
+ * Convert a wall-clock (Y/M/D HH:MM in `tz`) to a unix-epoch ms. The trick:
+ * format a "naive UTC" guess in `tz`, see what wall-clock that produces,
+ * derive the offset, shift back. Single round-trip is correct except across
+ * the DST gap — and even there the result is monotonic so the scheduler will
+ * still wake at most one hour off, which is well within the cap-grace.
+ */
+function wallTimeInTzToUtcMs(
+  y: number,
+  mo: number,
+  d: number,
+  h: number,
+  mi: number,
+  tz: string,
+): number | null {
+  try {
+    const naive = Date.UTC(y, mo - 1, d, h, mi, 0);
+    if (!Number.isFinite(naive)) return null;
+    const fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    });
+    const parts = fmt.formatToParts(new Date(naive));
+    const get = (t: string) => Number(parts.find((p) => p.type === t)?.value);
+    const tzAsUtc = Date.UTC(
+      get("year"),
+      get("month") - 1,
+      get("day"),
+      get("hour"),
+      get("minute"),
+      get("second"),
+    );
+    if (!Number.isFinite(tzAsUtc)) return null;
+    const offset = tzAsUtc - naive;
+    return naive - offset;
+  } catch {
+    return null;
+  }
+}
+
+function addOneDay(p: TzYmd): TzYmd {
+  const t = new Date(Date.UTC(p.year, p.month - 1, p.day));
+  t.setUTCDate(t.getUTCDate() + 1);
+  return { year: t.getUTCFullYear(), month: t.getUTCMonth() + 1, day: t.getUTCDate() };
+}
+
+export function parseClaudeCliResetTime(message: string, nowMs: number): number | null {
+  const m = RESET_TIME_PATTERN.exec(message);
+  // Mandatory groups (hour, am/pm, TZ) — under `noUncheckedIndexedAccess` they
+  // type as string|undefined even though the regex guarantees them. Bail out
+  // defensively rather than non-null-asserting.
+  if (!m || m[1] === undefined || m[3] === undefined || m[4] === undefined) return null;
+  let hour = parseInt(m[1], 10);
+  const minute = m[2] ? parseInt(m[2], 10) : 0;
+  const ampm = m[3].toLowerCase();
+  const tz = m[4].trim();
+  if (!Number.isInteger(hour) || hour < 1 || hour > 12) return null;
+  if (!Number.isInteger(minute) || minute < 0 || minute > 59) return null;
+  if (ampm === "pm" && hour < 12) hour += 12;
+  else if (ampm === "am" && hour === 12) hour = 0;
+
+  const today = tzDateParts(nowMs, tz);
+  if (!today) return null;
+
+  const candidate = wallTimeInTzToUtcMs(today.year, today.month, today.day, hour, minute, tz);
+  if (candidate === null) return null;
+
+  // If the parsed wall-clock has already elapsed in `tz` (e.g. it's 23:00
+  // local and the reset says 10:50pm — i.e. 22:50), the reset must refer to
+  // tomorrow. Compare via the candidate timestamp rather than wall-clock
+  // arithmetic so DST transitions don't bite us.
+  if (candidate <= nowMs) {
+    const tomorrow = addOneDay(today);
+    const next = wallTimeInTzToUtcMs(tomorrow.year, tomorrow.month, tomorrow.day, hour, minute, tz);
+    return next === null ? null : next + RESET_TIME_GRACE_MS;
+  }
+  return candidate + RESET_TIME_GRACE_MS;
+}
+
 // Exposed for the unit tests; not part of the public surface.
 export const _internals = {
   MIN_ESTIMATED_DELAY_MS,
   MAX_ESTIMATED_DELAY_MS,
   DEFAULT_RATE_LIMIT_FALLBACK_MS,
+  RESET_TIME_GRACE_MS,
   readRetryAfterMs,
+  parseClaudeCliResetTime,
 };
 
 // ─── Helpers ───────────────────────────────────────────────────────────────

@@ -10,28 +10,38 @@ import {
 } from "../../lib/json-safe-parse.js";
 
 describe("slugify", () => {
-  it("collapses spaces, lowercase passthrough, drops illegal chars", () => {
-    expect(slugify("Hello World")).toBe("Hello_World");
+  it("emits lowercase kebab-case, drops illegal chars", () => {
+    expect(slugify("Hello World")).toBe("hello-world");
     expect(slugify("foo!@#bar")).toBe("foobar");
-    expect(slugify("multi   space")).toBe("multi_space");
+    expect(slugify("multi   space")).toBe("multi-space");
+    expect(slugify("Audit Review & Final Coverage")).toBe(
+      "audit-review-final-coverage",
+    );
   });
 
-  it("trims trailing/leading underscores and dashes", () => {
+  it("collapses underscores into dashes (kebab is the canonical form)", () => {
+    expect(slugify("foo_bar_baz")).toBe("foo-bar-baz");
+    expect(slugify("mix_of words and_under")).toBe("mix-of-words-and-under");
+    expect(slugify("trailing___underscores")).toBe("trailing-underscores");
+  });
+
+  it("trims leading/trailing dashes and dots", () => {
     expect(slugify("__hi__")).toBe("hi");
     expect(slugify("--bye--")).toBe("bye");
+    expect(slugify("..dotted..")).toBe("dotted");
   });
 
   it("falls back to 'unnamed' when input collapses to empty", () => {
-    // Hits the `|| "unnamed"` branch on line 13 — input is non-empty but
-    // every character is stripped, so the chained replaces yield "".
     expect(slugify("!@#$%")).toBe("unnamed");
     expect(slugify("   ")).toBe("unnamed");
     expect(slugify("")).toBe("unnamed");
     expect(slugify("___")).toBe("unnamed");
+    expect(slugify("---")).toBe("unnamed");
   });
 
-  it("preserves dots, dashes, underscores, alphanumerics", () => {
-    expect(slugify("hello.world-1_2")).toBe("hello.world-1_2");
+  it("preserves alphanumerics, dots, and existing dashes", () => {
+    expect(slugify("hello.world-1-2")).toBe("hello.world-1-2");
+    expect(slugify("v1.2.3")).toBe("v1.2.3");
   });
 });
 

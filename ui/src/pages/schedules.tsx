@@ -1,4 +1,5 @@
-import { Fragment, useState } from "react";
+import { useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   useSchedules,
   usePauseSchedule,
@@ -6,17 +7,9 @@ import {
   useDeleteSchedule,
   useTriggerSchedule,
 } from "@/lib/hooks";
+import { useWsAwarePolling } from "@/lib/global-ws";
 import { ScheduleStatus } from "@/lib/types";
-import type { Schedule, ScheduleFilters } from "@/lib/types";
-import { formatTimestamp as formatTime } from "@/lib/format";
-import {
-  Table,
-  TableHeader,
-  TableBody,
-  TableRow,
-  TableHead,
-  TableCell,
-} from "@/components/ui/table";
+import type { ScheduleFilters } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -28,13 +21,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { ConfirmDialog, useConfirmDialog } from "@/components/confirm-dialog";
-import { ScheduleStatusBadge } from "@/components/schedule-status-badge";
-import { ChevronDown, ChevronRight } from "lucide-react";
-import {
-  CreateScheduleDialog,
-  scopeLabel,
-} from "@/pages/schedules-components/create-schedule-dialog";
-import { ScheduleTasksRow } from "@/pages/schedules-components/schedule-tasks-row";
+import { SectionHeader } from "@/components/design";
+import { CreateScheduleDialog } from "@/pages/schedules-components/create-schedule-dialog";
+import { SchedulesTable } from "@/pages/schedules-components/SchedulesTable";
 
 // Re-exported for callers that still import from `@/pages/schedules` (the
 // project-detail Schedules section mounts the dialog inline with a preset
@@ -49,30 +38,82 @@ const SCHEDULE_STATUS_VALUES: ScheduleStatus[] = [
   ScheduleStatus.expired,
 ];
 
+const SEARCH_INPUT_CLASSES =
+  "px-3 py-1.5 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded text-[12.5px] outline-none focus:border-indigo-500 w-56";
 
 /**
- * /schedules landing page. Renders the filter bar + paginated table. Row
- * expansion drops to `ScheduleTasksRow` (fetches latest tasks spawned by the
- * schedule) and the header "Create" button mounts `CreateScheduleDialog`.
- * Heavy sub-trees live under `schedules-components/` so this file stays
- * focused on the table layout and row actions.
+ * Case-insensitive substring match on a schedule's identifying fields:
+ *   - `template_name` (the most user-visible label)
+ *   - `id`            (so the operator can paste a schedule id to jump)
+ *   - `cron_expression` (handy when grepping for a known cron)
+ *
+ * Mirrors the predicate shape used by `filterTasksByQuery` /
+ * `filterProjectsByQuery` so the four library pages (Tasks, Projects,
+ * Workspaces, Schedules) all share the same search semantics.
+ */
+function filterSchedulesByQuery<
+  T extends {
+    id?: string | null;
+    template_name?: string | null;
+    cron_expression?: string | null;
+  },
+>(rows: ReadonlyArray<T>, query: string): T[] {
+  const trimmed = query.trim().toLowerCase();
+  if (!trimmed) return [...rows];
+  return rows.filter((row) => {
+    const id = (row.id ?? "").toLowerCase();
+    const template = (row.template_name ?? "").toLowerCase();
+    const cron = (row.cron_expression ?? "").toLowerCase();
+    return (
+      id.includes(trimmed) ||
+      template.includes(trimmed) ||
+      cron.includes(trimmed)
+    );
+  });
+}
+
+
+/**
+ * /schedules landing page. Renders the filter bar + paginated table — the
+ * actual table is the M22-styled {@link SchedulesTable} (flat divider-y
+ * rows, scope-tinted project pills, kebab actions). Mutations and the
+ * delete-confirm dialog are wired here so the table component stays
+ * presentational.
  */
 export default function SchedulesPage() {
-  const [filters, setFilters] = useState<ScheduleFilters>({});
-  const [offset, setOffset] = useState(0);
-  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+  // ─── URL-backed filter / pagination state ───────────────────────────
+  //
+  // Tasks already moved its filters into the URL (`useSearchParams`);
+  // mirroring the pattern here means a refresh / deep-link / back-button
+  // preserves the operator's filtered view. Audit-round-3 finding.
+  //
+  // The URL is the source of truth — `filters`, `offset`, and the search
+  // draft are all derived from it. The setters write back through
+  // `setSearchParams` so React Router takes care of history entries.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const status = searchParams.get("status") as ScheduleFilters["status"] | null;
+  const scheduleType = searchParams.get("type") as ScheduleFilters["schedule_type"] | null;
+  const filters = useMemo<ScheduleFilters>(() => {
+    const next: ScheduleFilters = {};
+    if (status) next.status = status;
+    if (scheduleType) next.schedule_type = scheduleType;
+    return next;
+  }, [status, scheduleType]);
+  const offset = Number.parseInt(searchParams.get("offset") ?? "0", 10) || 0;
+  // Client-side `?q=` narrowing — the schedules API doesn't accept a free-text
+  // query param, so we filter the current page client-side to match the rest
+  // of the library surfaces (Tasks, Projects, Workspaces). The draft stays
+  // in component state (typing doesn't churn URL history); we read+commit
+  // to URL via the visible value below.
+  const urlSearchValue = searchParams.get("q") ?? "";
+  const [searchDraft, setSearchDraft] = useState<string>(urlSearchValue);
 
-  function toggleExpanded(id: string) {
-    setExpandedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }
-
+  // Visibility-gated polling: the schedules surface has no WS push (yet),
+  // so the helper falls back to the 10s interval when the tab is visible
+  // and pauses entirely when hidden — half the daemon's idle traffic.
+  const refetchInterval = useWsAwarePolling(10_000);
   const { data, isLoading, error } = useSchedules(offset, PAGE_SIZE, filters, {
-    refetchInterval: 10_000,
+    refetchInterval,
   });
   const pauseScheduleMutation = usePauseSchedule();
   const resumeScheduleMutation = useResumeSchedule();
@@ -80,20 +121,44 @@ export default function SchedulesPage() {
   const triggerScheduleMutation = useTriggerSchedule();
   const deleteConfirm = useConfirmDialog();
 
+  // Map a `ScheduleFilters` key onto its URL param name. Keeps the
+  // search-params shape decoupled from the internal filter shape so a
+  // future schema tweak doesn't break shared bookmarks.
+  function urlKeyFor(key: keyof ScheduleFilters): string {
+    return key === "schedule_type" ? "type" : key;
+  }
+
   function updateFilter<K extends keyof ScheduleFilters>(
     key: K,
     value: ScheduleFilters[K],
   ) {
-    setFilters((prev) => {
-      const next = { ...prev };
-      if (value === undefined) {
-        delete next[key];
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      const paramKey = urlKeyFor(key);
+      // `ScheduleFilters` keys are typed as enum unions, so a literal
+      // `""` check needs a string-coerce intermediate to compile under
+      // strict mode.
+      const strValue =
+        value === undefined || value === null ? "" : String(value);
+      if (strValue === "") {
+        next.delete(paramKey);
       } else {
-        next[key] = value;
+        next.set(paramKey, strValue);
       }
+      // Reset pagination on filter change — keeps the "showing 1–N of M"
+      // label sensible across filter switches.
+      next.delete("offset");
       return next;
     });
-    setOffset(0);
+  }
+
+  function setOffset(nextOffset: number) {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      if (nextOffset === 0) next.delete("offset");
+      else next.set("offset", String(nextOffset));
+      return next;
+    });
   }
 
   const filterCount = Object.values(filters).filter(
@@ -102,20 +167,25 @@ export default function SchedulesPage() {
   const showingFrom = data ? Math.min(offset + 1, data.total) : 0;
   const showingTo = data ? Math.min(offset + PAGE_SIZE, data.total) : 0;
 
-  return (
-    <div>
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div className="min-w-0">
-          <h1 className="text-xl font-bold sm:text-2xl">Schedules</h1>
-          <p className="mt-1 text-sm text-muted-foreground sm:text-base">
-            Configure and monitor scheduled task execution.
-          </p>
-        </div>
-        <CreateScheduleDialog />
-      </div>
+  // Apply the client-side search predicate to the current page. The server
+  // already paginates, so the narrowing is bounded by PAGE_SIZE.
+  const filteredItems = useMemo(
+    () => filterSchedulesByQuery(data?.items ?? [], searchDraft),
+    [data?.items, searchDraft],
+  );
+  const hasSearch = searchDraft.trim().length > 0;
 
-      {/* Filter bar */}
-      <div className="mt-4 flex flex-wrap items-end gap-3">
+  return (
+    <div data-testid="schedules-page" className="max-w-7xl">
+      <SectionHeader
+        title="Schedules"
+        subtitle="Configure and monitor scheduled task execution."
+        action={<CreateScheduleDialog />}
+      />
+
+      {/* Filter bar — Status select sits left, search input right (matches
+          the Tasks filter row layout). */}
+      <div className="mb-3 flex flex-wrap items-end gap-3">
         <div className="space-y-1">
           <Label className="text-xs text-muted-foreground">Status</Label>
           <Select
@@ -143,10 +213,21 @@ export default function SchedulesPage() {
           </Select>
         </div>
 
+        <div className="flex-1" />
 
+        <input
+          type="text"
+          role="searchbox"
+          placeholder="Search schedules…"
+          aria-label="Search schedules"
+          value={searchDraft}
+          onChange={(e) => setSearchDraft(e.target.value)}
+          className={SEARCH_INPUT_CLASSES}
+          data-testid="schedules-search-input"
+        />
       </div>
 
-      <div className="mt-6">
+      <div>
         {isLoading && (
           <div className="space-y-2">
             {Array.from({ length: 5 }).map((_, i) => (
@@ -166,133 +247,40 @@ export default function SchedulesPage() {
               : "No schedules yet."}
           </p>
         )}
-        {data && data.items.length > 0 && (
+        {data && data.items.length > 0 && filteredItems.length === 0 && hasSearch && (
+          <p
+            className="text-sm text-muted-foreground"
+            data-testid="schedules-search-empty"
+          >
+            No schedules match “{searchDraft.trim()}”.
+          </p>
+        )}
+        {data && filteredItems.length > 0 && (
           <>
             <p className="mb-4 text-sm text-muted-foreground">
               Showing {showingFrom}–{showingTo} of {data.total} schedule
               {data.total !== 1 ? "s" : ""}
               {filterCount > 0 &&
                 ` (${filterCount} filter${filterCount > 1 ? "s" : ""} active)`}
+              {hasSearch &&
+                ` · ${filteredItems.length} match${filteredItems.length === 1 ? "" : "es"} for “${searchDraft.trim()}”`}
             </p>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-[32px]" />
-                  <TableHead>Template</TableHead>
-                  <TableHead>Scope</TableHead>
-                  <TableHead>Schedule</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead>Next Fire</TableHead>
-                  <TableHead>Last Fire</TableHead>
-                  <TableHead className="w-[180px]">Actions</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {data.items.map((sched: Schedule) => {
-                  const isExpanded = expandedIds.has(sched.id);
-                  return (
-                  <Fragment key={sched.id}>
-                  <TableRow
-                    className="cursor-pointer"
-                    onClick={() => toggleExpanded(sched.id)}
-                  >
-                    <TableCell className="w-[32px] p-2">
-                      <button
-                        type="button"
-                        className="flex h-6 w-6 items-center justify-center rounded hover:bg-accent"
-                        aria-label={isExpanded ? "Collapse" : "Expand"}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          toggleExpanded(sched.id);
-                        }}
-                      >
-                        {isExpanded ? (
-                          <ChevronDown className="h-4 w-4 text-muted-foreground" />
-                        ) : (
-                          <ChevronRight className="h-4 w-4 text-muted-foreground" />
-                        )}
-                      </button>
-                    </TableCell>
-                    <TableCell className="font-medium">
-                      {sched.template_name}
-                    </TableCell>
-                    <TableCell className="text-xs">
-                      {scopeLabel(sched.template_scope)}
-                    </TableCell>
-                    <TableCell className="font-mono text-xs">
-                      {sched.cron_expression ?? "-"}
-                    </TableCell>
-                    <TableCell>
-                      <ScheduleStatusBadge status={sched.status} />
-                    </TableCell>
-                    <TableCell className="text-xs">
-                      {formatTime(sched.next_fire_time)}
-                    </TableCell>
-                    <TableCell className="text-xs">
-                      {formatTime(sched.last_fire_time)}
-                    </TableCell>
-                    <TableCell>
-                      <div
-                        className="flex gap-1"
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        {sched.status === ScheduleStatus.active && (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-7 px-2 text-xs"
-                            disabled={pauseScheduleMutation.isPending}
-                            onClick={() =>
-                              pauseScheduleMutation.mutate(sched.id)
-                            }
-                          >
-                            Pause
-                          </Button>
-                        )}
-                        {sched.status === ScheduleStatus.paused && (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-7 px-2 text-xs"
-                            disabled={resumeScheduleMutation.isPending}
-                            onClick={() =>
-                              resumeScheduleMutation.mutate(sched.id)
-                            }
-                          >
-                            Resume
-                          </Button>
-                        )}
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-7 px-2 text-xs"
-                          disabled={triggerScheduleMutation.isPending}
-                          onClick={() =>
-                            triggerScheduleMutation.mutate(sched.id)
-                          }
-                        >
-                          Run
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-7 px-2 text-xs text-destructive hover:text-destructive"
-                          disabled={deleteScheduleMutation.isPending}
-                          onClick={() => deleteConfirm.requestConfirm(sched.id)}
-                        >
-                          Delete
-                        </Button>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                  {isExpanded && (
-                    <ScheduleTasksRow scheduleId={sched.id} colSpan={8} />
-                  )}
-                  </Fragment>
-                  );
-                })}
-              </TableBody>
-            </Table>
+            <SchedulesTable
+              rows={filteredItems}
+              onRunNow={(id) =>
+                !triggerScheduleMutation.isPending &&
+                triggerScheduleMutation.mutate(id)
+              }
+              onPause={(id) =>
+                !pauseScheduleMutation.isPending &&
+                pauseScheduleMutation.mutate(id)
+              }
+              onResume={(id) =>
+                !resumeScheduleMutation.isPending &&
+                resumeScheduleMutation.mutate(id)
+              }
+              onDelete={(id) => deleteConfirm.requestConfirm(id)}
+            />
 
             {/* Pagination */}
             <div className="mt-4 flex items-center justify-between">
@@ -305,7 +293,7 @@ export default function SchedulesPage() {
                   variant="outline"
                   size="sm"
                   disabled={offset === 0}
-                  onClick={() => setOffset((o) => Math.max(0, o - PAGE_SIZE))}
+                  onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
                 >
                   Previous
                 </Button>
@@ -313,7 +301,7 @@ export default function SchedulesPage() {
                   variant="outline"
                   size="sm"
                   disabled={offset + PAGE_SIZE >= data.total}
-                  onClick={() => setOffset((o) => o + PAGE_SIZE)}
+                  onClick={() => setOffset(offset + PAGE_SIZE)}
                 >
                   Next
                 </Button>

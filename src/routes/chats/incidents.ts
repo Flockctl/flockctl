@@ -5,6 +5,7 @@ import { chats, chatMessages, aiProviderKeys } from "../../db/schema.js";
 import { eq, sql } from "drizzle-orm";
 import { NotFoundError, ValidationError } from "../../lib/errors.js";
 import { parseIdParam } from "../../lib/route-params.js";
+import { flattenZodError } from "../../lib/zod-utils.js";
 import { extractIncidentFromMessages } from "../../services/incidents/extractor.js";
 import { getChatOrThrow } from "../../lib/db-helpers.js";
 
@@ -36,9 +37,7 @@ export function registerChatIncidents(router: Hono): void {
     });
     const parsed = bodySchema.safeParse(body);
     if (!parsed.success) {
-      throw new ValidationError(
-        `invalid body: ${parsed.error.issues.map((i) => i.message).join(", ")}`,
-      );
+      throw new ValidationError("invalid body", flattenZodError(parsed.error));
     }
     const { messageIds, skipExtract } = parsed.data;
 

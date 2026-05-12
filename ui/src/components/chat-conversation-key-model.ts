@@ -14,6 +14,14 @@ export interface UseChatKeyModelSelectionInput {
   allModels: MetaModel[];
   defaultModel: string;
   defaultKeyId: string | number | null | undefined;
+  /**
+   * Identifier of the scope whose allow-list applies to this chat — usually
+   * the project id, but for workspace-only chats (no project) it's the
+   * workspace id. Empty string disables both the allow-list filter and the
+   * "wait for fetch" guard, so the picker shows every active key — that's
+   * the global /chats fallback. The variable name is a historical artefact
+   * (originally project-only); semantically it's "allow-list scope id".
+   */
   projectIdForConfig: string;
   chatAllowedKeys: { allowedKeyIds: number[] | null } | null | undefined;
   chatProjectConfig: { model?: unknown } | null | undefined;

@@ -108,6 +108,27 @@ export const noActionSchema = z.object({
 });
 
 /**
+ * The "supervisor looked and decided the mission's objective is met" variant.
+ * This is the explicit termination signal: when the supervisor emits this,
+ * `SupervisorService.evaluate` writes an `objective_met` event AND transitions
+ * the mission to `status='completed'`. Without this kind, missions could
+ * only end via budget exhaustion or operator action — there was no
+ * model-driven success path. Bumped from `v1.0.0` to `v1.1.0` of the
+ * prompt template (see `SUPERVISOR_PROMPT_VERSION`).
+ *
+ * `summary` is the operator-facing explanation of WHY the supervisor
+ * concluded the objective is met — surfaced on the mission timeline as
+ * the final "why this was completed" line.
+ */
+export const objectiveMetSchema = z.object({
+  kind: z.literal("objective_met"),
+  summary: z
+    .string()
+    .min(10, "summary must be ≥ 10 chars (operator-facing 'why this is done?')")
+    .max(4000),
+});
+
+/**
  * Discriminated union covering everything the supervisor is allowed to
  * emit. Use this at the parse boundary; `.parse()` will route to the
  * correct branch based on `kind` and surface a single error per call.
@@ -115,8 +136,10 @@ export const noActionSchema = z.object({
 export const supervisorOutputSchema = z.discriminatedUnion("kind", [
   proposalSchema,
   noActionSchema,
+  objectiveMetSchema,
 ]);
 
 export type Proposal = z.infer<typeof proposalSchema>;
 export type NoAction = z.infer<typeof noActionSchema>;
+export type ObjectiveMet = z.infer<typeof objectiveMetSchema>;
 export type SupervisorOutput = z.infer<typeof supervisorOutputSchema>;

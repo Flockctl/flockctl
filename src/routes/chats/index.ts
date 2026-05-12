@@ -1,5 +1,11 @@
 import { Hono } from "hono";
-import { registerChatCrud, registerChatGetById, registerChatDelete, registerChatPatch } from "./crud.js";
+import {
+  registerChatCrud,
+  registerChatGetById,
+  registerChatDelete,
+  registerChatBatchDelete,
+  registerChatPatch,
+} from "./crud.js";
 import { registerChatMessages } from "./messages.js";
 import { registerChatAttachments } from "./attachments.js";
 import { registerChatIncidents } from "./incidents.js";
@@ -14,6 +20,11 @@ import { registerChatQuestions } from "./questions.js";
 import { registerChatMetrics } from "./metrics.js";
 import { registerChatTodos } from "./todos.js";
 import { registerChatDiff } from "./diff.js";
+import {
+  registerChatEndSession,
+  registerChatWorktreeApply,
+  registerChatWorktreeCleanup,
+} from "./worktree.js";
 
 export const chatRoutes = new Hono();
 
@@ -27,6 +38,10 @@ registerChatCrud(chatRoutes);
 
 // GET /pending-permissions — literal path, must come before GET /:id
 registerChatGlobalPendingPermissions(chatRoutes);
+
+// POST /batch-delete — literal path, must come before any /:id routes so a
+// request like POST /chats/batch-delete isn't captured by /:id-style handlers.
+registerChatBatchDelete(chatRoutes);
 
 // GET /:id
 registerChatGetById(chatRoutes);
@@ -71,3 +86,20 @@ registerChatApproval(chatRoutes);
 
 // PATCH /:id
 registerChatPatch(chatRoutes);
+
+// POST /:id/end-session — operator-driven worktree cleanup (matches
+// `claude --worktree` exit prompt). Cleans iff worktree is clean,
+// returns 409 otherwise; pass `?force=true` to discard a dirty
+// worktree.
+registerChatEndSession(chatRoutes);
+
+// DELETE /:id/worktree — RESTful synonym of POST /:id/end-session
+// (same handler under the hood). CLI / scripting clients reach for
+// this; the UI's "End session" button uses POST /end-session.
+registerChatWorktreeCleanup(chatRoutes);
+
+// POST /:id/worktree/apply — merge the chat's worktree branch into
+// the project's currently-checked-out branch. Counterpart to End
+// session (which discards the worktree); this lands the agent's
+// commits on the operator's branch. Worktree itself is preserved.
+registerChatWorktreeApply(chatRoutes);

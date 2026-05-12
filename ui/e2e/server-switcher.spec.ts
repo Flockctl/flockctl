@@ -3,8 +3,9 @@ import { test, expect } from "@playwright/test";
 /**
  * Basic coverage for the <ServerSwitcher /> mounted in the sidebar. Verifies
  * the dropdown renders, exposes the Local server by default, and provides a
- * "Manage Servers…" link to /settings. The WS-reconnect-on-switch contract
- * is covered in the Vitest unit suite (`src/__tests__/lib/ws.test.tsx`)
+ * "Manage Servers…" link that opens the Server tab in /settings.
+ * The WS-reconnect-on-switch contract is covered in the Vitest unit
+ * suite (`src/__tests__/lib/ws.test.tsx`)
  * because it requires mocking WebSocket — jumping between servers in a real
  * browser would need two live daemons plus a registered token pair, which
  * the e2e harness deliberately doesn't provision.
@@ -24,7 +25,7 @@ test.describe("ServerSwitcher", () => {
     await expect(page.getByText("Servers", { exact: true })).toBeVisible();
   });
 
-  test("exposes a Manage Servers link that navigates to /settings", async ({ page }) => {
+  test("exposes a Manage Servers link that opens the Server settings tab", async ({ page }) => {
     await page.goto("/dashboard");
 
     const trigger = page.getByRole("button", { name: /switch server/i });
@@ -34,10 +35,11 @@ test.describe("ServerSwitcher", () => {
     await expect(manageLink).toBeVisible();
     await manageLink.click();
 
-    await expect(page).toHaveURL(/\/settings$/);
+    await expect(page).toHaveURL(/\/settings\?tab=server$/);
     await expect(
       page.getByRole("heading", { name: /^Settings$/ }).first(),
     ).toBeVisible();
+    await expect(page.getByTestId("settings-tabpanel-server")).toBeVisible();
   });
 
   test("renders a connection status indicator", async ({ page }) => {

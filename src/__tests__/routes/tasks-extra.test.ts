@@ -296,6 +296,52 @@ describe("Tasks API — extra endpoints", () => {
     });
   });
 
+  describe("cost_usd (SUM total_cost_usd from usage_records)", () => {
+    // The Tasks table renders the COST column from `cost_usd`; without this
+    // field the UI fell back to `formatCost(undefined)` → `$0.00` for every
+    // row even when the database had real spend recorded. Both list and
+    // detail endpoints must surface the SUM (a single task can produce
+    // multiple usage rows across turns).
+    beforeEach(() => {
+      testDb.sqlite.exec("DELETE FROM usage_records;");
+    });
+
+    it("GET /tasks sums total_cost_usd across every usage row per task", async () => {
+      const t1 = testDb.db.insert(tasks).values({ prompt: "multi-turn" } as any).returning().get()!;
+      const t2 = testDb.db.insert(tasks).values({ prompt: "single-turn" } as any).returning().get()!;
+      const t3 = testDb.db.insert(tasks).values({ prompt: "no usage" } as any).returning().get()!;
+
+      testDb.db.insert(usageRecords).values({
+        taskId: t1.id, provider: "anthropic", model: "x", totalCostUsd: 1.25,
+      } as any).run();
+      testDb.db.insert(usageRecords).values({
+        taskId: t1.id, provider: "anthropic", model: "x", totalCostUsd: 2.50,
+      } as any).run();
+      testDb.db.insert(usageRecords).values({
+        taskId: t2.id, provider: "anthropic", model: "x", totalCostUsd: 0.75,
+      } as any).run();
+
+      const res = await app.request("/tasks");
+      const body = await res.json();
+      const byId = new Map<number, any>(body.items.map((it: any) => [it.id, it]));
+
+      expect(byId.get(t1.id).cost_usd).toBeCloseTo(3.75, 5);
+      expect(byId.get(t2.id).cost_usd).toBeCloseTo(0.75, 5);
+      // No usage rows → 0 (not NULL) so the UI can format $0.00 directly.
+      expect(byId.get(t3.id).cost_usd).toBe(0);
+    });
+
+    it("GET /tasks/:id surfaces the same cost_usd sum", async () => {
+      const t = testDb.db.insert(tasks).values({ prompt: "detail" } as any).returning().get()!;
+      testDb.db.insert(usageRecords).values({
+        taskId: t.id, provider: "anthropic", model: "x", totalCostUsd: 4.43,
+      } as any).run();
+      const res = await app.request(`/tasks/${t.id}`);
+      const body = await res.json();
+      expect(body.cost_usd).toBeCloseTo(4.43, 5);
+    });
+  });
+
   describe("GET /tasks/:id/diff", () => {
     it("returns 404 if task not found", async () => {
       const res = await app.request("/tasks/999/diff");

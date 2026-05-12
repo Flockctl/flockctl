@@ -14,9 +14,17 @@ import {
   fetchProjectAllowedKeys,
   fetchAutoExecStatus,
   gitPullProject,
+  gitCommitProject,
+  gitPushProject,
+  gitStatusProject,
 } from "../api";
 import type {
+  GitCommitBody,
+  GitCommitResult,
   GitPullResult,
+  GitPushBody,
+  GitPushResult,
+  GitStatusResult,
   Project,
   ProjectAllowedKeys,
   ProjectCreate,
@@ -141,6 +149,89 @@ export function useGitPullProject() {
         queryClient.invalidateQueries({ queryKey: queryKeys.project(projectId) });
         queryClient.invalidateQueries({ queryKey: queryKeys.projectTree(projectId) });
       }
+    },
+  });
+}
+
+/**
+ * Stage and commit on the project's branch. The mutation always resolves
+ * (HTTP 200) — caller inspects the returned `GitCommitResult.ok` to
+ * distinguish success from a structured failure (`empty_message`,
+ * `empty_index`, `unknown_path`, `detached_head`, …).
+ *
+ * On settle (success or failure) we invalidate the project query and
+ * project tree — both drive the dropdown's enable/disable plus any
+ * derived UI that reads HEAD or the working-tree state. We invalidate
+ * on both branches because:
+ *   - A committed change moves HEAD even on `ok:true` → tree is stale.
+ *   - A failure may have partially staged files (the service stages
+ *     before re-reading status to detect `empty_index`), so the
+ *     working-tree status surfaced elsewhere is also stale.
+ */
+/**
+ * Fetch `git status --porcelain` for a project's local clone. Always
+ * resolves with HTTP 200; the structured failure shape (`ok: false,
+ * reason: ...`) flows through verbatim. The dialog passes
+ * `enabled` / `staleTime: 0` per-open so each open gets a fresh peek
+ * — the working tree is by definition mutable between opens.
+ */
+export function useGitStatusProject(
+  projectId: string,
+  options?: Partial<UseQueryOptions<GitStatusResult>>,
+) {
+  return useQuery({
+    queryKey: queryKeys.projectGitStatus(projectId),
+    queryFn: () => gitStatusProject(projectId),
+    enabled: !!projectId,
+    ...options,
+  });
+}
+
+export function useGitCommitProject() {
+  const queryClient = useQueryClient();
+  return useMutation<
+    GitCommitResult,
+    Error,
+    { projectId: string; body: GitCommitBody }
+  >({
+    mutationFn: ({ projectId, body }) => gitCommitProject(projectId, body),
+    onSettled: (_result, _err, { projectId }) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.project(projectId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.projectTree(projectId) });
+      // The porcelain checklist seen by the Commit dialog is now stale —
+      // commit either consumed entries (success) or partially staged them
+      // (failure path inside `runGitCommit` stages before re-reading
+      // status to detect `empty_index`). Either way, a fresh peek is the
+      // correct next read.
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.projectGitStatus(projectId),
+      });
+    },
+  });
+}
+
+/**
+ * Push the project's current branch. The mutation always resolves
+ * (HTTP 200) — caller inspects the returned `GitPushResult.ok` to
+ * distinguish success from a structured failure (`auth_failed`,
+ * `rejected_non_fast_forward`, `protected_branch`, `no_upstream`, …).
+ *
+ * On settle (success or failure) we invalidate the project query and
+ * project tree — same rationale as commit: the dropdown's
+ * enable/disable plus any derived UI may read upstream tracking state
+ * that a push (or a refused push) just changed.
+ */
+export function useGitPushProject() {
+  const queryClient = useQueryClient();
+  return useMutation<
+    GitPushResult,
+    Error,
+    { projectId: string; body?: GitPushBody }
+  >({
+    mutationFn: ({ projectId, body }) => gitPushProject(projectId, body),
+    onSettled: (_result, _err, { projectId }) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.project(projectId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.projectTree(projectId) });
     },
   });
 }

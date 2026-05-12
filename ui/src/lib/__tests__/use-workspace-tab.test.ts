@@ -33,11 +33,11 @@ describe("use-workspace-tab contract", () => {
     const { result } = renderHook(() => useWorkspaceTab(), {
       wrapper: makeWrapper("/workspaces/w1"),
     });
-    expect(result.current[0]).toBe<WorkspaceTab>("plan");
+    expect(result.current[0]).toBe<WorkspaceTab>("overview");
   });
 
   it("returns each allowed tab when present in the URL", () => {
-    const cases: WorkspaceTab[] = ["plan", "runs", "templates", "config"];
+    const cases: WorkspaceTab[] = ["overview", "projects", "plan", "runs", "templates", "config"];
     for (const value of cases) {
       const { result } = renderHook(() => useWorkspaceTab(), {
         wrapper: makeWrapper(`/workspaces/w1?tab=${value}`),
@@ -46,12 +46,12 @@ describe("use-workspace-tab contract", () => {
     }
   });
 
-  it("rejects invalid ?tab= values (XSS, unicode, wrong case, empty) and falls back to 'plan'", () => {
+  it("rejects invalid ?tab= values (XSS, unicode, wrong case, empty) and falls back to the default tab", () => {
     // Empty string: `?tab=` — explicitly set but empty.
     const empty = renderHook(() => useWorkspaceTab(), {
       wrapper: makeWrapper("/workspaces/w1?tab="),
     });
-    expect(empty.result.current[0]).toBe<WorkspaceTab>("plan");
+    expect(empty.result.current[0]).toBe<WorkspaceTab>("overview");
 
     // Classic script-injection shape.
     const xss = renderHook(() => useWorkspaceTab(), {
@@ -59,25 +59,25 @@ describe("use-workspace-tab contract", () => {
         "/workspaces/w1?tab=%3Cscript%3Ealert(1)%3C%2Fscript%3E",
       ),
     });
-    expect(xss.result.current[0]).toBe<WorkspaceTab>("plan");
+    expect(xss.result.current[0]).toBe<WorkspaceTab>("overview");
 
     // Unicode smiley — outside the allow-list.
     const unicode = renderHook(() => useWorkspaceTab(), {
       wrapper: makeWrapper("/workspaces/w1?tab=%F0%9F%98%80"),
     });
-    expect(unicode.result.current[0]).toBe<WorkspaceTab>("plan");
+    expect(unicode.result.current[0]).toBe<WorkspaceTab>("overview");
 
     // Case matters — 'Plan' is not 'plan'.
     const wrongCase = renderHook(() => useWorkspaceTab(), {
       wrapper: makeWrapper("/workspaces/w1?tab=Plan"),
     });
-    expect(wrongCase.result.current[0]).toBe<WorkspaceTab>("plan");
+    expect(wrongCase.result.current[0]).toBe<WorkspaceTab>("overview");
 
     // Adjacent-but-unknown value.
     const unknown = renderHook(() => useWorkspaceTab(), {
       wrapper: makeWrapper("/workspaces/w1?tab=settings"),
     });
-    expect(unknown.result.current[0]).toBe<WorkspaceTab>("plan");
+    expect(unknown.result.current[0]).toBe<WorkspaceTab>("overview");
   });
 
   it("setTab writes the ?tab= param and preserves other query params", () => {
@@ -123,6 +123,6 @@ describe("use-workspace-tab contract", () => {
       // Cast around the type guard to simulate a caller passing junk.
       (result.current[1] as (t: string) => void)("not-a-tab");
     });
-    expect(result.current[0]).toBe<WorkspaceTab>("plan");
+    expect(result.current[0]).toBe<WorkspaceTab>("overview");
   });
 });

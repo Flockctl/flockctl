@@ -9,6 +9,7 @@ import {
   persistAgentQuestion,
 } from "../agent-interaction.js";
 import type { QuestionRequest } from "../agent-session/index.js";
+import { parseQuestionOptions } from "../agent-session/parse-question-options.js";
 import { wsManager } from "../ws-manager.js";
 
 type AgentQuestionRow = typeof agentQuestions.$inferSelect;
@@ -203,19 +204,9 @@ export function listPendingQuestions(taskId: number): Array<{
   return rows
     .sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""))
     .map((r) => {
-      let parsedOptions:
-        | Array<{ label: string; description?: string; preview?: string }>
-        | null = null;
-      if (r.options != null) {
-        try {
-          const parsed = JSON.parse(r.options);
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            parsedOptions = parsed;
-          }
-        } catch {
-          parsedOptions = null;
-        }
-      }
+      const rawOptions = parseQuestionOptions(r.options);
+      const parsedOptions =
+        rawOptions && rawOptions.length > 0 ? rawOptions : null;
       return {
         id: r.id,
         requestId: r.requestId,

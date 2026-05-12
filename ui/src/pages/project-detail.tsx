@@ -1,113 +1,118 @@
-import { useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import {
-  GitPullRequestArrow,
-  ListChecks,
-  Loader2,
-  MessageSquare,
-} from "lucide-react";
+import { useTrackRecent } from "@/lib/recent-store";
+import { ListChecks, MessageSquare } from "lucide-react";
 
 import {
   useAttention,
   useCreateChat,
-  useGitPullProject,
   useProject,
   useProjectConfig,
+  useProjectTree,
 } from "@/lib/hooks";
-import type { GitPullReason, GitPullResult } from "@/lib/types";
+import { useKpiData } from "@/lib/use-kpi-data";
+import { useSelection } from "@/lib/use-selection";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { TodoMdDialog } from "@/components/todo-md-dialog";
+import { GitDropdownButton } from "@/components/git/git-dropdown-button";
 
 import { ConfigTab } from "./project-detail-components/ConfigTab";
-import { MissionControlKpiBar } from "./project-detail-components/MissionControlKpiBar";
-import { PlanTab } from "./project-detail-components/PlanTab";
-import { RunsTab } from "./project-detail-components/RunsTab";
-import { TemplatesSchedulesTab } from "./project-detail-components/TemplatesSchedulesTab";
+import { MilestoneKanban } from "./project-detail-components/MilestoneKanban";
+import { MilestoneRail } from "./project-detail-components/MilestoneRail";
+import { ProjectKpiRow } from "./project-detail-components/ProjectKpiRow";
+import { ProjectTreePanel } from "./project-detail-components/ProjectTreePanel";
+import {
+  PROJECT_TAB_IDS,
+  ProjectTabs,
+  type ProjectTabId,
+} from "./project-detail-components/ProjectTabs";
+// `RunsTab` pulls in `recharts` for the spend/tokens charts. Users on
+// the Plan / Code / Config tabs never need it — lazy-load the tab so
+// the recharts chunk only downloads when the Runs tab is opened.
+// Audit-round-7 BUNDLE finding.
+const RunsTab = lazy(() =>
+  import("./project-detail-components/RunsTab").then((m) => ({
+    default: m.RunsTab,
+  })),
+);
+
+// `ProjectCodeMode` pulls in `react-arborist` (file tree) plus a chain that
+// reaches Monaco editor / shiki / the chat composer. Most project-detail
+// visits stay on Plan / Runs / Config — lazy-load the tab so the Code
+// chunk only downloads when the user actually opens the Code tab.
+const ProjectCodeMode = lazy(() =>
+  import("./project-detail-components/CodeMode").then((m) => ({
+    default: m.ProjectCodeMode,
+  })),
+);
 
 /**
- * Project-detail page shell (redesigned — milestone TBD / v1 migration).
+ * Project-detail page shell — assembled from the M23 redesign primitives.
  *
- * Replaces the former tree-view / board-view dispatcher with a single
- * **tabbed surface**:
+ *   ┌─────────────────────────────────────────────────────────────────┐
+ *   │ ProjectHeader  (title · attention badge · repo badges · CTAs)   │
+ *   │ ProjectKpiRow  (5 tiles wired through useKpiData)               │
+ *   │ ProjectTabs    (URL-driven `?tab=` segmented strip)             │
+ *   ├─────────────────────────────────────────────────────────────────┤
+ *   │ {tab === "plan"} → MilestoneRail | MilestoneKanban (260px / 1fr)│
+ *   │ {tab === "tree"} → ProjectTreePane (mission/milestone/slice/task)│
+ *   │ {tab === "runs"} → RunsTab                                      │
+ *   │ {tab === "code"} → ProjectCodeMode                              │
+ *   │ {tab === "config"} → ConfigTab                                  │
+ *   └─────────────────────────────────────────────────────────────────┘
  *
- *   ┌───────────────────────────────────────────────────────────────┐
- *   │ ← back · crumbs                                              │
- *   │ title + attention badge + repo badges     [TODO] [New Task]   │
- *   │ MissionControlKpiBar                                          │
- *   │ Plan | Runs | Templates & Schedules | Config                  │
- *   ├───────────────────────────────────────────────────────────────┤
- *   │ active tab content                                            │
- *   └───────────────────────────────────────────────────────────────┘
+ * Assembly invariants (pinned by `project-detail.test.tsx`):
+ *   - The page body renders the header → KPI row → tab strip in order.
+ *     None of the three is conditional on the active tab.
+ *   - The active tab swaps **only** the inner pane. Switching tabs does
+ *     NOT remount the page chrome (header / KPI / tabs). The test pins
+ *     this with stable element identities across `userEvent.click` calls.
+ *   - The Plan pane is the **only** branch that renders `MilestoneRail`
+ *     + `MilestoneKanban` directly. Every other tab delegates to its
+ *     dedicated tab component (`RunsTab`, `ProjectCodeMode`,
+ *     `TemplatesAndSchedulesTab`, `ConfigTab`).
  *
- * Design notes:
- * - The old ViewModeToggle is gone. The board is always rendered inside
- *   the Plan tab via {@link PlanTab}, so there is no longer a tree-vs-
- *   board split. Task analytics moved into a dedicated {@link RunsTab}.
- * - `?tab=<id>` backs the active tab so a page reload, a shared URL, or
- *   a deep-link into a specific tab all land on the same content.
- *   Invalid / missing values fall back to `"plan"`.
- * - The project-level "Chat" button is removed per the migration brief.
- *   Milestone- and slice-level chat buttons live on the right-rail detail
- *   panels inside the Plan tab and are untouched.
- * - "Settings" has moved into the Config tab — the entire former
- *   `/projects/:id/settings` page (General, AI Configuration, Execution,
- *   Env Vars, Gitignore, AGENTS.md, Skills, MCP, Secrets, Danger Zone)
- *   now lives inline there. The legacy URL redirects to `?tab=config`.
- * - The Danger Zone (delete project) is folded into the Config tab. The
- *   page header no longer carries a delete affordance — delete is not a
- *   first-class action you want 0 clicks away.
- *
- * Data fetching is intentionally minimal here: the shell only reads
- * `useProject` / `useProjectConfig` / `useAttention` so it can render
- * the title bar without waiting for the heavy project-tree payload. Each
- * tab loads its own data independently.
+ * URL state:
+ *   - `?tab=<plan|runs|code|templates|config>` — driven by `<ProjectTabs>`.
+ *     A missing or unknown value falls back to `"plan"` (the default).
+ *   - `?milestone=<slug>` — drives the `MilestoneRail` selection. When the
+ *     URL has no milestone but the project has at least one, we fall
+ *     back to the first milestone so the kanban is never blank.
  */
 
-const TAB_IDS = ["plan", "runs", "templates-schedules", "config"] as const;
-type TabId = (typeof TAB_IDS)[number];
+const TAB_SET = new Set<string>(PROJECT_TAB_IDS);
 
-function isTabId(value: string | null): value is TabId {
-  return !!value && (TAB_IDS as readonly string[]).includes(value);
+function isTabId(value: string | null): value is ProjectTabId {
+  return !!value && TAB_SET.has(value);
 }
 
 export default function ProjectDetailPage() {
   const { projectId } = useParams<{ projectId: string }>();
-  const [searchParams, setSearchParams] = useSearchParams();
+  const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const createChat = useCreateChat();
 
-  const tab: TabId = isTabId(searchParams.get("tab"))
-    ? (searchParams.get("tab") as TabId)
+  const tab: ProjectTabId = isTabId(searchParams.get("tab"))
+    ? (searchParams.get("tab") as ProjectTabId)
     : "plan";
-
-  const setTab = (next: TabId) => {
-    setSearchParams(
-      (prev) => {
-        const params = new URLSearchParams(prev);
-        if (next === "plan") params.delete("tab");
-        else params.set("tab", next);
-        return params;
-      },
-      { replace: true },
-    );
-  };
 
   const {
     data: project,
     isLoading: projectLoading,
     error: projectError,
   } = useProject(projectId ?? "", { enabled: !!projectId });
+
+  // Populate the new-shell sidebar Recent list. No-op when params or
+  // project name aren't ready; safe to call even when the OLD shell
+  // is active (the recent store survives across shells).
+  useTrackRecent({
+    kind: "project",
+    id: projectId,
+    label: project?.name,
+    href: `/projects/${projectId ?? ""}`,
+  });
 
   const { data: projectConfig } = useProjectConfig(projectId ?? "");
   const baseBranch = projectConfig?.baseBranch ?? "main";
@@ -124,33 +129,48 @@ export default function ProjectDetailPage() {
 
   const [todoOpen, setTodoOpen] = useState(false);
 
-  // ─── Git Pull state ─────────────────────────────────────────────────────
-  // The mutation always resolves with HTTP 200 (failures are encoded in the
-  // body's `ok` field — see `useGitPullProject`). We surface the result via
-  // a single dialog that adapts its copy to the discriminated outcome:
-  //   - success + alreadyUpToDate → brief confirmation
-  //   - success + commits pulled  → summary + before/after SHAs
-  //   - failure                   → reason + message + raw stderr block
-  // The dialog is the only failure surface — we don't want a silent toast
-  // for `git pull` errors because the user almost always needs the stderr
-  // to diagnose (auth, divergence, etc.).
-  const gitPull = useGitPullProject();
-  const [gitPullResult, setGitPullResult] = useState<GitPullResult | null>(null);
-  const handleGitPull = () => {
-    if (!projectId) return;
-    gitPull.mutate(projectId, {
-      onSuccess: (result) => setGitPullResult(result),
-      // The mutation should not reject — apiFetch only throws on transport
-      // failure. On the rare network-level error we still want the user
-      // to see *something*, so synthesize a minimal failure result.
-      onError: (err) =>
-        setGitPullResult({
-          ok: false,
-          reason: "unknown",
-          message: err.message || "Failed to reach the daemon",
-        }),
-    });
-  };
+  // KPI data — useKpiData returns `costCents24h`; ProjectKpiRow wants
+  // dollars. Convert here so the row stays purely presentational.
+  const kpi = useKpiData(projectId ?? "");
+  const costUsd =
+    typeof kpi.costCents24h === "number"
+      ? kpi.costCents24h / 100
+      : undefined;
+
+  // Plan tab data: project tree drives MilestoneRail + MilestoneKanban.
+  // Skip the fetch on tabs that don't need it (Runs / Code / Config) so
+  // we don't pay for a (potentially heavy) tree response on a project
+  // that's only being browsed for analytics or files. The Tree pane
+  // re-fetches the same tree internally via its own ProjectTreePanel —
+  // react-query dedupes by the shared `["project", id, "tree"]` cache
+  // key so the second mount is free.
+  const { data: tree } = useProjectTree(projectId ?? "", {
+    enabled: !!projectId && tab === "plan",
+  });
+  const milestones = tree?.milestones ?? [];
+
+  const { milestoneId, setMilestone } = useSelection();
+  // Prefer the URL `?milestone=` value; fall back to the first milestone
+  // so the kanban never renders against an unknown selection.
+  const activeMilestoneId =
+    milestoneId && milestones.some((m) => m.id === milestoneId)
+      ? milestoneId
+      : milestones[0]?.id ?? null;
+  const activeMilestone = useMemo(
+    () => milestones.find((m) => m.id === activeMilestoneId) ?? null,
+    [milestones, activeMilestoneId],
+  );
+
+  // Sync the URL with the implicit fallback so a copy-pasted link to
+  // `/projects/p1?tab=plan` lands on the same milestone the user was
+  // looking at when they shared it. Only writes when the URL is empty
+  // and we genuinely picked a fallback.
+  useEffect(() => {
+    if (tab !== "plan") return;
+    if (!milestoneId && activeMilestoneId) {
+      setMilestone(activeMilestoneId);
+    }
+  }, [tab, milestoneId, activeMilestoneId, setMilestone]);
 
   if (!projectId) {
     return <p className="text-destructive">Missing project ID.</p>;
@@ -169,21 +189,24 @@ export default function ProjectDetailPage() {
       data-testid="project-detail-page"
       // Constrain the page to the app's inner main (`flex-1 overflow-auto`
       // in layout.tsx). The custom property makes it explicit that the
-      // Plan tab's embedded board is carving ~280px off the viewport for
-      // the page chrome above it — kept as a CSS var so tweaking the
-      // height of the header does not require touching the board.
+      // Plan / Code panes are carving ~280px off the viewport for the
+      // page chrome above them — kept as a CSS var so tweaking the height
+      // of the header does not require touching the panes.
       style={{ "--project-chrome-h": "280px" } as React.CSSProperties}
       className="flex min-h-full flex-col"
     >
       {/* --- Page header --- */}
-      <div className="mb-4 flex flex-col gap-3">
+      <header
+        data-testid="project-detail-header"
+        className="mb-4 flex flex-col gap-3"
+      >
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               {projectLoading || !project ? (
                 <Skeleton className="h-7 w-48" />
               ) : (
-                <h1 className="truncate text-xl font-bold sm:text-2xl" title={project.name}>
+                <h1 className="truncate text-[15px] font-semibold leading-tight" title={project.name}>
                   {project.name}
                 </h1>
               )}
@@ -202,7 +225,7 @@ export default function ProjectDetailPage() {
               <p className="mt-1 text-muted-foreground">{project.description}</p>
             )}
             {project && (
-              <div className="mt-2 flex flex-wrap items-center gap-2">
+              <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1">
                 {project.repo_url && (
                   <Badge variant="secondary" className="font-mono">
                     {project.repo_url}
@@ -211,21 +234,47 @@ export default function ProjectDetailPage() {
                 <Badge variant="outline" className="font-mono">
                   {baseBranch}
                 </Badge>
+                <span
+                  aria-hidden="true"
+                  className="text-muted-foreground/40 text-[10px]"
+                >
+                  ·
+                </span>
+                <ProjectKpiRow
+                  compact
+                  slicesDone={kpi.slicesDone}
+                  slicesTotal={kpi.slicesTotal}
+                  activeTasks={kpi.activeTasks}
+                  pendingApproval={kpi.pendingApproval}
+                  failed24h={kpi.failed24h}
+                  costUsd={costUsd}
+                />
               </div>
             )}
           </div>
 
-          <div className="flex flex-wrap items-center gap-2">
-            {/*
-              Per redesign brief: the project-level "Chat" button used to
-              open a project-scoped chat; it's been folded into the Plan
-              tab's milestone/slice detail panels. The project-level entry
-              point below survives because top-level Plan chats remain a
-              convenient way to ask about the project as a whole — but it
-              no longer pollutes the page's main CTA row. Keeping it
-              around preserves the "open a project chat" flow the old
-              button surfaced.
-            */}
+          {/*
+            Header right cluster — mirrors the prototype at
+            `.flockctl/plan/ui-prototype.html` (project-detail bar):
+            tab strip lives in the SAME row as the project title, with
+            a "New chat" CTA flush to its right and the secondary
+            actions (TODO, Git) on the same line.
+
+            The strip used to live on its own row beneath the KPI bar;
+            promoting it into the header eats one full row of vertical
+            real estate and matches the prototype's hierarchy
+            (project name → tab strip → content) without an
+            interleaving KPI band breaking the visual grouping.
+
+            Order — Tabs / New chat / TODO / Git — keeps the prototype's
+            primary "switch view" → "spawn chat" pairing tight and
+            pushes the lower-frequency overflow buttons to the right.
+          */}
+          <div
+            className="flex flex-wrap items-center gap-2"
+            data-testid="project-detail-header-actions"
+          >
+            <ProjectTabs data-testid="project-detail-tabs" />
             <Button
               variant="outline"
               size="sm"
@@ -239,7 +288,7 @@ export default function ProjectDetailPage() {
               data-testid="project-detail-page-chat"
             >
               <MessageSquare className="mr-1 h-4 w-4" />
-              {createChat.isPending ? "Creating…" : "Chat"}
+              {createChat.isPending ? "Creating…" : "New chat"}
             </Button>
             <Button
               variant="outline"
@@ -250,97 +299,134 @@ export default function ProjectDetailPage() {
               <ListChecks className="mr-1 h-4 w-4" />
               TODO
             </Button>
-            {/*
-              Git pull lives on the header (not in a dedicated tab) because
-              it's a high-frequency, click-and-go action — typically run
-              while looking at the Plan tab to refresh the local clone
-              after a teammate pushes. A future "Git" tab is planned to
-              host commit/push/status/log (see TODO.md), with this header
-              button kept around as a shortcut.
-            */}
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={gitPull.isPending || !project?.path}
-              onClick={handleGitPull}
-              data-testid="project-detail-page-git-pull"
-              title={
-                project?.path
-                  ? "git pull --ff-only from origin"
-                  : "Project has no local path"
-              }
-            >
-              {gitPull.isPending ? (
-                <Loader2 className="mr-1 h-4 w-4 animate-spin" />
-              ) : (
-                <GitPullRequestArrow className="mr-1 h-4 w-4" />
-              )}
-              {gitPull.isPending ? "Pulling…" : "Pull"}
-            </Button>
+            {project && (
+              <GitDropdownButton
+                target={{
+                  kind: "project",
+                  id: project.id,
+                  path: project.path,
+                }}
+              />
+            )}
           </div>
         </div>
+      </header>
 
-        {/* KPI bar — always visible above the tab switcher */}
-        <MissionControlKpiBar projectId={projectId} />
-      </div>
+      {/* KPI row used to live here as a 5-column grid of full-size
+          tiles. It now rides along the repo/branch line in the header
+          via `<ProjectKpiRow compact />` — the numbers are mostly zero
+          on a fresh project and burning a full strip on them was
+          wasted vertical real estate. */}
 
-      {/* --- Tabs --- */}
-      <Tabs
-        value={tab}
-        onValueChange={(value) => {
-          if (isTabId(value)) setTab(value);
-        }}
-        className="flex min-h-0 flex-1 flex-col gap-4"
-        data-testid="project-detail-tabs"
+{/* --- Active pane (conditional, only the inner pane swaps) --- */}
+      {/*
+        The pane carries the WAI-ARIA `role="tabpanel"` plus the matching
+        `id` referenced by `<ProjectTabs>`'s `aria-controls`. Without the
+        id, axe flags `aria-valid-attr-value` (critical) on the tab
+        buttons because the controls reference points at a non-existent
+        node. The `id` shape (`project-tabpanel-<tab>`) is the contract
+        the tab strip pins down — keep them in sync.
+      */}
+      <div
+        data-testid="project-detail-pane"
+        data-active-tab={tab}
+        role="tabpanel"
+        id={`project-tabpanel-${tab}`}
+        aria-labelledby={`project-tab-${tab}`}
+        // Plan and Code each need a bounded height so their internal
+        // `h-full` panels can fill the viewport. Other tabs are
+        // content-sized.
+        //
+        // The pane uses an explicit `h-[calc(100vh - chrome)]` rather
+        // than relying on `flex-1` because the project-detail outer
+        // container is `min-h-full` (NOT `h-full`) — `min-height` alone
+        // does not establish a definite height for percentage / flex
+        // resolution in the children, so a `flex-1` pane collapses to
+        // its content height instead of filling the viewport. The
+        // `--project-chrome-h` CSS var (set on the outer div) measures
+        // the header + KPI row + tab strip stack so tweaking that chrome
+        // doesn't require touching the pane class. The `min-h-[400px]`
+        // floor protects short-viewport screens from a degenerate
+        // 0-height editor when chrome is bigger than the visible area.
+        className={
+          tab === "plan" || tab === "code" || tab === "tree"
+            ? "flex h-[calc(100vh-var(--project-chrome-h))] min-h-[400px] flex-col"
+            : undefined
+        }
       >
-        <TabsList className="self-start">
-          <TabsTrigger value="plan" data-testid="project-detail-tab-plan">
-            Plan
-          </TabsTrigger>
-          <TabsTrigger value="runs" data-testid="project-detail-tab-runs">
-            Runs
-          </TabsTrigger>
-          <TabsTrigger
-            value="templates-schedules"
-            data-testid="project-detail-tab-templates-schedules"
+        {tab === "plan" && (
+          <div
+            data-testid="project-detail-plan-pane"
+            // 260px milestone rail + remaining width for the kanban.
+            className="grid flex-1 min-h-0 grid-cols-[260px_1fr] gap-4"
           >
-            Templates &amp; Schedules
-          </TabsTrigger>
-          <TabsTrigger value="config" data-testid="project-detail-tab-config">
-            Config
-          </TabsTrigger>
-        </TabsList>
+            <MilestoneRail
+              milestones={milestones}
+              activeMilestoneId={activeMilestoneId}
+              onSelectMilestone={(id) => setMilestone(id)}
+            />
+            <div className="min-w-0 overflow-auto">
+              {activeMilestone ? (
+                <MilestoneKanban
+                  milestoneTitle={activeMilestone.title}
+                  slices={activeMilestone.slices}
+                />
+              ) : (
+                <div
+                  data-testid="project-detail-plan-empty"
+                  className="grid h-full place-items-center text-sm text-muted-foreground"
+                >
+                  No milestones yet — generate a plan to get started.
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
-        {/*
-          Plan tab is the only one that must fill a constrained height —
-          the embedded board uses `h-full` and needs a bounded parent.
-          The `h-[calc(...)]` height carves the page chrome (title block
-          + KPI bar + tabs strip) off the viewport so the board fills
-          whatever remains without forcing the outer `main` container to
-          scroll past the board's own tracks.
-        */}
-        <TabsContent
-          value="plan"
-          className="h-[calc(100vh-var(--project-chrome-h))] min-h-[400px] data-[state=inactive]:hidden"
-        >
-          <PlanTab projectId={projectId} />
-        </TabsContent>
+        {tab === "tree" && (
+          <ProjectTreePane projectId={projectId} />
+        )}
 
-        <TabsContent value="runs" className="data-[state=inactive]:hidden">
-          <RunsTab projectId={projectId} />
-        </TabsContent>
+        {tab === "runs" && (
+          <Suspense
+            fallback={
+              <div
+                aria-busy="true"
+                style={{ height: 500 }}
+                className="rounded-md border border-border bg-card animate-pulse"
+              />
+            }
+          >
+            <RunsTab projectId={projectId} />
+          </Suspense>
+        )}
 
-        <TabsContent
-          value="templates-schedules"
-          className="data-[state=inactive]:hidden"
-        >
-          <TemplatesSchedulesTab projectId={projectId} />
-        </TabsContent>
+        {tab === "code" && project && (
+          <Suspense
+            fallback={
+              <div
+                aria-busy="true"
+                style={{ height: 500 }}
+                className="rounded-md border border-border bg-card animate-pulse"
+              />
+            }
+          >
+            <ProjectCodeMode
+              // `key` makes a project-id change remount the subtree —
+              // see CodeMode.tsx for why that's the reset mechanism.
+              key={projectId}
+              projectId={projectId}
+              target={{
+                kind: "project",
+                id: project.id,
+                path: project.path,
+              }}
+            />
+          </Suspense>
+        )}
 
-        <TabsContent value="config" className="data-[state=inactive]:hidden">
-          <ConfigTab projectId={projectId} />
-        </TabsContent>
-      </Tabs>
+        {tab === "config" && <ConfigTab projectId={projectId} />}
+      </div>
 
       {project && (
         <TodoMdDialog
@@ -351,118 +437,47 @@ export default function ProjectDetailPage() {
           title={project.name}
         />
       )}
-      <GitPullResultDialog
-        result={gitPullResult}
-        onClose={() => setGitPullResult(null)}
-      />
     </div>
   );
 }
 
-// ─── Git pull result dialog ────────────────────────────────────────────────
-//
-// Single dialog shared between the success and failure paths so the user
-// always lands on the same interaction shape regardless of outcome. We
-// deliberately keep the copy short — the value-add is the structured
-// summary line + the raw `stderr` block on failure (kept in a
-// monospaced <pre> so an operator can copy-paste it into a terminal
-// without losing whitespace).
+/**
+ * Plain hierarchical mission → milestone → slice → task view. Wraps the
+ * existing {@link ProjectTreePanel} (already battle-tested against
+ * keyboard navigation + selection sync) and forwards selection back
+ * into the URL via {@link useSelection} so a click drills into the
+ * Plan tab with the right slice highlighted. Selecting a task also
+ * lands on the parent slice — task-level URL state isn't part of the
+ * `useSelection` contract.
+ */
+function ProjectTreePane({ projectId }: { projectId: string }) {
+  const navigate = useNavigate();
+  const { milestoneId, sliceId, setSelection, setMilestone } = useSelection();
 
-function GitPullResultDialog({
-  result,
-  onClose,
-}: {
-  result: GitPullResult | null;
-  onClose: () => void;
-}) {
   return (
-    <Dialog
-      open={result !== null}
-      onOpenChange={(open) => {
-        if (!open) onClose();
-      }}
+    <div
+      data-testid="project-detail-tree-pane"
+      className="min-h-0 flex-1 overflow-auto"
     >
-      <DialogContent
-        className="max-w-lg"
-        data-testid="git-pull-result-dialog"
-      >
-        {result?.ok ? (
-          <>
-            <DialogHeader>
-              <DialogTitle>
-                {result.already_up_to_date
-                  ? "Already up to date"
-                  : "Pull complete"}
-              </DialogTitle>
-              <DialogDescription>
-                Branch <span className="font-mono">{result.branch}</span> ·{" "}
-                {result.summary}
-              </DialogDescription>
-            </DialogHeader>
-            {!result.already_up_to_date && (
-              <div className="text-xs text-muted-foreground">
-                <span className="font-mono">
-                  {result.before_sha.slice(0, 7)}
-                </span>{" "}
-                →{" "}
-                <span className="font-mono">
-                  {result.after_sha.slice(0, 7)}
-                </span>
-              </div>
-            )}
-            <DialogFooter>
-              <Button variant="outline" size="sm" onClick={onClose}>
-                Close
-              </Button>
-            </DialogFooter>
-          </>
-        ) : result ? (
-          <>
-            <DialogHeader>
-              <DialogTitle>Pull failed</DialogTitle>
-              <DialogDescription>
-                {gitPullReasonHeadline(result.reason)}
-              </DialogDescription>
-            </DialogHeader>
-            <p className="text-sm">{result.message}</p>
-            {result.stderr && (
-              <pre
-                className="max-h-48 overflow-auto rounded bg-muted p-2 text-xs font-mono whitespace-pre-wrap"
-                data-testid="git-pull-stderr"
-              >
-                {result.stderr}
-              </pre>
-            )}
-            <DialogFooter>
-              <Button variant="outline" size="sm" onClick={onClose}>
-                Close
-              </Button>
-            </DialogFooter>
-          </>
-        ) : null}
-      </DialogContent>
-    </Dialog>
+      <ProjectTreePanel
+        projectId={projectId}
+        selectedMilestoneId={milestoneId ?? undefined}
+        selectedSliceId={sliceId ?? undefined}
+        onSelectMilestone={(id) => {
+          setMilestone(id);
+          navigate(`/projects/${projectId}?tab=plan`);
+        }}
+        onSelectSlice={(mid, sid) => {
+          setSelection({ milestoneId: mid, sliceId: sid });
+          navigate(`/projects/${projectId}?tab=plan`);
+        }}
+        onSelectTask={(mid, sid) => {
+          // No task-level URL state — drill into the parent slice in the
+          // Plan tab so the task is visible in the slice detail panel.
+          setSelection({ milestoneId: mid, sliceId: sid });
+          navigate(`/projects/${projectId}?tab=plan`);
+        }}
+      />
+    </div>
   );
 }
-
-function gitPullReasonHeadline(reason: GitPullReason): string {
-  switch (reason) {
-    case "not_a_git_repo":
-      return "Project is not a git repository.";
-    case "no_upstream":
-      return "Current branch has no upstream.";
-    case "dirty_working_tree":
-      return "Working tree has uncommitted changes.";
-    case "non_fast_forward":
-      return "Local and remote have diverged — fast-forward not possible.";
-    case "auth_failed":
-      return "Authentication with the remote failed.";
-    case "network_error":
-      return "Could not reach the remote.";
-    /* v8 ignore next 2 — unreachable; the union above is exhaustive over GitPullReason */
-    case "unknown":
-    default:
-      return "git pull failed.";
-  }
-}
-

@@ -5,6 +5,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { cn } from "@/lib/utils";
 import type { PermissionMode } from "@/lib/types";
 
 export interface PermissionModeOption {
@@ -57,6 +58,14 @@ interface Props {
   compact?: boolean;
   /** Omit the inherit option (for task-create forms where no parent value yet). */
   allowInherit?: boolean;
+  /**
+   * Extra classes piped onto the SelectTrigger. Lets the chat composer override
+   * the default compact framing with a borderless / pill look without forcing a
+   * second `inline` boolean into the API. Composer passes the borderless-style
+   * Tailwind tokens; legacy callers (project / workspace config tabs) leave it
+   * unset and keep the bordered framing.
+   */
+  triggerClassName?: string;
 }
 
 export function PermissionModeSelect({
@@ -66,6 +75,7 @@ export function PermissionModeSelect({
   disabled,
   compact,
   allowInherit = true,
+  triggerClassName,
 }: Props) {
   const current = value ?? INHERIT_VALUE;
   const triggerLabel = value
@@ -77,7 +87,13 @@ export function PermissionModeSelect({
       onValueChange={(v) => onChange(v === INHERIT_VALUE ? null : (v as PermissionMode))}
       disabled={disabled}
     >
-      <SelectTrigger className={compact ? "h-8 w-full text-xs" : "w-full"}>
+      <SelectTrigger
+        aria-label="Permission mode"
+        className={cn(
+          compact ? "h-8 w-full text-xs" : "w-full",
+          triggerClassName,
+        )}
+      >
         <SelectValue placeholder="Pick a mode">{triggerLabel}</SelectValue>
       </SelectTrigger>
       <SelectContent>

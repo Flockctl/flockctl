@@ -20,8 +20,22 @@ import { useCallback, useSyncExternalStore } from "react";
 // means if that ever changes, drafts won't silently collide with a real id.
 export const NEW_CHAT_DRAFT_KEY = "__new__";
 
+// ─── Bounded growth (audit-round-5) ───
+//
+// Empty values are evicted on save, but typing into many chats over
+// a long session can accumulate entries indefinitely. 256 keys is far
+// more than any real workflow needs; oldest-eviction on overflow keeps
+// the cache warm for the chats the operator is actually toggling
+// between.
+const MAX_DRAFT_ENTRIES = 256;
 const drafts = new Map<string, string>();
 const subscribers = new Set<() => void>();
+
+function evictOldestDraftIfFull(): void {
+  if (drafts.size < MAX_DRAFT_ENTRIES) return;
+  const oldest = drafts.keys().next().value;
+  if (oldest !== undefined) drafts.delete(oldest);
+}
 
 function emit(): void {
   for (const fn of subscribers) fn();
@@ -46,6 +60,9 @@ export function setDraft(chatId: string | null | undefined, value: string): void
   if (value === "") {
     drafts.delete(key);
   } else {
+    // Evict oldest entry FIRST so the new key doesn't bypass the cap
+    // when it's a fresh insertion at-capacity.
+    if (!drafts.has(key)) evictOldestDraftIfFull();
     drafts.set(key, value);
   }
   emit();

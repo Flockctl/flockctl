@@ -82,9 +82,9 @@ test.describe("AgentsMdEditor — project scope", () => {
     const proj = await createProject(request, name, { path: root });
 
     try {
-      await page.goto(`/projects/${proj.id}/settings`);
+      await page.goto(`/projects/${proj.id}?tab=config`);
       await expect(
-        page.getByRole("heading", { name: "Project Settings" }),
+        page.getByTestId("project-config-tab"),
       ).toBeVisible({ timeout: 10_000 });
 
       const card = editorCard(page, "project");
@@ -126,9 +126,9 @@ test.describe("AgentsMdEditor — project scope", () => {
     const proj = await createProject(request, name, { path: root });
 
     try {
-      await page.goto(`/projects/${proj.id}/settings`);
+      await page.goto(`/projects/${proj.id}?tab=config`);
       await expect(
-        page.getByRole("heading", { name: "Project Settings" }),
+        page.getByTestId("project-config-tab"),
       ).toBeVisible({ timeout: 10_000 });
 
       await editorCard(page, "project").scrollIntoViewIfNeeded();
@@ -145,7 +145,13 @@ test.describe("AgentsMdEditor — project scope", () => {
           /\/projects\/\d+\/agents-md(\?|$)/.test(r.url()) &&
           r.request().method() === "PUT",
       );
-      await page.getByRole("button", { name: /^save$/i }).click();
+      // Scope the Save lookup to the agents-md card — the project Config tab
+      // ships a sibling "Save" button for the project metadata form, and a
+      // page-wide /^save$/ regex matches the metadata one first. The agents-md
+      // Save button advertises "Save agent guidance" via aria-label.
+      await page
+        .getByRole("button", { name: "Save agent guidance" })
+        .click();
       const saveRes = await saved;
       expect(saveRes.status()).toBe(200);
 
@@ -165,10 +171,10 @@ test.describe("AgentsMdEditor — project scope", () => {
     const proj = await createProject(request, name, { path: root });
 
     try {
-      await page.goto(`/projects/${proj.id}/settings`);
-      await expect(
-        page.getByRole("heading", { name: "Project Settings" }),
-      ).toBeVisible({ timeout: 10_000 });
+      await page.goto(`/projects/${proj.id}?tab=config`);
+      await expect(page.getByTestId("project-config-tab")).toBeVisible({
+        timeout: 15_000,
+      });
       await editorCard(page, "project").scrollIntoViewIfNeeded();
 
       await page
@@ -186,7 +192,13 @@ test.describe("AgentsMdEditor — project scope", () => {
           /\/projects\/\d+\/agents-md\/effective(\?|$)/.test(r.url()) &&
           r.request().method() === "GET",
       );
-      await page.getByRole("button", { name: /^save$/i }).click();
+      // Scope the Save lookup to the agents-md card — the project Config tab
+      // ships a sibling "Save" button for the project metadata form, and a
+      // page-wide /^save$/ regex matches the metadata one first. The agents-md
+      // Save button advertises "Save agent guidance" via aria-label.
+      await page
+        .getByRole("button", { name: "Save agent guidance" })
+        .click();
       await saved;
       await effectiveRefreshed;
 
@@ -215,10 +227,10 @@ test.describe("AgentsMdEditor — project scope", () => {
     const proj = await createProject(request, name, { path: root });
 
     try {
-      await page.goto(`/projects/${proj.id}/settings`);
-      await expect(
-        page.getByRole("heading", { name: "Project Settings" }),
-      ).toBeVisible({ timeout: 10_000 });
+      await page.goto(`/projects/${proj.id}?tab=config`);
+      await expect(page.getByTestId("project-config-tab")).toBeVisible({
+        timeout: 15_000,
+      });
       await editorCard(page, "project").scrollIntoViewIfNeeded();
 
       // Existing content means the empty-state CTA must NOT be rendered.
@@ -248,10 +260,10 @@ test.describe("AgentsMdEditor — workspace scope", () => {
     const ws = await createWorkspace(request, name, { path: root });
 
     try {
-      await page.goto(`/workspaces/${ws.id}/settings`);
-      await expect(
-        page.getByRole("heading", { name: "Workspace Settings" }),
-      ).toBeVisible({ timeout: 10_000 });
+      await page.goto(`/workspaces/${ws.id}?tab=config`);
+      await expect(page.getByTestId("workspace-config-tab")).toBeVisible({
+        timeout: 15_000,
+      });
 
       const card = editorCard(page, "workspace");
       await card.scrollIntoViewIfNeeded();
@@ -276,6 +288,391 @@ test.describe("AgentsMdEditor — workspace scope", () => {
 
       await expect(card).toHaveScreenshot("workspace-editor.png");
     } finally {
+      cleanupDir(root);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Read path via <CodeEditor> + GET fs/file
+//
+// The editor surface is now backed by Monaco (`<CodeEditor>`) reading directly
+// from the project's filesystem via `GET /projects/:id/fs/file?path=AGENTS.md`.
+// These tests prove:
+//   1. the Monaco container mounts and reflects the live AGENTS.md content,
+//   2. the read-status header shows "loaded" once the fetch resolves,
+//   3. the Monaco theme attribute flips when the app's theme flips, and
+//   4. visual baselines exist for both themes so a Monaco upgrade or theme
+//      regression breaks the suite loudly instead of silently.
+// ---------------------------------------------------------------------------
+
+test.describe("AgentsMdEditor — Monaco read path", () => {
+  test("Monaco editor renders the live AGENTS.md content", async ({
+    page,
+    request,
+  }) => {
+    const name = uniq("proj-agents-md-monaco");
+    const root = `/tmp/${name}`;
+    ensureDir(root);
+    const seeded = "# Hello from disk\n\nLine two.\n";
+    writeFileSync(publicPath(root), seeded, "utf-8");
+    const proj = await createProject(request, name, { path: root });
+
+    try {
+      await page.goto(`/projects/${proj.id}?tab=config`);
+      await expect(page.getByTestId("project-config-tab")).toBeVisible({
+        timeout: 15_000,
+      });
+      await editorCard(page, "project").scrollIntoViewIfNeeded();
+
+      // Header strip: "loaded" once the /fs/file fetch resolves and the
+      // path label echoes the relative path the hook was asked for.
+      const status = page.getByTestId("agents-md-status-project-public");
+      await expect(status).toHaveText("loaded", { timeout: 10_000 });
+      await expect(
+        page.getByTestId("agents-md-path-project-public"),
+      ).toHaveText("AGENTS.md");
+
+      // The Monaco surface is the inner `[data-testid="code-editor"]` div
+      // emitted by `CodeEditor.lazy.tsx` once Suspense resolves.
+      const monaco = page.getByTestId("code-editor");
+      await expect(monaco).toBeVisible({ timeout: 10_000 });
+
+      // Monaco renders content into `.view-line` spans inside its scrolled
+      // viewport. Asserting the literal text within the editor proves the
+      // fs/file hook fed Monaco the file we wrote a moment ago — not the
+      // empty editor or the empty-state CTA.
+      await expect(monaco).toContainText("Hello from disk", {
+        timeout: 10_000,
+      });
+    } finally {
+      cleanupDir(root);
+    }
+  });
+
+  test("Monaco theme attribute flips with the app theme", async ({
+    page,
+    request,
+  }) => {
+    const name = uniq("proj-agents-md-theme");
+    const root = `/tmp/${name}`;
+    ensureDir(root);
+    writeFileSync(publicPath(root), "# Theme test\n", "utf-8");
+    const proj = await createProject(request, name, { path: root });
+
+    try {
+      await page.goto(`/projects/${proj.id}?tab=config`);
+      await expect(page.getByTestId("project-config-tab")).toBeVisible({
+        timeout: 15_000,
+      });
+      await editorCard(page, "project").scrollIntoViewIfNeeded();
+
+      const monaco = page.getByTestId("code-editor");
+      await expect(monaco).toBeVisible({ timeout: 10_000 });
+
+      // Lock to light first. The wrapper's `data-monaco-theme` attribute is
+      // fed from `useTheme().theme` so toggling the document class is enough
+      // to drive the prop through the React tree on the next render.
+      await page.evaluate(() => {
+        document.documentElement.classList.remove("dark");
+        try {
+          window.localStorage.setItem("flockctl-theme", "light");
+        } catch {
+          /* private mode */
+        }
+      });
+      // Force a re-render by navigating again — the theme-provider boots
+      // from localStorage so a reload picks up the locked value.
+      await page.reload();
+      await expect(monaco).toBeVisible({ timeout: 10_000 });
+      await expect(monaco).toHaveAttribute("data-monaco-theme", "vs", {
+        timeout: 5_000,
+      });
+
+      // Flip to dark — the wrapper updates the attribute without remounting.
+      await page.evaluate(() => {
+        document.documentElement.classList.add("dark");
+        try {
+          window.localStorage.setItem("flockctl-theme", "dark");
+        } catch {
+          /* private mode */
+        }
+      });
+      await page.reload();
+      await expect(monaco).toBeVisible({ timeout: 10_000 });
+      await expect(monaco).toHaveAttribute("data-monaco-theme", "vs-dark", {
+        timeout: 5_000,
+      });
+    } finally {
+      cleanupDir(root);
+    }
+  });
+
+  test("agents-md-editor visual baseline — light", async ({ page, request }) => {
+    const name = uniq("proj-agents-md-snap-light");
+    const root = `/tmp/${name}`;
+    ensureDir(root);
+    writeFileSync(publicPath(root), "# Light snapshot\n", "utf-8");
+    const proj = await createProject(request, name, { path: root });
+
+    try {
+      await page.evaluate(() => {
+        document.documentElement.classList.remove("dark");
+        try {
+          window.localStorage.setItem("flockctl-theme", "light");
+        } catch {
+          /* private mode */
+        }
+      });
+      await page.goto(`/projects/${proj.id}?tab=config`);
+      await expect(
+        page.getByTestId("project-config-tab"),
+      ).toBeVisible({ timeout: 10_000 });
+      const card = editorCard(page, "project");
+      await card.scrollIntoViewIfNeeded();
+      const monaco = page.getByTestId("code-editor");
+      await expect(monaco).toBeVisible({ timeout: 10_000 });
+
+      // Freeze caret blink + transitions so the snapshot is deterministic.
+      await page.addStyleTag({
+        content:
+          "*, *::before, *::after { animation-duration: 0s !important; transition-duration: 0s !important; caret-color: transparent !important; }",
+      });
+
+      await expect(card).toHaveScreenshot("agents-md-editor-light.png", {
+        maxDiffPixelRatio: 0.02,
+      });
+    } finally {
+      cleanupDir(root);
+    }
+  });
+
+  test("agents-md-editor visual baseline — dark", async ({ page, request }) => {
+    const name = uniq("proj-agents-md-snap-dark");
+    const root = `/tmp/${name}`;
+    ensureDir(root);
+    writeFileSync(publicPath(root), "# Dark snapshot\n", "utf-8");
+    const proj = await createProject(request, name, { path: root });
+
+    try {
+      await page.evaluate(() => {
+        document.documentElement.classList.add("dark");
+        try {
+          window.localStorage.setItem("flockctl-theme", "dark");
+        } catch {
+          /* private mode */
+        }
+      });
+      await page.goto(`/projects/${proj.id}?tab=config`);
+      await expect(
+        page.getByTestId("project-config-tab"),
+      ).toBeVisible({ timeout: 10_000 });
+      const card = editorCard(page, "project");
+      await card.scrollIntoViewIfNeeded();
+      const monaco = page.getByTestId("code-editor");
+      await expect(monaco).toBeVisible({ timeout: 10_000 });
+
+      await page.addStyleTag({
+        content:
+          "*, *::before, *::after { animation-duration: 0s !important; transition-duration: 0s !important; caret-color: transparent !important; }",
+      });
+
+      await expect(card).toHaveScreenshot("agents-md-editor-dark.png", {
+        maxDiffPixelRatio: 0.02,
+      });
+    } finally {
+      cleanupDir(root);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Save flow — Cmd+S, dirty state, sha-conflict banner.
+//
+// The component holds the loaded file's sha and re-checks it before every
+// PUT. When two tabs (or two browsers) edit the same AGENTS.md, whichever
+// one saves second sees a sha mismatch and surfaces the conflict banner
+// instead of overwriting. This block exercises:
+//   - the dirty badge appearing on first edit (visual baseline),
+//   - the keyboard binding (Cmd+S / Ctrl+S) triggering a save,
+//   - the two-tab race producing the conflict banner in the losing tab
+//     (visual baseline of the banner).
+// ---------------------------------------------------------------------------
+
+test.describe("AgentsMdEditor — save flow", () => {
+  test("editing the buffer surfaces the Unsaved badge", async ({
+    page,
+    request,
+  }) => {
+    const name = uniq("proj-agents-md-dirty");
+    const root = `/tmp/${name}`;
+    ensureDir(root);
+    writeFileSync(publicPath(root), "# Initial\n", "utf-8");
+    const proj = await createProject(request, name, { path: root });
+
+    try {
+      await page.goto(`/projects/${proj.id}?tab=config`);
+      await expect(page.getByTestId("project-config-tab")).toBeVisible({
+        timeout: 15_000,
+      });
+      const card = editorCard(page, "project");
+      await card.scrollIntoViewIfNeeded();
+
+      const monaco = page.getByTestId("code-editor");
+      await expect(monaco).toBeVisible({ timeout: 10_000 });
+      await expect(monaco).toContainText("Initial", { timeout: 10_000 });
+
+      // Type into Monaco — dirty badge should mount.
+      await monaco.click();
+      await page.keyboard.press("End");
+      await page.keyboard.type(" — local edit");
+
+      await expect(card.getByText("Unsaved")).toBeVisible({ timeout: 5_000 });
+
+      await page.addStyleTag({
+        content:
+          "*, *::before, *::after { animation-duration: 0s !important; transition-duration: 0s !important; caret-color: transparent !important; }",
+      });
+      await expect(card).toHaveScreenshot("agents-md-editor-dirty-state.png", {
+        maxDiffPixelRatio: 0.02,
+      });
+    } finally {
+      cleanupDir(root);
+    }
+  });
+
+  test("Cmd+S triggers a PUT to /agents-md", async ({ page, request, browserName }) => {
+    const name = uniq("proj-agents-md-cmd-s");
+    const root = `/tmp/${name}`;
+    ensureDir(root);
+    writeFileSync(publicPath(root), "# Initial\n", "utf-8");
+    const proj = await createProject(request, name, { path: root });
+
+    try {
+      await page.goto(`/projects/${proj.id}?tab=config`);
+      await expect(page.getByTestId("project-config-tab")).toBeVisible({
+        timeout: 15_000,
+      });
+      const card = editorCard(page, "project");
+      await card.scrollIntoViewIfNeeded();
+      const monaco = page.getByTestId("code-editor");
+      await expect(monaco).toBeVisible({ timeout: 10_000 });
+      await expect(monaco).toContainText("Initial", { timeout: 10_000 });
+
+      // Drive a change so save is enabled.
+      await monaco.click();
+      await page.keyboard.press("End");
+      await page.keyboard.type(" — kb edit");
+      await expect(card.getByText("Unsaved")).toBeVisible();
+
+      const saved = page.waitForResponse(
+        (r) =>
+          /\/projects\/\d+\/agents-md(\?|$)/.test(r.url()) &&
+          r.request().method() === "PUT",
+      );
+
+      // Ctrl+S on linux/win, Meta+S on mac. Playwright canonicalises
+      // `ControlOrMeta` for us — covers webkit on macOS too.
+      const modifier =
+        browserName === "webkit" || process.platform === "darwin" ? "Meta" : "Control";
+      await page.keyboard.press(`${modifier}+s`);
+
+      const res = await saved;
+      expect(res.status()).toBe(200);
+
+      // Disk reflects the keyboard-driven save.
+      const onDisk = readFileSync(publicPath(root), "utf-8");
+      expect(onDisk).toContain("kb edit");
+    } finally {
+      cleanupDir(root);
+    }
+  });
+
+  test("two-tab race surfaces reload banner in losing tab", async ({
+    browser,
+    request,
+  }) => {
+    const name = uniq("proj-agents-md-race");
+    const root = `/tmp/${name}`;
+    ensureDir(root);
+    writeFileSync(publicPath(root), "# Initial\n", "utf-8");
+    const proj = await createProject(request, name, { path: root });
+
+    const ctxA = await browser.newContext();
+    const ctxB = await browser.newContext();
+    const pageA = await ctxA.newPage();
+    const pageB = await ctxB.newPage();
+
+    try {
+      // Both tabs load the same project's settings page. They get the same
+      // initial content/sha from /fs/file?path=AGENTS.md.
+      for (const p of [pageA, pageB]) {
+        await p.goto(`/projects/${proj.id}?tab=config`);
+        await expect(p.getByTestId("project-config-tab")).toBeVisible({
+          timeout: 15_000,
+        });
+        const card = editorCard(p, "project");
+        await card.scrollIntoViewIfNeeded();
+        const monaco = p.getByTestId("code-editor");
+        await expect(monaco).toBeVisible({ timeout: 10_000 });
+        await expect(monaco).toContainText("Initial", { timeout: 10_000 });
+      }
+
+      // Each tab makes a unique edit.
+      await pageA.getByTestId("code-editor").click();
+      await pageA.keyboard.press("End");
+      await pageA.keyboard.type(" — A wins");
+
+      await pageB.getByTestId("code-editor").click();
+      await pageB.keyboard.press("End");
+      await pageB.keyboard.type(" — B loses");
+
+      // Tab A saves first → succeeds, advances on-disk sha.
+      const aSaved = pageA.waitForResponse(
+        (r) =>
+          /\/projects\/\d+\/agents-md(\?|$)/.test(r.url()) &&
+          r.request().method() === "PUT",
+      );
+      await pageA.getByRole("button", { name: "Save agent guidance" }).click();
+      const aRes = await aSaved;
+      expect(aRes.status()).toBe(200);
+
+      // Tab B saves second → conflict probe sees the new sha, banner mounts,
+      // PUT is NOT issued. Wait for the conflict probe GET to land before
+      // asserting on the banner so we know B observed the sha drift.
+      const bProbe = pageB.waitForResponse(
+        (r) =>
+          /\/projects\/\d+\/fs\/file\?.*path=AGENTS\.md/.test(r.url()) &&
+          r.request().method() === "GET",
+      );
+      await pageB.getByRole("button", { name: "Save agent guidance" }).click();
+      await bProbe;
+
+      const banner = pageB.getByTestId("agents-md-conflict-banner");
+      await expect(banner).toBeVisible({ timeout: 5_000 });
+      await expect(
+        pageB.getByTestId("agents-md-conflict-reload"),
+      ).toBeVisible();
+      await expect(
+        pageB.getByTestId("agents-md-conflict-keep"),
+      ).toBeVisible();
+
+      const card = editorCard(pageB, "project");
+      await pageB.addStyleTag({
+        content:
+          "*, *::before, *::after { animation-duration: 0s !important; transition-duration: 0s !important; caret-color: transparent !important; }",
+      });
+      await expect(card).toHaveScreenshot(
+        "agents-md-editor-conflict-banner.png",
+        { maxDiffPixelRatio: 0.02 },
+      );
+
+      // Disk still holds A's edit — B did not overwrite.
+      expect(readFileSync(publicPath(root), "utf-8")).toContain("A wins");
+      expect(readFileSync(publicPath(root), "utf-8")).not.toContain("B loses");
+    } finally {
+      await ctxA.close();
+      await ctxB.close();
       cleanupDir(root);
     }
   });

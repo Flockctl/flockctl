@@ -9,6 +9,7 @@ import { join } from "path";
 import { eq } from "drizzle-orm";
 import { getDb } from "../../db/index.js";
 import { projects, workspaces } from "../../db/schema.js";
+import { getProjectById } from "../../lib/db-helpers.js";
 import {
   resolveMcpServersForProject,
   resolveMcpServersForWorkspace,
@@ -32,8 +33,7 @@ interface ManifestEntry {
  * <project>/.flockctl/mcp-state.json.
  */
 export function reconcileMcpForProject(projectId: number): void {
-  const db = getDb();
-  const project = db.select().from(projects).where(eq(projects.id, projectId)).get();
+  const project = getProjectById(projectId);
   if (!project?.path || !existsSync(project.path)) return;
 
   const servers = resolveMcpServersForProject(projectId);

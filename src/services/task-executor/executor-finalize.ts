@@ -1,7 +1,7 @@
 import { execFileSync } from "child_process";
 import { eq } from "drizzle-orm";
 import { getDb } from "../../db/index.js";
-import { tasks } from "../../db/schema.js";
+import { projects, tasks } from "../../db/schema.js";
 import { TaskStatus, type TerminalErrorTaskStatus } from "../../lib/types.js";
 import { emitAttentionChanged } from "../attention.js";
 import { wsManager } from "../ws-manager.js";
@@ -10,6 +10,7 @@ import {
   summarizeJournal,
   type FileEditJournal,
 } from "../file-edit-journal.js";
+import { cleanupIfClean } from "../worktree-manager.js";
 import { syncPlan, repointPlan } from "./helpers.js";
 
 export interface FinalizeSuccessArgs {
@@ -65,6 +66,57 @@ export function finalizeSuccess(args: FinalizeSuccessArgs): void {
     emitAttentionChanged(wsManager);
   }
   syncPlan(taskId);
+  // Cleanup-if-clean for isolated tasks. Mirrors `claude --worktree`'s
+  // "auto-remove iff no changes were made" behaviour. Only runs on
+  // success-like terminal states (DONE / PENDING_APPROVAL) — error
+  // states (FAILED / TIMED_OUT / CANCELLED) intentionally leave the
+  // worktree behind so the operator can inspect what the agent did
+  // before things went wrong. `flockctl worktree prune` cleans those
+  // up later.
+  maybeCleanupTaskWorktree(taskId);
+}
+
+/**
+ * Cleanup-if-clean entry point used by `finalizeSuccess` (DONE /
+ * PENDING_APPROVAL terminals). Re-fetches the row to pick up the
+ * worktree fields written during setup, sweeps the worktree iff
+ * `git status --porcelain` is empty, and NULLs the `worktree_path` /
+ * `worktree_branch` columns on success so the row reflects ground
+ * truth. A dirty worktree leaves the columns untouched — the operator
+ * can find the path via the DB row, review/merge, then call
+ * `DELETE /tasks/:id/worktree` to manually finish cleanup.
+ *
+ * Best-effort: any error during cleanup (git not available, worktree
+ * directory raced into nonexistence, …) is logged and swallowed — the
+ * task itself has already finalised, so a cleanup failure must not
+ * convert a successful task into a visible error.
+ */
+function maybeCleanupTaskWorktree(taskId: number): void {
+  const db = getDb();
+  const row = db.select().from(tasks).where(eq(tasks.id, taskId)).get();
+  if (!row || !row.worktreePath || !row.worktreeBranch || !row.projectId) return;
+
+  const project = db.select().from(projects).where(eq(projects.id, row.projectId)).get();
+  if (!project?.path) return;
+
+  try {
+    const result = cleanupIfClean({
+      projectPath: project.path,
+      worktreePath: row.worktreePath,
+      branch: row.worktreeBranch,
+    });
+    if (result.removed) {
+      db.update(tasks)
+        .set({ worktreePath: null, worktreeBranch: null })
+        .where(eq(tasks.id, taskId))
+        .run();
+    }
+  } catch (err) {
+    /* v8 ignore next 4 — defensive: cleanupIfClean catches its own
+     * errors internally; reaching this branch implies a programming
+     * bug elsewhere. We log + continue so finalize doesn't propagate. */
+    console.error(`[task-executor] worktree cleanup failed for task ${taskId}:`, err);
+  }
 }
 
 /**
@@ -129,6 +181,12 @@ export function scheduleRetry(failedTaskId: number): number | null {
     permissionMode: updated.permissionMode,
     envVars: updated.envVars,
     requiresApproval: updated.requiresApproval,
+    // Inherit isolation intent — a retry of a worktree-isolated task
+    // should also run isolated. The retry gets its OWN worktree
+    // (different task id ⇒ different branch / path); we don't copy
+    // `worktreePath` / `worktreeBranch` because those name the parent's
+    // worktree, not the retry's.
+    isolation: updated.isolation,
   }).returning().get();
   if (!newTask) return null;
   repointPlan(failedTaskId, newTask.id);

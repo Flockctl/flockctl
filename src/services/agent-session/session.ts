@@ -1,7 +1,7 @@
 import { EventEmitter } from "events";
 import {
   getAgentTools,
-  executeToolCall,
+  executeToolCallAsync,
   parseAskUserQuestionInput,
   type ParsedAskUserQuestion,
 } from "../agent-tools.js";
@@ -447,9 +447,25 @@ export class AgentSession extends EventEmitter {
       ? setTimeout(() => this.abort("timeout"), this.opts.timeoutSeconds * 1000)
       : null;
 
+    // Hard cap on the agentic loop. The exit condition is "model returns a
+    // message with no tool calls" — under normal operation that fires within
+    // a handful of iterations. The cap defends against a malformed provider
+    // (or an LLM caught in a loop) that always emits another tool call: we'd
+    // rather throw with a clear error after MAX_ITERATIONS than burn a
+    // budget while the operator watches the daemon log scroll. The
+    // BudgetEnforcer is a higher-level safety net for cost; this is a
+    // safety net for *iteration count* on missions / chats without budgets.
+    const MAX_AGENTIC_ITERATIONS = 200;
+    let iteration = 0;
     try {
       // Agentic loop: repeat until AI responds without tool calls
       while (true) {
+        iteration++;
+        if (iteration > MAX_AGENTIC_ITERATIONS) {
+          throw new Error(
+            `agent-session ${this.sessionPrefix()} exceeded MAX_AGENTIC_ITERATIONS (${MAX_AGENTIC_ITERATIONS}) — provider keeps emitting tool calls`,
+          );
+        }
         this.abortController.signal.throwIfAborted();
 
         let streamedText = false;
@@ -629,7 +645,12 @@ export class AgentSession extends EventEmitter {
               result = await this.awaitUserAnswer(tc.id, parsed.value);
             }
           } else {
-            result = executeToolCall(tc.name, tc.input, this.opts.workingDir, this.abortController.signal);
+            // Use the async sibling so Bash/Grep go through execa with a
+            // real abort signal — a session cancel actually kills the
+            // subprocess mid-run instead of waiting up to 2 minutes for
+            // the execSync timeout. Non-shell tools fall through to the
+            // sync impl inside the helper.
+            result = await executeToolCallAsync(tc.name, tc.input, this.opts.workingDir, this.abortController.signal);
           }
           this.emit("tool_result", tc.name, result);
           toolResults.push({ type: "tool_result", tool_use_id: tc.id, content: result });
@@ -647,14 +668,18 @@ export class AgentSession extends EventEmitter {
         turns,
         durationMs: Date.now() - startTime,
       };
-    } catch (err: any) {
+    } catch (err: unknown) {
       // Re-throw with a name that reflects WHY we aborted. Without this,
       // timeouts surface as AbortError and get misclassified as user cancels.
       if (this.isAbortLikeError(err) && this._abortReason) {
-        const mapped = new Error(this.abortMessage());
-        (mapped as any).name = this._abortReason === "timeout" ? "TimeoutError" : "AbortError";
-        (mapped as any).reason = this._abortReason;
-        (mapped as any).cause = err;
+        // `Error.name` and `Error.cause` are standard fields; `reason` is our
+        // own field, so we narrow to a richer shape rather than `as any`.
+        const mapped: Error & { reason?: AbortReason; cause?: unknown } = new Error(
+          this.abortMessage(),
+        );
+        mapped.name = this._abortReason === "timeout" ? "TimeoutError" : "AbortError";
+        mapped.reason = this._abortReason;
+        mapped.cause = err;
         throw mapped;
       }
       throw err;

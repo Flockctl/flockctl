@@ -84,7 +84,7 @@ export function SkillDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleClose}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="flex max-h-[calc(100vh-4rem)] flex-col sm:max-w-3xl">
         <DialogHeader>
           <DialogTitle>{isEditing ? "Edit Skill" : `Add Skill (${scope})`}</DialogTitle>
           <DialogDescription>
@@ -93,7 +93,7 @@ export function SkillDialog({
               : `Create a new SKILL.md at the ${scope} level.`}
           </DialogDescription>
         </DialogHeader>
-        <div className="space-y-4">
+        <div className="flex min-h-0 flex-1 flex-col space-y-3 overflow-y-auto">
           <div className="space-y-2">
             <Label htmlFor="skill-name">Name</Label>
             <Input
@@ -104,14 +104,14 @@ export function SkillDialog({
               disabled={isEditing}
             />
           </div>
-          <div className="space-y-2">
+          <div className="flex min-h-0 flex-1 flex-col space-y-2">
             <Label htmlFor="skill-content">Content (Markdown)</Label>
             <Textarea
               id="skill-content"
               placeholder={"# Skill Name\n\nDescription and instructions..."}
               value={content}
               onChange={(e) => setContent(e.target.value)}
-              className="min-h-[200px] font-mono text-sm"
+              className="min-h-[300px] flex-1 resize-none font-mono text-sm [field-sizing:fixed]"
             />
           </div>
           {error && <p className="text-sm text-destructive">{error}</p>}

@@ -6,6 +6,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { StatCard } from "@/components/stat-card";
 import { useKpiData } from "@/lib/use-kpi-data";
+import { formatCents, formatTokensWithNull, clampPercent } from "@/lib/format";
 
 /**
  * Top-of-BoardView KPI bar for the mission-control experience
@@ -53,34 +54,26 @@ export interface MissionControlKpiBarProps {
 export const KPI_NULL_PLACEHOLDER = "—";
 
 /**
- * Format a raw token count. Millions go to `1.2M`, thousands to
- * `1.2K`, and anything smaller prints as-is. We deliberately do NOT
- * reuse `formatTokens` from `lib/format` because the contract here
- * is slightly stricter: "1.2M" must always be emitted for 1e6+, even
- * if `formatTokens` were to change its rounding rule later.
- *
- * `null` inputs surface the `—` sentinel, signalling "data unavailable"
- * (e.g. usage-by-workspace hook is not wired). That is distinct from a
- * known zero, which stays as `"0"`.
+ * Format a raw token count. Delegates to the canonical
+ * `formatTokensWithNull` (compact `1.2K` / `1.2M` rule) and surfaces
+ * `KPI_NULL_PLACEHOLDER` for null inputs — see {@link formatTokensWithNull}
+ * for the canonical implementation.
  */
 export function formatKpiTokens(n: number | null): string {
-  if (n === null) return KPI_NULL_PLACEHOLDER;
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return String(n);
+  return formatTokensWithNull(n, KPI_NULL_PLACEHOLDER);
 }
 
 /**
  * Format cents as USD. Non-zero sub-cent values collapse to the
  * sentinel `<$0.01` so the card never claims "$0.00" when a
  * non-trivial cost was spent. `null` → the `—` placeholder, same rule
- * as {@link formatKpiTokens}.
+ * as {@link formatKpiTokens}. Delegates to the canonical {@link formatCents}.
  */
 export function formatKpiCost(cents: number | null): string {
-  if (cents === null) return KPI_NULL_PLACEHOLDER;
-  if (cents === 0) return "$0.00";
-  if (cents < 1) return "<$0.01";
-  return `$${(cents / 100).toFixed(2)}`;
+  return formatCents(cents, {
+    nullSentinel: KPI_NULL_PLACEHOLDER,
+    subDollarSentinel: "<$0.01",
+  });
 }
 
 /**
@@ -136,7 +129,7 @@ function ToneStatCard({
       <CardContent>
         <div
           className={cn(
-            "text-2xl font-bold",
+            "text-[18px] font-semibold leading-tight",
             tone === "amber" && "text-amber-600",
             tone === "destructive" && "text-destructive",
           )}
@@ -179,10 +172,7 @@ function SlicesStatCard({
   // track. A `null` on either side zeroes the bar — we explicitly do
   // NOT guess at a percentage when either numerator or denominator is
   // unknown.
-  const percent =
-    slicesDone !== null && slicesTotal !== null && slicesTotal > 0
-      ? Math.max(0, Math.min(100, (slicesDone / slicesTotal) * 100))
-      : 0;
+  const percent = clampPercent(slicesDone, slicesTotal);
   const valueLabel =
     slicesDone === null || slicesTotal === null
       ? KPI_NULL_PLACEHOLDER
@@ -196,7 +186,7 @@ function SlicesStatCard({
         </CardTitle>
       </CardHeader>
       <CardContent>
-        <div className="text-2xl font-bold" data-testid="kpi-slices-value">
+        <div className="text-[18px] font-semibold leading-tight" data-testid="kpi-slices-value">
           {isLoading ? <Skeleton className="h-8 w-16" /> : valueLabel}
         </div>
         <div className="mt-2" data-testid="kpi-slices-progress">

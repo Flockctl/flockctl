@@ -22,8 +22,18 @@ import { NEW_CHAT_DRAFT_KEY } from "@/lib/chat-draft-store";
  *  reference when a chat has no draft and doesn't re-render on every read. */
 const EMPTY: readonly AttachmentChipFile[] = Object.freeze([]);
 
+// Bounded growth — same rationale as chat-draft-store (audit-round-5).
+// Pending attachments accumulate across chats over a long session;
+// 256 entries is a generous ceiling.
+const MAX_ATTACHMENT_DRAFT_ENTRIES = 256;
 const drafts = new Map<string, AttachmentChipFile[]>();
 const subscribers = new Set<() => void>();
+
+function evictOldestAttachmentDraftIfFull(): void {
+  if (drafts.size < MAX_ATTACHMENT_DRAFT_ENTRIES) return;
+  const oldest = drafts.keys().next().value;
+  if (oldest !== undefined) drafts.delete(oldest);
+}
 
 function emit(): void {
   for (const fn of subscribers) fn();
@@ -54,6 +64,7 @@ export function setAttachmentDraft(
     if (!prev) return;
     drafts.delete(key);
   } else {
+    if (!prev) evictOldestAttachmentDraftIfFull();
     drafts.set(key, value);
   }
   emit();

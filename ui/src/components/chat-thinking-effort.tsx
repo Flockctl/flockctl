@@ -8,6 +8,7 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
+import { cn } from "@/lib/utils";
 import type { EffortLevel } from "@/lib/types";
 
 /**
@@ -31,26 +32,39 @@ export function ChatThinkingEffortControl({
   onThinkingChange,
   onEffortChange,
   disabled,
+  inline,
+  triggerClassName,
 }: {
   thinkingEnabled: boolean;
   effort: EffortLevel | null;
   onThinkingChange: (next: boolean) => void;
   onEffortChange: (next: EffortLevel) => void;
   disabled?: boolean;
+  /**
+   * Borderless inline trigger for the chat-composer footer. Switches the
+   * underlying Button from `outline` (its own border + bg-background) to
+   * `ghost` (transparent surface, hover-muted) so the control reads as part
+   * of the composer card rather than a free-floating chip above it.
+   */
+  inline?: boolean;
+  /** Extra classes appended to the Button trigger. */
+  triggerClassName?: string;
 }) {
   // Fall back to the SDK's default label when no per-chat override is
-  // stored — matches the server-side resolution in routes/chats/messages.ts
-  // (NULL → "high"). We don't persist the default back to the DB; a null
-  // value signals "follow the default" and stays writable from any path.
-  const effectiveEffort: EffortLevel = effort ?? "high";
+  // stored — matches the server-side resolution in services/ai/client.ts
+  // (NULL → "xhigh"; the SDK silently degrades to "high" on models that
+  // don't support xhigh). We don't persist the default back to the DB; a
+  // null value signals "follow the default" and stays writable from any
+  // path.
+  const effectiveEffort: EffortLevel = effort ?? "xhigh";
 
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <Button
-          variant="outline"
+          variant={inline ? "ghost" : "outline"}
           size="sm"
-          className="h-8 gap-1 px-2 text-xs"
+          className={cn("h-8 gap-1 px-2 text-xs", triggerClassName)}
           disabled={disabled}
           data-testid="chat-thinking-effort-trigger"
           title="Adaptive thinking & effort"
@@ -95,7 +109,7 @@ export function ChatThinkingEffortControl({
         <div className="px-1 pb-1 text-[11px] leading-snug text-muted-foreground">
           Guides how much effort Claude puts into the response. Higher = more
           thinking (when adaptive thinking is on) and deeper replies.
-          <strong className="ml-1 font-medium">high</strong> is the default.
+          <strong className="ml-1 font-medium">xhigh</strong> is the default.
         </div>
         {EFFORT_OPTIONS.map((opt) => (
           <DropdownMenuItem
@@ -125,6 +139,10 @@ export function ChatThinkingEffortControl({
 const EFFORT_OPTIONS: Array<{ value: EffortLevel; description: string }> = [
   { value: "low", description: "Minimal thinking, fastest responses." },
   { value: "medium", description: "Moderate thinking." },
-  { value: "high", description: "Deep reasoning (default)." },
+  { value: "high", description: "Deep reasoning." },
+  {
+    value: "xhigh",
+    description: "Deeper than high (Opus 4.7 only; falls back to high) — default.",
+  },
   { value: "max", description: "Maximum effort — select models only." },
 ];

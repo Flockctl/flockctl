@@ -4,7 +4,7 @@ import { startServer } from "./server.js";
 import { SchedulerService } from "./services/scheduler.js";
 import { wsManager } from "./services/ws-manager.js";
 import { taskExecutor } from "./services/task-executor/index.js";
-import { chatExecutor, sweepOrphanedChatQuestions } from "./services/chat-executor.js";
+import { chatExecutor, sweepOrphanedChatQuestions, sweepOrphanedRunningChats } from "./services/chat-executor.js";
 import { rateLimitScheduler } from "./services/agents/rate-limit-scheduler.js";
 import { seedDefaultKey } from "./services/ai/key-selection.js";
 import { reconcilePlanStatuses, resumeStaleMilestones, cancelOrphanedExecutionTasks } from "./services/auto-executor.js";
@@ -17,7 +17,16 @@ import {
   startStalledDetector,
   stopStalledDetector,
 } from "./services/missions/stalled-detector.js";
+import { subscribeMissionEvents } from "./services/missions/event-subscriber.js";
+import { reconcilePendingApproveEvents } from "./services/missions/approve-reconciler.js";
+import { supervisorService } from "./services/missions/service.js";
 import {
+  startWakeupWorker,
+  stopWakeupWorker,
+} from "./services/wakeups/wakeup-worker.js";
+import type { WakeupRow } from "./services/wakeups/wakeup-service.js";
+import {
+  DEFAULT_DAEMON_PORT,
   seedBundledSkills,
   checkRcPermissions,
   hasRemoteAuth,
@@ -50,7 +59,7 @@ function argFlag(flag: string): boolean {
   return process.argv.includes(flag);
 }
 
-const port = parseInt(argValue("--port") ?? "52077", 10);
+const port = parseInt(argValue("--port") ?? String(DEFAULT_DAEMON_PORT), 10);
 const host = argValue("--host") ?? "127.0.0.1";
 const allowInsecurePublic = argFlag("--allow-insecure-public");
 
@@ -149,6 +158,17 @@ const requeued = taskExecutor.resetStaleTasks();
   }
 }
 
+// 2b-running-chats. Chats left with `status='running'` after a crashed
+// daemon are orphans — the in-memory executor is gone but the row reads
+// 'busy' forever, blocking new turns from the UI. Sweep them back to
+// 'idle' so the operator can re-engage. Audit-round-7 finding.
+{
+  const reset = sweepOrphanedRunningChats();
+  if (reset > 0) {
+    console.log(`[chat-executor] reset ${reset} orphaned running chat(s) to idle`);
+  }
+}
+
 // 2c-rate-limit. Re-arm wake-up timers for tasks/chats parked in
 // `status='rate_limited'` from a prior daemon instance. The scheduler reads
 // `resume_at` off the row and arms a setTimeout per parked entry; a row whose
@@ -174,25 +194,53 @@ scheduler.loadExistingSchedules();
 
 // 3a-mission. Mission-tier liveness wiring. MUST run AFTER `SchedulerService`
 //   has started (the heartbeat + stalled-detector use the same node-cron
-//   tick infrastructure as scheduler.ts) AND AFTER the missions event
-//   subscriber is attached (so the synthetic `taskTerminalEvents` emit from
-//   the stalled-detector lands at a wired listener — without the
-//   subscriber the synthetic event would be a tree-falls-in-the-forest).
+//   tick infrastructure as scheduler.ts) AND BEFORE the synthetic
+//   `taskTerminalEvents` emit from the stalled-detector — otherwise the
+//   first synthetic stalled event would be a tree-falls-in-the-forest
+//   (no listener attached yet).
 //
-//   The subscriber is wired in a sibling slice (slice 11/03 §"production
-//   wiring"); when that wiring lands, it MUST run before this block. We
-//   guard against a misordered boot by accepting that — without a
-//   supervisor — the heartbeat callback degrades to a logged warning,
-//   and the synthetic `stalled` event broadcasts on `taskTerminalEvents`
-//   regardless (consumers attached later will receive subsequent ticks).
+//   Wiring order inside this block, top → bottom:
+//     1. subscribeMissionEvents(supervisorService)
+//          — attaches the listener that resolves task → mission and routes
+//            `task_observed` triggers into the supervisor.
+//     2. registerHeartbeats(heartbeatDispatch)
+//          — installs the per-mission cron handles that fan `heartbeat`
+//            triggers into the same supervisor instance every 15 minutes.
+//     3. startStalledDetector()
+//          — emits synthetic `taskTerminalEvents` for tasks that have been
+//            running past the stalled threshold; lands on the listener
+//            installed in step 1.
 //
-//   `heartbeatDispatch` is the seam that the supervisor wiring slice will
-//   replace with `(missionId) => supervisorService.evaluate(missionId,
-//   { kind: 'heartbeat' })`. The placeholder logs at debug-cost — a
-//   missing supervisor must NOT crash the daemon.
-const heartbeatDispatch: HeartbeatCallback = (missionId) => {
-  console.log(`[missions/heartbeat] tick for mission ${missionId}`);
-};
+//   `heartbeatDispatch` calls `supervisorService.evaluate(missionId,
+//   { kind: 'heartbeat' })`. The supervisor short-circuits heartbeat
+//   triggers internally (no LLM round-trip, no spend — see
+//   `supervisor.ts` §"Heartbeat short-circuit"), so a 15-minute tick is
+//   bounded to one INSERT into `mission_events`. Errors from evaluate()
+//   (DB closed, mission deleted between tick and read, etc.) are caught
+//   inside `heartbeat.ts` itself — logged + swallowed so a single bad
+//   tick can never kill the dispatcher for the rest of the missions.
+const unsubscribeMissionEvents = subscribeMissionEvents(supervisorService);
+
+// Boot-time durability reconciler: surface any `remediation_approved`
+// events that were recorded but never confirmed (operator approved a
+// proposal, daemon crashed between the event INSERT and the FS
+// materialisation). One WS broadcast per row + a console.warn summary
+// so the operator sees them immediately. Pure scan — does not mutate.
+reconcilePendingApproveEvents();
+const heartbeatDispatch: HeartbeatCallback = (missionId) =>
+  supervisorService.evaluate(missionId, { kind: "heartbeat" }).then(
+    () => undefined,
+    // Defensive: heartbeat.ts already logs + swallows callback rejections,
+    // but returning a resolved void here keeps the typed callback contract
+    // (`void | Promise<void>`) free of an unhandled rejection in the rare
+    // case the heartbeat dispatcher's outer try/catch is bypassed.
+    (err: unknown) => {
+      console.warn(
+        `[missions/heartbeat] supervisor.evaluate rejected for ${missionId}:`,
+        err,
+      );
+    },
+  );
 const { registered: registeredHeartbeats } = registerHeartbeats(heartbeatDispatch);
 if (registeredHeartbeats.length > 0) {
   console.log(
@@ -200,6 +248,64 @@ if (registeredHeartbeats.length > 0) {
   );
 }
 startStalledDetector();
+
+// 3a-wakeups. Scheduled-wakeups tick worker.
+//
+//   Fires every WAKEUP_TICK_INTERVAL_MS (10 s by default) and walks the
+//   `scheduled_wakeups` partial-indexed pending set. The fire callback
+//   below is the seam where the production resume integration plugs in
+//   — for the current skeleton it logs and broadcasts but does NOT yet
+//   spawn a `claude --resume` subprocess. That follow-up wiring lands
+//   alongside the chat/task session-resume entrypoint; until then a
+//   fired row appears in the UI inbox as "fired (no resume wired)" so
+//   the operator sees that the timer fired even when the actual chat
+//   resume is still a manual "claude --resume" away.
+//
+//   `onMissed` and `onFired` push WS broadcasts so the UI inbox swaps
+//   the countdown chip for a "fired" / "missed" badge in real time
+//   without polling. Per-row resolution (so we know chat_id/task_id at
+//   broadcast time) flows through wsManager.broadcastWakeupStatus.
+const wakeupFire = (row: WakeupRow): void => {
+  /* v8 ignore start — production resume integration replaces this. */
+  console.log(
+    `[wakeups] tick fired row=${row.id} chat=${row.chatId} task=${row.taskId} ` +
+      `claudeSession=${row.claudeSessionId} reason=${row.reason ?? "(none)"}`,
+  );
+  /* v8 ignore stop */
+};
+const wakeupOnMissed = (ids: string[]): void => {
+  for (const id of ids) {
+    // The service has already transitioned the row; we re-read the
+    // row inline here rather than caching the post-update state in the
+    // worker so the broadcast reflects the canonical row shape (the UI
+    // refetches on click anyway).
+    /* v8 ignore start — exercised when a daemon was down past grace. */
+    import("./services/wakeups/wakeup-service.js").then(({ getById }) => {
+      const row = getById(id);
+      if (!row) return;
+      wsManager.broadcastWakeupStatus({
+        wakeup_id: row.id,
+        chat_id: row.chatId,
+        task_id: row.taskId,
+        status: row.status,
+        fire_at: row.fireAt,
+        reason: row.reason,
+      });
+    }).catch(() => undefined);
+    /* v8 ignore stop */
+  }
+};
+const wakeupOnFired = (row: WakeupRow): void => {
+  wsManager.broadcastWakeupStatus({
+    wakeup_id: row.id,
+    chat_id: row.chatId,
+    task_id: row.taskId,
+    status: row.status,
+    fire_at: row.fireAt,
+    reason: row.reason,
+  });
+};
+startWakeupWorker(wakeupFire, { onMissed: wakeupOnMissed, onFired: wakeupOnFired });
 
 // 3. Start HTTP server
 startServer(port, host);
@@ -263,7 +369,9 @@ async function shutdown(reason: string = "signal") {
   try {
     scheduler.stopAll();
     unregisterAllHeartbeats();
+    unsubscribeMissionEvents();
     stopStalledDetector();
+    stopWakeupWorker();
     taskExecutor.cancelAll();
     chatExecutor.cancelAll();
     // Drain chat streams and tear down ssh tunnels in parallel — both are

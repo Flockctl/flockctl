@@ -1,118 +1,136 @@
-import { useMemo } from "react";
-import { useAttention, useProjects } from "@/lib/hooks";
-import { Skeleton } from "@/components/ui/skeleton";
+import * as React from "react";
 import { Inbox } from "lucide-react";
-import { AttentionRow } from "@/components/attention/attention-row";
-import type { Project } from "@/lib/types";
-import type { AttentionItem } from "@/lib/api";
+
+import { SectionHeader } from "@/components/design";
+import { AttentionSection } from "./attention-components/AttentionSection";
+import { EmptyState } from "@/components/EmptyState";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  useAttentionInbox,
+  type AttentionInboxItem,
+} from "@/lib/hooks/use-attention-inbox";
 
 /**
- * Inbox page — flat list of items the user must act on right now
- * (task approvals + tool-permission prompts on running task/chat sessions).
+ * Attention page — redesigned working surface (slice
+ * `24-ui-redesign-working-surfaces/04-attention`, T03).
  *
- * We intentionally render cards rather than a table: items are mixed-kind
- * (approvals vs. per-tool prompts) and each kind surfaces different context,
- * so a single-width row of columns would either truncate useful fields or
- * leave most cells empty. Cards scale to arbitrary per-kind detail without
- * forcing every variant into the same column grid.
+ * Page composition:
  *
- * Shell contract (matches other pages under ui/src/pages):
- *  - Page title + count subtitle in a header that mirrors dashboard/tasks
- *  - Loading: a short stack of skeletons
- *  - Error: red destructive text, non-fatal (header still renders)
- *  - Empty: muted "Inbox is empty" illustration
- *  - Items: vertical stack of cards
+ *   <SectionHeader title="Attention" subtitle="{n} items" />
+ *   ── if any ──
+ *     <AttentionSection priority="critical" />   (failed tasks)
+ *     <AttentionSection priority="normal"   />   (agent questions, mission proposals)
+ *   ── else ──
+ *     <EmptyState>All caught up · 0 items waiting</EmptyState>
  *
- * Data comes from `useAttention`, which owns the React Query cache and
- * invalidates on `attention_changed` WS frames — so this component never
- * holds a local copy of the list.
+ * Data
+ * ----
+ * The list is the merged feed produced by `useAttentionInbox()` — three
+ * client-side sources (`useAgentQuestionsAll` + `useMissionProposalsAll` +
+ * `useFailedTasks24h`) sorted by priority then `created_at` DESC. Each
+ * source owns its own React Query cache; partial errors land in
+ * `partialErrors[]` so a single broken source does not blank the page.
  *
- * We fetch projects ONCE at the page level (not per-row) and build a
- * `projectsById` map to avoid the obvious N+1 fetch storm when the inbox
- * has ten rows pointing at ten different projects. The map is passed down
- * to each row; if a project is missing from the map the row falls back to
- * `Project #N`, keeping the row renderable even on a stale projects list.
+ * Empty buckets render NOTHING — `<AttentionSection>` short-circuits to
+ * `null` when `items.length === 0`. A page with only critical items
+ * therefore shows just the Critical block + page header (no Normal stub).
+ *
+ * Dismiss
+ * -------
+ * The slice's read-only success criterion is "accept/dismiss hooks call
+ * existing endpoints". For sources without a dedicated dismiss endpoint
+ * (mission proposals: deferred per parent-slice audit findings; failed
+ * tasks: dismissal is a UX-only "hide" with no server side effect today)
+ * the page wires a no-op resolver — the row hides itself once the promise
+ * resolves, matching the AttentionRow contract pinned by
+ * `attention-row.test.tsx::dismiss happy path`. When the underlying
+ * source endpoints land we replace the stub here without touching the
+ * row/section components.
  */
-export default function AttentionPage() {
-  const { items, total, isLoading, error } = useAttention();
-  const { data: projects } = useProjects();
+export default function AttentionPage(): React.JSX.Element {
+  const { items, isLoading, partialErrors } = useAttentionInbox();
 
-  const projectsById = useMemo(() => {
-    const map = new Map<string, Project>();
-    for (const p of projects ?? []) map.set(p.id, p);
-    return map;
-  }, [projects]);
+  // Bucketing is cheap (one O(n) pass per priority). We memoize so the
+  // section components are referentially stable when the merge result is
+  // — saves a re-render on every parent state change unrelated to items.
+  const critical = React.useMemo(
+    () => items.filter((it) => it.priority === "critical"),
+    [items],
+  );
+  const normal = React.useMemo(
+    () => items.filter((it) => it.priority === "normal"),
+    [items],
+  );
+
+  const total = items.length;
+  const subtitle = isLoading
+    ? "Loading…"
+    : total === 0
+      ? "Nothing waiting on you."
+      : `${total} item${total === 1 ? "" : "s"}`;
+
+  // Stable handler — the row stores it in a closure so a fresh reference
+  // on every render would needlessly retrigger the row's optimistic-hide
+  // useState transition cadence under React StrictMode.
+  const handleDismiss = React.useCallback(
+    async (_item: AttentionInboxItem): Promise<void> => {
+      // No-op for now (see header comment). Returning a resolved promise
+      // satisfies the AttentionRow contract: row hides itself once this
+      // resolves, errors are surfaced inline if it rejects.
+      return Promise.resolve();
+    },
+    [],
+  );
 
   return (
-    <div>
-      <div className="mb-6">
-        <h1 className="text-xl font-bold sm:text-2xl">Inbox</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          {isLoading
-            ? "Loading…"
-            : total === 0
-              ? "Nothing is waiting on you."
-              : `${total} item${total === 1 ? "" : "s"} waiting on you.`}
-        </p>
-      </div>
+    <div data-testid="attention-page" className="max-w-7xl">
+      <SectionHeader
+        title="Attention"
+        subtitle={subtitle}
+        data-testid="attention-page-header"
+      />
 
-      {error ? (
-        <p className="text-sm text-destructive">
-          Failed to load inbox:{" "}
-          {error instanceof Error ? error.message : String(error)}
+      {partialErrors.length > 0 && (
+        <p
+          role="alert"
+          data-testid="attention-partial-error"
+          className="mb-4 text-sm text-destructive"
+        >
+          Some sources failed to load. The list shows what is available.
         </p>
-      ) : null}
+      )}
 
       {isLoading && (
-        <div className="space-y-3">
+        <div className="space-y-3" data-testid="attention-loading">
           {Array.from({ length: 3 }).map((_, i) => (
             <Skeleton key={i} className="h-20 w-full" />
           ))}
         </div>
       )}
 
-      {!isLoading && !error && items.length === 0 && (
-        <div className="flex flex-col items-center justify-center rounded-md border border-dashed py-16 text-center">
-          <Inbox className="mb-3 h-10 w-10 text-muted-foreground" />
-          <p className="text-sm font-medium">Inbox is empty</p>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Approval requests and tool-permission prompts will appear here.
-          </p>
-        </div>
+      {!isLoading && total === 0 && (
+        <EmptyState
+          icon={Inbox}
+          title="All caught up · 0 items waiting"
+          description="Agent questions, mission proposals, and failed tasks will appear here."
+          data-testid="attention-empty-state"
+        />
       )}
 
-      {!isLoading && !error && items.length > 0 && (
-        <ul className="space-y-3">
-          {items.map((item) => (
-            <li key={attentionKey(item)}>
-              <AttentionRow item={item} projectsById={projectsById} />
-            </li>
-          ))}
-        </ul>
+      {!isLoading && total > 0 && (
+        <>
+          <AttentionSection
+            priority="critical"
+            items={critical}
+            onDismiss={handleDismiss}
+          />
+          <AttentionSection
+            priority="normal"
+            items={normal}
+            onDismiss={handleDismiss}
+          />
+        </>
       )}
     </div>
   );
-}
-
-/**
- * A stable, kind-aware React key. `request_id` is unique per permission
- * prompt but does not exist on approvals, so we fall back to `task_id`
- * there. Prefix with `kind` so a task approval and a task permission for
- * the same task id never collide.
- */
-function attentionKey(item: AttentionItem): string {
-  switch (item.kind) {
-    case "task_approval":
-      return `task_approval:${item.task_id}`;
-    case "chat_approval":
-      return `chat_approval:${item.chat_id}`;
-    case "task_permission":
-      return `task_permission:${item.task_id}:${item.request_id}`;
-    case "chat_permission":
-      return `chat_permission:${item.chat_id}:${item.request_id}`;
-    case "task_question":
-      return `task_question:${item.task_id}:${item.request_id}`;
-    case "chat_question":
-      return `chat_question:${item.chat_id}:${item.request_id}`;
-  }
 }

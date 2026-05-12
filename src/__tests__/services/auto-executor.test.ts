@@ -86,6 +86,46 @@ describe("startAutoExecution (no slices — finishes immediately)", () => {
     expect(getAutoExecutionStatus(m.slug).running).toBe(false);
     rmSync(projPath, { recursive: true, force: true });
   });
+
+  /*
+   * Regression for the vacuous-truth bug: prior code used
+   *   `finalSlices.every(s => s.status === COMPLETED)`
+   * and
+   *   `finalTasks.every(t => t.status === COMPLETED)`
+   * which both return `true` on empty arrays. Running the executor on a
+   * milestone that contains zero slices, or on slices that contain zero
+   * plan tasks, would silently flip them all to `completed` in
+   * milliseconds without spawning a single agent — exactly the failure
+   * mode that produced the false-positive M17–M21 statuses observed in
+   * 2026-05.
+   */
+  it("does NOT mark a milestone with zero slices as completed", async () => {
+    const projPath = mkdtempSync(join(tmpdir(), "ae-nv-m-"));
+    const proj = db.insert(projects).values({ name: "p", path: projPath }).returning().get()!;
+    const m = createMilestone(projPath, { title: "Empty milestone" });
+
+    await startAutoExecution(proj.id, projPath, m.slug);
+
+    const after = getMilestone(projPath, m.slug)!;
+    expect(after.status).not.toBe("completed");
+    rmSync(projPath, { recursive: true, force: true });
+  });
+
+  it("does NOT mark a slice with zero plan tasks as completed", async () => {
+    const projPath = mkdtempSync(join(tmpdir(), "ae-nv-s-"));
+    const proj = db.insert(projects).values({ name: "p", path: projPath }).returning().get()!;
+    const m = createMilestone(projPath, { title: "M with empty slice" });
+    createSlice(projPath, m.slug, { title: "no-tasks-here" });
+
+    await startAutoExecution(proj.id, projPath, m.slug);
+
+    const slices = listSlices(projPath, m.slug);
+    expect(slices).toHaveLength(1);
+    expect(slices[0].status).not.toBe("completed");
+    // Milestone must also stay un-completed: not all slices completed.
+    expect(getMilestone(projPath, m.slug)!.status).not.toBe("completed");
+    rmSync(projPath, { recursive: true, force: true });
+  });
 });
 
 describe("reconcilePlanStatuses", () => {

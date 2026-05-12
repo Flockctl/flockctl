@@ -1,6 +1,6 @@
 import { getDb } from "../../db/index.js";
 import { tasks } from "../../db/schema.js";
-import { eq, or } from "drizzle-orm";
+import { eq, or, inArray } from "drizzle-orm";
 import { TaskStatus } from "../../lib/types.js";
 
 /**
@@ -24,27 +24,35 @@ export function resetStaleTasks(activeTaskIds: Set<number>): number[] {
     .all();
 
   const requeued: number[] = [];
-  let runningReset = 0;
   let queuedAdopted = 0;
+  // Batch the running→queued UPDATEs into a single statement (audit-
+  // round-5). The previous shape ran one UPDATE per stale row; on a
+  // daemon that died mid-flight with dozens of running tasks that's
+  // dozens of write-path round-trips at boot. Collapse to one
+  // `WHERE id IN (...)` write.
+  const runningResetIds: number[] = [];
   for (const t of stale) {
     if (activeTaskIds.has(t.id)) continue;
     if (t.status === TaskStatus.RUNNING) {
-      db.update(tasks)
-        .set({
-          status: TaskStatus.QUEUED,
-          exitCode: null,
-          errorMessage: null,
-          startedAt: null,
-          completedAt: null,
-        })
-        .where(eq(tasks.id, t.id))
-        .run();
-      runningReset++;
+      runningResetIds.push(t.id);
     } else {
       queuedAdopted++;
     }
     requeued.push(t.id);
   }
+  if (runningResetIds.length > 0) {
+    db.update(tasks)
+      .set({
+        status: TaskStatus.QUEUED,
+        exitCode: null,
+        errorMessage: null,
+        startedAt: null,
+        completedAt: null,
+      })
+      .where(inArray(tasks.id, runningResetIds))
+      .run();
+  }
+  const runningReset = runningResetIds.length;
 
   if (runningReset > 0) {
     console.log(`Re-queued ${runningReset} stale running task(s) from previous daemon`);

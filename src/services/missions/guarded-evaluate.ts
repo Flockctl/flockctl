@@ -35,6 +35,8 @@
 // attempt (the caller is expected to retry or surface the failure).
 
 import { randomUUID } from "node:crypto";
+import type Database from "better-sqlite3";
+
 import { getRawDb } from "../../db/index.js";
 import {
   BudgetEnforcer,
@@ -237,6 +239,33 @@ export async function guardedEvaluate(
 
 // ─── Internals ───
 
+// ─── Prepared-statement cache (audit hot-path optimisation) ───
+//
+// Both helpers below fire on every guardedEvaluate() call. Lift their
+// SQL into a per-Database cache so we don't re-parse on every LLM turn.
+
+interface GuardedStmts {
+  readStatus: Database.Statement<[string]>;
+  insertEvent: Database.Statement<[string, string, string, string, number, number, number]>;
+}
+
+const stmtCache = new WeakMap<Database.Database, GuardedStmts>();
+
+function getStmts(sqlite: Database.Database): GuardedStmts {
+  let cached = stmtCache.get(sqlite);
+  if (cached) return cached;
+  cached = {
+    readStatus: sqlite.prepare("SELECT status FROM missions WHERE id = ?"),
+    insertEvent: sqlite.prepare(
+      `INSERT INTO mission_events
+         (id, mission_id, kind, payload, cost_tokens, cost_usd_cents, depth)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ),
+  };
+  stmtCache.set(sqlite, cached);
+  return cached;
+}
+
 /**
  * Disambiguate the two BudgetEnforcer denial paths so the caller can tell
  * "operator hit pause" apart from "budget exhausted on its own". One small
@@ -244,9 +273,9 @@ export async function guardedEvaluate(
  */
 function classifyBudgetDenial(missionId: string): "paused" | "budget_exhausted" {
   const sqlite = getRawDb();
-  const row = sqlite
-    .prepare("SELECT status FROM missions WHERE id = ?")
-    .get(missionId) as { status?: string } | undefined;
+  const row = getStmts(sqlite).readStatus.get(missionId) as
+    | { status?: string }
+    | undefined;
   return row?.status === "paused" ? "paused" : "budget_exhausted";
 }
 
@@ -265,12 +294,14 @@ function writeMissionEvent(
 ): string {
   const sqlite = getRawDb();
   const id = randomUUID();
-  sqlite
-    .prepare(
-      `INSERT INTO mission_events
-         (id, mission_id, kind, payload, cost_tokens, cost_usd_cents, depth)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .run(id, missionId, kind, JSON.stringify(payload), cost.tokens, cost.cents, depth);
+  getStmts(sqlite).insertEvent.run(
+    id,
+    missionId,
+    kind,
+    JSON.stringify(payload),
+    cost.tokens,
+    cost.cents,
+    depth,
+  );
   return id;
 }

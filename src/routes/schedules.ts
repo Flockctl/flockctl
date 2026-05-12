@@ -1,13 +1,13 @@
 import { Hono } from "hono";
 import { getDb } from "../db/index.js";
 import { schedules, tasks } from "../db/schema.js";
-import { eq, and, sql, desc, like } from "drizzle-orm";
+import { eq, and, sql, desc, like, type SQL } from "drizzle-orm";
 import { paginationParams } from "../lib/pagination.js";
 import { NotFoundError, ValidationError } from "../lib/errors.js";
-import { parseIdParam } from "../lib/route-params.js";
+import { parseIdParam, parseJsonBodySafe } from "../lib/route-params.js";
 import { schedulerService } from "../services/scheduler.js";
 import { getTemplate, type TemplateScope } from "../services/templates.js";
-import { getScheduleOrThrow } from "../lib/db-helpers.js";
+import { getScheduleOrThrow, requireRow } from "../lib/db-helpers.js";
 
 export const scheduleRoutes = new Hono();
 
@@ -75,7 +75,7 @@ scheduleRoutes.get("/", (c) => {
   const db = getDb();
   const { page, perPage, offset } = paginationParams(c);
 
-  const conditions: any[] = [];
+  const conditions: SQL[] = [];
   const status = c.req.query("status");
   const scheduleType = c.req.query("schedule_type");
 
@@ -119,7 +119,7 @@ scheduleRoutes.get("/:id", (c) => {
 // POST /schedules
 scheduleRoutes.post("/", async (c) => {
   const db = getDb();
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
 
   if (!body.scheduleType) throw new ValidationError("scheduleType is required");
   if (body.scheduleType === "cron" && !body.cronExpression) {
@@ -171,7 +171,7 @@ scheduleRoutes.patch("/:id", async (c) => {
   const id = parseIdParam(c);
   const existing = getScheduleOrThrow(id);
 
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
 
   // Template reference is mutable, but all four columns move together to
   // preserve the CHECK constraint. The caller must supply the full new
@@ -218,7 +218,14 @@ scheduleRoutes.patch("/:id", async (c) => {
     }
   }
 
-  const updated = db.select().from(schedules).where(eq(schedules.id, id)).get();
+  // Re-fetch the post-update row through `requireRow` so a concurrent
+  // DELETE between the UPDATE and this SELECT surfaces a 404 instead
+  // of returning `undefined` as the response body.
+  const updated = requireRow(
+    db.select().from(schedules).where(eq(schedules.id, id)).get(),
+    "Schedule",
+    id,
+  );
   return c.json(updated);
 });
 
@@ -242,7 +249,14 @@ scheduleRoutes.post("/:id/pause", (c) => {
 
   schedulerService.pause(id);
   db.update(schedules).set({ status: "paused", updatedAt: new Date().toISOString() }).where(eq(schedules.id, id)).run();
-  const updated = db.select().from(schedules).where(eq(schedules.id, id)).get();
+  // Re-fetch the post-update row through `requireRow` so a concurrent
+  // DELETE between the UPDATE and this SELECT surfaces a 404 instead
+  // of returning `undefined` as the response body.
+  const updated = requireRow(
+    db.select().from(schedules).where(eq(schedules.id, id)).get(),
+    "Schedule",
+    id,
+  );
   return c.json(updated);
 });
 
@@ -255,7 +269,14 @@ scheduleRoutes.post("/:id/resume", (c) => {
 
   schedulerService.resume(id);
   db.update(schedules).set({ status: "active", updatedAt: new Date().toISOString() }).where(eq(schedules.id, id)).run();
-  const updated = db.select().from(schedules).where(eq(schedules.id, id)).get();
+  // Re-fetch the post-update row through `requireRow` so a concurrent
+  // DELETE between the UPDATE and this SELECT surfaces a 404 instead
+  // of returning `undefined` as the response body.
+  const updated = requireRow(
+    db.select().from(schedules).where(eq(schedules.id, id)).get(),
+    "Schedule",
+    id,
+  );
   return c.json(updated);
 });
 
@@ -287,6 +308,13 @@ scheduleRoutes.post("/:id/trigger", (c) => {
 
   schedulerService.triggerNow(id);
 
-  const updated = db.select().from(schedules).where(eq(schedules.id, id)).get();
+  // Re-fetch the post-update row through `requireRow` so a concurrent
+  // DELETE between the UPDATE and this SELECT surfaces a 404 instead
+  // of returning `undefined` as the response body.
+  const updated = requireRow(
+    db.select().from(schedules).where(eq(schedules.id, id)).get(),
+    "Schedule",
+    id,
+  );
   return c.json(updated);
 });

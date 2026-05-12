@@ -14,9 +14,12 @@ export const queryKeys = {
   workspace: (id: string) => ["workspaces", id] as const,
   workspaceDashboard: (id: string) => ["workspaces", id, "dashboard"] as const,
   workspaceDependencyGraph: (id: string) => ["workspaces", id, "dependency-graph"] as const,
+  workspaceAllowedKeys: (id: string) => ["workspaces", id, "allowed-keys"] as const,
+  workspaceGitStatus: (id: string) => ["workspaces", id, "git-status"] as const,
   projects: ["projects"] as const,
   project: (id: string) => ["projects", id] as const,
   projectTree: (id: string) => ["projects", id, "tree"] as const,
+  projectGitStatus: (id: string) => ["projects", id, "git-status"] as const,
   projectAllowedKeys: (id: string) => ["projects", id, "allowed-keys"] as const,
   generatePlanStatus: (projectId: string) =>
     ["projects", projectId, "generate-plan", "status"] as const,

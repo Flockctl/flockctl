@@ -5,6 +5,7 @@ import { tasks, agentQuestions } from "../../db/schema.js";
 import { eq } from "drizzle-orm";
 import { AppError, NotFoundError, ValidationError } from "../../lib/errors.js";
 import { parseIdParam } from "../../lib/route-params.js";
+import { flattenZodError } from "../../lib/zod-utils.js";
 import { taskExecutor } from "../../services/task-executor/index.js";
 import { getTaskOrThrow } from "../../lib/db-helpers.js";
 
@@ -115,12 +116,7 @@ export function registerTaskQuestions(router: Hono): void {
     const rawBody = await c.req.json().catch(() => ({}));
     const body = questionAnswerBodySchema.safeParse(rawBody);
     if (!body.success) {
-      const details: Record<string, string[]> = {};
-      for (const issue of body.error.issues) {
-        const key = issue.path.length > 0 ? String(issue.path[0]) : "_";
-        (details[key] ||= []).push(issue.message);
-      }
-      throw new AppError(400, "invalid request body", details);
+      throw new AppError(400, "invalid request body", flattenZodError(body.error));
     }
 
     const db = getDb();

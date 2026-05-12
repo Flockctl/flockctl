@@ -51,6 +51,7 @@ function EditWorkspaceTemplateDialog({
     selectedWorkspaceId: template.workspace_id ?? "",
     selectedProjectId: template.project_id ?? "",
     permissionMode: null,
+    isolateWorktree: template.isolation === "worktree",
   });
   const [formError, setFormError] = useState("");
 
@@ -69,6 +70,7 @@ function EditWorkspaceTemplateDialog({
           : null,
       prompt: formValues.prompt.trim() || null,
       timeout_seconds: Number(formValues.timeout) || 300,
+      isolation: formValues.isolateWorktree ? "worktree" : null,
     };
 
     const ref: TemplateRef = {
@@ -87,14 +89,14 @@ function EditWorkspaceTemplateDialog({
   }
 
   return (
-    <DialogContent className="max-w-lg">
+    <DialogContent className="sm:max-w-lg">
       <DialogHeader>
         <DialogTitle>Edit Template</DialogTitle>
         <DialogDescription>
           Update template fields. Name and scope are immutable.
         </DialogDescription>
       </DialogHeader>
-      <form onSubmit={handleSubmit} className="space-y-4">
+      <form onSubmit={handleSubmit} className="space-y-3">
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div className="space-y-2">
             <Label htmlFor="edit-ws-tpl-scope">Scope</Label>
@@ -119,12 +121,11 @@ function EditWorkspaceTemplateDialog({
           onChange={setFormValues}
           idPrefix="edit-ws-tpl"
           hideAgent
+          hideModel
+          hideKey
           hideWorkspaceProject
           keyBeforeModel
         />
-        <p className="text-xs text-muted-foreground">
-          Note: AI key is configured per schedule, not on the template.
-        </p>
         {formError && <p className="text-sm text-destructive">{formError}</p>}
         <DialogFooter>
           <Button type="submit" disabled={updateTemplate.isPending}>
@@ -154,13 +155,13 @@ export function WorkspaceTemplatesSection({
 
   return (
     <div>
-      <div className="flex items-center justify-between mb-4">
-        <h2 className="text-lg font-semibold">Templates</h2>
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-[13px] font-semibold leading-tight">Templates</h2>
         <CreateTemplateDialog
           defaultScope="workspace"
           defaultWorkspaceId={workspaceId}
           lockScope
-          triggerLabel="Create Template"
+          triggerLabel="New template"
           triggerSize="sm"
         />
       </div>

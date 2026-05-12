@@ -1,5 +1,6 @@
 import { AgentSession } from "./agent-session/index.js";
 import type { PermissionRequest, QuestionRequest } from "./agent-session/index.js";
+import { parseQuestionOptions } from "./agent-session/parse-question-options.js";
 import type { PermissionMode } from "./permission-resolver.js";
 import { wsManager } from "./ws-manager.js";
 import { getDb } from "../db/index.js";
@@ -22,6 +23,7 @@ import {
   serializeJournal,
   summarizeJournal,
 } from "./file-edit-journal.js";
+import { startReaper, stopReaper } from "./claude/process-reaper.js";
 
 /**
  * Tracks in-flight chat AgentSessions by chatId. Unlike TaskExecutor, this
@@ -40,6 +42,13 @@ class ChatExecutor {
       const { resumeChatAfterRateLimit } = await import("./chat-rate-limit.js");
       await resumeChatAfterRateLimit(chatId);
     });
+
+    // Periodic reaper for hung `claude` SDK subprocesses. Closes the
+    // "Thinking… forever" bug where AbortController.abort() does not
+    // propagate through the SDK to the spawned binary — see
+    // ./claude/process-reaper.ts for the full root-cause writeup. The interval
+    // is unref'd so it never blocks process exit.
+    startReaper({ intervalMs: 10_000, graceMs: 5_000 });
   }
 
   // Chats that have been claimed (user message persisted + stream endpoint
@@ -341,6 +350,9 @@ class ChatExecutor {
     // Drop in-memory wake-up timers; the persisted `chats.resume_at` survives
     // and `recoverFromDatabase()` re-arms them on the next boot.
     rateLimitScheduler.cancelAll();
+    // Stop the claude-subprocess reaper; the interval is already unref'd so
+    // skipping this is harmless, but we want a clean teardown for tests.
+    stopReaper();
   }
 
   /**
@@ -473,19 +485,9 @@ class ChatExecutor {
     return rows
       .sort((a, b) => (a.createdAt ?? "").localeCompare(b.createdAt ?? ""))
       .map((r) => {
-        let parsedOptions:
-          | Array<{ label: string; description?: string; preview?: string }>
-          | null = null;
-        if (r.options != null) {
-          try {
-            const parsed = JSON.parse(r.options);
-            if (Array.isArray(parsed) && parsed.length > 0) {
-              parsedOptions = parsed;
-            }
-          } catch {
-            parsedOptions = null;
-          }
-        }
+        const rawOptions = parseQuestionOptions(r.options);
+        const parsedOptions =
+          rawOptions && rawOptions.length > 0 ? rawOptions : null;
         return {
           id: r.id,
           requestId: r.requestId,
@@ -585,6 +587,27 @@ export function sweepOrphanedChatQuestions(): number {
     .update(agentQuestions)
     .set({ status: "cancelled", answer: "(question cancelled)", answeredAt: new Date().toISOString() })
     .where(and(eq(agentQuestions.status, "pending"), sql`${agentQuestions.chatId} IS NOT NULL`))
+    .run();
+  return Number(result.changes ?? 0);
+}
+
+/**
+ * Boot-time sweep: chats left with `status='running'` after a crashed
+ * daemon are orphans — the in-memory executor is gone, so the chat
+ * will never transition out of 'running' on its own. Without this
+ * sweep the UI shows the chat as forever-busy and the user can't
+ * send another message. Audit-round-7 finding.
+ *
+ * Mirrors `sweepStaleTasks` in task-executor for tasks. Chats don't
+ * have a cold-resume path, so the orphan state isn't recoverable —
+ * we just transition them back to `idle` so the operator can re-engage.
+ */
+export function sweepOrphanedRunningChats(): number {
+  const db = getDb();
+  const result = db
+    .update(chats)
+    .set({ status: "idle", updatedAt: new Date().toISOString() })
+    .where(eq(chats.status, "running"))
     .run();
   return Number(result.changes ?? 0);
 }

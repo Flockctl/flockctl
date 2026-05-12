@@ -85,6 +85,7 @@ interface CreateOpts {
   label?: string;
   requiresApproval?: boolean;
   permissionMode?: string;
+  isolation?: string;
   json?: boolean;
 }
 
@@ -275,6 +276,12 @@ export function registerTasksCommand(program: Command): void {
       "--permission-mode <mode>",
       "Claude permission mode: default | plan | acceptEdits | bypassPermissions",
     )
+    .option(
+      "--isolation <mode>",
+      "Run in an isolated git worktree under <project>/.flockctl/worktrees/. " +
+        "Currently the only supported value is `worktree`. Falls back silently " +
+        "if the project is not a git repo.",
+    )
     .option("--json", "Print the created row as JSON")
     .action(async (opts: CreateOpts) => {
       try {
@@ -302,6 +309,7 @@ export function registerTasksCommand(program: Command): void {
           ...(opts.label && { label: opts.label }),
           ...(opts.requiresApproval && { requiresApproval: true }),
           ...(opts.permissionMode && { permissionMode: opts.permissionMode }),
+          ...(opts.isolation && { isolation: opts.isolation }),
         };
         const created = await client.post<TaskRow>("/tasks", body);
         if (opts.json) {

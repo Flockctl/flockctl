@@ -170,9 +170,12 @@ describe("chat questions — auxiliary routes", () => {
 
   // ─── GET /chats/:id/questions ─────────────────────────────────────────
   describe("GET /chats/:id/questions", () => {
-    it("400 when path id is invalid", async () => {
+    it("422 when path id is invalid", async () => {
+      // Aligned with the rest of the chat-route suite — `parseIdParam`
+      // throws `ValidationError` (422). The legacy 400 was a deviation
+      // from this endpoint's earlier ad-hoc zod-flatten path.
       const res = await app.request(`/chats/not-a-number/questions`);
-      expect(res.status).toBe(400);
+      expect(res.status).toBe(422);
     });
 
     it("404 when chat does not exist", async () => {

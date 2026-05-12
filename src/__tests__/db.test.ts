@@ -31,11 +31,17 @@ describe("Database connection", () => {
     expect(names).toContain("chat_attachments");
     expect(names).toContain("chat_todos");
     expect(names).toContain("agent_questions");
+    expect(names).toContain("git_audit_log");
+    expect(names).toContain("scheduled_wakeups");
+    expect(names).toContain("fs_audit_log");
+    expect(names).toContain("plan_task_execution_index");
     // FTS5 virtual table for incidents + its 4 shadow tables
     // (incidents_fts_data / idx / docsize / config) are also registered
-    // as tables by SQLite. Total is 18 real + 1 virtual + 4 shadow = 23
-    // (task_templates was removed in migration 0037).
+    // as tables by SQLite. Total is 22 real + 1 virtual + 4 shadow = 27
+    // (task_templates was removed in migration 0037; git_audit_log was
+    // added in migration 0046; scheduled_wakeups in 0047; fs_audit_log
+    // in 0049; plan_task_execution_index in 0062).
     expect(names).toContain("incidents_fts");
-    expect(names).toHaveLength(23);
+    expect(names).toHaveLength(27);
   });
 });

@@ -16,12 +16,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Skeleton } from "@/components/ui/skeleton";
-import {
-  Card,
-  CardHeader,
-  CardTitle,
-  CardContent,
-} from "@/components/ui/card";
+import { FlatCard } from "@/components/design";
 import {
   Dialog,
   DialogContent,
@@ -237,22 +232,30 @@ export function SecretsPanel(props: SecretsPanelProps) {
         : "Available only to this project. Shadows workspace and global secrets with the same name.";
 
   return (
-    <Card>
-      <CardHeader>
+    <FlatCard>
+      <div className="px-4 py-3" data-testid="secrets-panel">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <KeyRound className="h-4 w-4 text-muted-foreground" />
-            <CardTitle>Secrets</CardTitle>
+            <h3 className="text-sm font-semibold">Secrets</h3>
           </div>
-          <Button size="sm" variant="outline" onClick={handleCreate}>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleCreate}
+            data-testid="secrets-add-button"
+          >
             <Plus className="mr-1 h-3.5 w-3.5" /> Add Secret
           </Button>
         </div>
-        <p className="text-xs text-muted-foreground">
-          Encrypted at rest. Reference from MCP env values as <code className="rounded bg-muted px-1">{"${secret:NAME}"}</code>. {scopeHint}
+        <p className="mt-1 text-xs text-muted-foreground">
+          Encrypted at rest. Reference from MCP env values as{" "}
+          <code className="rounded bg-muted px-1">{"${secret:NAME}"}</code>.{" "}
+          {scopeHint}
         </p>
-      </CardHeader>
-      <CardContent className="space-y-4">
+      </div>
+
+      <div className="px-4 py-3 space-y-4">
         {isLoading ? (
           <div className="space-y-2">
             <Skeleton className="h-8 w-full" />
@@ -263,16 +266,40 @@ export function SecretsPanel(props: SecretsPanelProps) {
             No secrets at this scope yet.
           </p>
         ) : (
-          <div className="divide-y rounded-md border">
+          <ul
+            className="divide-y rounded-md border"
+            data-testid="secrets-list"
+            aria-label="Secrets at this scope"
+          >
             {items.map((secret) => (
-              <div key={secret.id} className="flex items-center gap-2 px-3 py-2">
-                <span className="text-sm font-medium font-mono flex-1">{secret.name}</span>
+              <li
+                key={secret.id}
+                className="flex items-center gap-2 px-3 py-2"
+                data-testid={`secret-row-${secret.name}`}
+              >
+                <span className="text-sm font-medium font-mono flex-1">
+                  {secret.name}
+                </span>
                 {secret.description && (
                   <span className="text-xs text-muted-foreground truncate max-w-[45%]">
                     {secret.description}
                   </span>
                 )}
-                <code className="rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+                {/*
+                  SECURITY: the panel never receives or renders the actual
+                  secret value. The API returns metadata only (name +
+                  description); the value is held server-side, encrypted at
+                  rest in `~/.flockctlrc` (chmod 600). What we render here is
+                  the *placeholder reference* string operators paste into MCP
+                  env — this stays plainly visible because it is *not* the
+                  secret. Editing pushes a new value through the dialog;
+                  there is no "reveal" path because there is no value to
+                  reveal in the UI.
+                */}
+                <code
+                  className="rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground"
+                  data-testid={`secret-placeholder-${secret.name}`}
+                >
                   {"${secret:" + secret.name + "}"}
                 </code>
                 <Button
@@ -280,6 +307,8 @@ export function SecretsPanel(props: SecretsPanelProps) {
                   size="icon"
                   className="h-7 w-7"
                   title="Update value or description"
+                  aria-label={`Edit secret ${secret.name}`}
+                  data-testid={`secret-edit-${secret.name}`}
                   onClick={() => handleEdit(secret)}
                 >
                   <Pencil className="h-3.5 w-3.5" />
@@ -288,15 +317,18 @@ export function SecretsPanel(props: SecretsPanelProps) {
                   variant="ghost"
                   size="icon"
                   className="h-7 w-7"
+                  title="Delete secret"
+                  aria-label={`Delete secret ${secret.name}`}
+                  data-testid={`secret-delete-${secret.name}`}
                   onClick={() => handleDelete(secret)}
                 >
                   <Trash2 className="h-3.5 w-3.5 text-destructive" />
                 </Button>
-              </div>
+              </li>
             ))}
-          </div>
+          </ul>
         )}
-      </CardContent>
+      </div>
 
       <SecretDialog
         open={dialogOpen}
@@ -312,6 +344,6 @@ export function SecretsPanel(props: SecretsPanelProps) {
         isPending={deletePending}
         onConfirm={doDelete}
       />
-    </Card>
+    </FlatCard>
   );
 }

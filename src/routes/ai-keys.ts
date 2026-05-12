@@ -4,7 +4,7 @@ import { aiProviderKeys } from "../db/schema.js";
 import { eq, sql, desc } from "drizzle-orm";
 import { paginationParams } from "../lib/pagination.js";
 import { NotFoundError, ValidationError } from "../lib/errors.js";
-import { parseIdParam } from "../lib/route-params.js";
+import { parseIdParam, parseJsonBodySafe } from "../lib/route-params.js";
 import { getAiKeyOrThrow } from "../lib/db-helpers.js";
 // GitHub Copilot is temporarily disabled — the provider implementation still
 // lives under `services/agents/copilot/` but is not auto-registered and is
@@ -109,7 +109,7 @@ aiKeyRoutes.get("/:id/identity", async (c) => {
 // — create key
 aiKeyRoutes.post("/", async (c) => {
   const db = getDb();
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
 
   if (!body.provider) throw new ValidationError("provider is required");
   if (!body.providerType) throw new ValidationError("providerType is required");
@@ -132,7 +132,20 @@ aiKeyRoutes.post("/", async (c) => {
     isActive: body.isActive ?? true,
   }).returning().get();
 
-  return c.json(result, 201);
+  // Redact `keyValue` in the response — audit-round-7 SECURITY finding.
+  // GET/LIST/PATCH already redact, but the POST insert was echoing the
+  // raw plaintext key back to the caller; that's the value a logging
+  // proxy / browser cache / screenshot would capture. Use the same
+  // shape (`PREFIX...SUFFIX`) as the list redaction at L32.
+  return c.json(
+    {
+      ...result,
+      keyValue: result.keyValue
+        ? `${result.keyValue.slice(0, 8)}...${result.keyValue.slice(-4)}`
+        : null,
+    },
+    201,
+  );
 });
 
 // PATCH /keys/:id
@@ -141,7 +154,7 @@ aiKeyRoutes.patch("/:id", async (c) => {
   const id = parseIdParam(c);
   const existing = getAiKeyOrThrow(id);
 
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
   db.update(aiProviderKeys)
     .set({
       ...(body.provider !== undefined && { provider: body.provider }),

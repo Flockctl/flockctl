@@ -190,6 +190,303 @@ export interface GitPullFailure {
 
 export type GitPullResult = GitPullSuccess | GitPullFailure;
 
+// --- Git Status (GET /projects/:id/git-status) ---
+
+/**
+ * Single porcelain entry from `git status` — see `runGitStatus` in
+ * `src/services/git-operations.ts`. `index` and `worktree` are the two
+ * single-character status codes from `git status --porcelain=v1`'s `XY`
+ * pair; the UI renders them as the small leading badge in the Commit
+ * dialog's stage-selection list.
+ */
+export interface GitStatusEntry {
+  path: string;
+  index: string;
+  worktree: string;
+}
+
+export type GitStatusReason =
+  | "ok"
+  | "not_a_repo"
+  | "path_missing"
+  | "unknown";
+
+export interface GitStatusSuccess {
+  ok: true;
+  branch?: string;
+  detached?: boolean;
+  entries: GitStatusEntry[];
+  reason: "ok";
+}
+
+export interface GitStatusFailure {
+  ok: false;
+  reason: GitStatusReason;
+  message?: string;
+}
+
+export type GitStatusResult = GitStatusSuccess | GitStatusFailure;
+
+// --- Git Commit (POST /projects/:id/git-commit) ---
+
+/**
+ * Reason codes for `git commit`. Mirrors the server-side `GitCommitReason`
+ * union in `src/services/git-operations.ts`. The success path always sets
+ * `reason: "ok"`; failure-path values let the UI key copy by failure mode.
+ *
+ * - `ok`             — commit landed; SHA + file count are populated.
+ * - `empty_message`  — commit message was empty / whitespace-only.
+ * - `detached_head`  — committing here would create an orphan commit.
+ * - `unknown_path`   — a `paths` entry was not in `git status`.
+ * - `empty_index`    — nothing to commit after staging.
+ * - `auth_failed`    — git rejected credentials.
+ * - `timeout`        — wall-clock budget exceeded.
+ * - `not_a_repo`     — path exists but has no `.git/`.
+ * - `path_missing`   — the project's path is gone from disk.
+ * - `unknown`        — anything else; raw stderr is preserved verbatim.
+ */
+export type GitCommitReason =
+  | "ok"
+  | "empty_message"
+  | "detached_head"
+  | "unknown_path"
+  | "empty_index"
+  | "auth_failed"
+  | "timeout"
+  | "not_a_repo"
+  | "path_missing"
+  | "unknown";
+
+export interface GitCommitSuccess {
+  ok: true;
+  sha: string;
+  files_committed: number;
+  reason: "ok";
+}
+
+export interface GitCommitFailure {
+  ok: false;
+  reason: GitCommitReason;
+  message?: string;
+  stderr?: string;
+}
+
+export type GitCommitResult = GitCommitSuccess | GitCommitFailure;
+
+/**
+ * Request body for `POST /projects/:id/git-commit`. Mirrors the
+ * server-side `gitCommitBodySchema` (`src/routes/projects.ts`):
+ * message is required (1-4096 bytes); paths are optional (≤ 500 entries,
+ * omit for `git add -A`).
+ */
+export interface GitCommitBody {
+  message: string;
+  paths?: string[];
+}
+
+// --- Git Push (POST /projects/:id/git-push) ---
+
+/**
+ * Reason codes for `git push`. Mirrors the server-side `GitPushReason`
+ * union in `src/services/git-operations.ts`.
+ *
+ * - `ok`                       — push completed (see `updated` to tell
+ *                                if the remote ref moved).
+ * - `auth_failed`              — credentials rejected (SSH key / HTTPS).
+ * - `rejected_non_fast_forward`— remote has commits we don't; needs pull
+ *                                or `force: true`.
+ * - `no_upstream`              — branch has no `@{u}` and `setUpstream`
+ *                                was false.
+ * - `detached_head`            — no branch to push.
+ * - `protected_branch`         — refused to force-push to main/master.
+ * - `timeout`                  — wall-clock budget exceeded.
+ * - `not_a_repo`               — path exists but has no `.git/`.
+ * - `path_missing`             — the project's path is gone from disk.
+ * - `unknown`                  — anything else; raw stderr preserved.
+ */
+export type GitPushReason =
+  | "ok"
+  | "auth_failed"
+  | "rejected_non_fast_forward"
+  | "no_upstream"
+  | "detached_head"
+  | "protected_branch"
+  | "timeout"
+  | "not_a_repo"
+  | "path_missing"
+  | "unknown";
+
+export interface GitPushSuccess {
+  ok: true;
+  branch: string;
+  remote: string;
+  /**
+   * `true` when the push moved the remote ref; `false` when the remote
+   * was already up to date (`Everything up-to-date`).
+   */
+  updated: boolean;
+  reason: "ok";
+}
+
+export interface GitPushFailure {
+  ok: false;
+  /** Resolved when pre-flight got far enough to read it; absent otherwise. */
+  branch?: string;
+  remote?: string;
+  reason: GitPushReason;
+  message?: string;
+  stderr?: string;
+}
+
+export type GitPushResult = GitPushSuccess | GitPushFailure;
+
+/**
+ * Request body for `POST /projects/:id/git-push`. Mirrors the
+ * server-side `gitPushBodySchema` (`src/routes/projects.ts`) — `.strict()`
+ * on the backend rejects unknown fields, so do NOT add new keys here
+ * without updating the route schema in lock-step.
+ *
+ * All fields optional — empty body means `{ remote: 'origin',
+ * setUpstream: false, force: false }`. `force: true` translates to
+ * `--force-with-lease` server-side (NEVER raw `--force`) and is refused
+ * outright on protected branches (main / master).
+ */
+export interface GitPushBody {
+  remote?: string;
+  set_upstream?: boolean;
+  force?: boolean;
+}
+
+// --- Git Log (GET /projects/:id/git-log, GET /workspaces/:id/git-log) ---
+
+/**
+ * Reason codes for `git log`. Mirrors the server-side `GitLogReason` union
+ * in `src/services/git-operations.ts`.
+ *
+ * - `ok`            — happy path; `commits` populated (may be empty for an
+ *                     empty repo).
+ * - `bad_revision`  — caller-supplied cursor / branch is malformed or refers
+ *                     to a non-existent ref.
+ * - `not_a_repo`    — path exists but has no `.git/`.
+ * - `path_missing`  — the entity's path is gone from disk.
+ * - `timeout`       — wall-clock budget exceeded.
+ * - `unknown`       — anything else; raw stderr preserved verbatim.
+ */
+export type GitLogReason =
+  | "ok"
+  | "not_a_repo"
+  | "path_missing"
+  | "bad_revision"
+  | "timeout"
+  | "unknown";
+
+/**
+ * Single commit row. Mirrors `GitLogCommit` in
+ * `src/services/git-operations.ts`. After `apiFetch`'s camelCase →
+ * snake_case key conversion the server's `shortSha` lands as `short_sha`,
+ * so the field names on the wire and in this interface match.
+ */
+export interface GitLogCommit {
+  /** Full 40-char commit SHA (lowercase hex). */
+  sha: string;
+  /** First 7 chars of {@link sha}, pre-computed by the server. */
+  short_sha: string;
+  /** Author name (`%an`). */
+  author: string;
+  /** Author email (`%ae`). */
+  email: string;
+  /** Author timestamp as unix-epoch seconds (`%at`). */
+  ts: number;
+  /** Subject line (first line of the commit message; `%s`). */
+  subject: string;
+  /** Parent SHAs (empty for the root commit; ≥2 for a merge). */
+  parents: string[];
+}
+
+export interface GitLogSuccess {
+  ok: true;
+  commits: GitLogCommit[];
+  /** Next page's starting SHA, or `null` when nothing remains to walk. */
+  next_cursor: string | null;
+  reason: "ok";
+}
+
+export interface GitLogFailure {
+  ok: false;
+  reason: GitLogReason;
+  message?: string;
+  stderr?: string;
+}
+
+export type GitLogResult = GitLogSuccess | GitLogFailure;
+
+/**
+ * Single page of commit history. The hook layer maps this 1:1 from a
+ * {@link GitLogSuccess} response — failures throw out of the query.
+ */
+export interface GitLogPage {
+  commits: GitLogCommit[];
+  next_cursor: string | null;
+}
+
+// --- git-show ------------------------------------------------------------
+//
+// Mirrors the response shape of `GET /:scope/:id/git-show?sha=<sha>`,
+// backed by `runGitShow` in `src/services/git-operations.ts`. After
+// `apiFetch`'s camelCase → snake_case key conversion the server's
+// `oldPath` lands as `old_path`.
+
+export type GitShowReason =
+  | "ok"
+  | "not_a_repo"
+  | "path_missing"
+  | "bad_revision"
+  | "timeout"
+  | "unknown";
+
+/**
+ * Single file row in a commit's diff index. Status enum mirrors the
+ * `--name-status` codes — `M`/`A`/`D`/`R`/`C` plus the rare type-change
+ * (`T`) / unmerged (`U`) variants. `added` / `removed` are zero for
+ * binary files (where git emits `-` `-` in `--numstat`).
+ */
+export interface GitShowFile {
+  /** New path. For renames / copies, the destination side. */
+  path: string;
+  status: "M" | "A" | "D" | "R" | "C" | "T" | "U";
+  added: number;
+  removed: number;
+  /** Old path on a rename / copy; absent otherwise. */
+  old_path?: string;
+}
+
+export interface GitShowCommit {
+  sha: string;
+  parents: string[];
+  author: string;
+  email: string;
+  /** Author timestamp as unix-epoch seconds (`%at`). */
+  ts: number;
+  /** Subject line (`%s`). One line. */
+  message: string;
+}
+
+export interface GitShowSuccess {
+  ok: true;
+  commit: GitShowCommit;
+  files: GitShowFile[];
+  reason: "ok";
+}
+
+export interface GitShowFailure {
+  ok: false;
+  reason: GitShowReason;
+  message?: string;
+  stderr?: string;
+}
+
+export type GitShowResult = GitShowSuccess | GitShowFailure;
+
 // --- Project Allowed Keys (resolved with workspace → project inheritance) ---
 
 /**
@@ -211,8 +508,20 @@ export interface ProjectStats {
   tasks: {
     total: number;
     queued: number;
+    /**
+     * @deprecated Always 0 — backend FSM never produces an `assigned` row,
+     * but `GET /projects/:id/stats` initialises this bucket for backward
+     * compatibility with older clients. The TaskStatus enum no longer
+     * lists `assigned`, so this field is purely wire-format glue.
+     */
     assigned: number;
     running: number;
+    /** Suspend state — task is blocked on AskUserQuestion. Mirrors
+     *  `TaskStatus.waiting_for_input`. Optional for back-compat with API
+     *  responses that omit zero-count buckets. */
+    waiting_for_input?: number;
+    pending_approval?: number;
+    rate_limited?: number;
     completed: number;
     done: number;
     failed: number;

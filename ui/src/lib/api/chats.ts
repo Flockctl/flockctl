@@ -51,6 +51,40 @@ export function fetchChats(params?: {
   return apiFetch<PaginatedResponse<ChatResponse>>(`/chats${query ? `?${query}` : ""}`).then((r) => r.items);
 }
 
+/**
+ * Fetch a single page of `/chats` returning the full envelope (items +
+ * total + page + perPage). Used by the paginated/load-more hook so the
+ * caller can advance an offset cursor without losing the server's total
+ * count.
+ *
+ * `fetchChats` above intentionally drops the envelope because most
+ * callers (entity-scoped lookups, narrow filters) want the items array
+ * only and the surrounding code shouldn't have to spell out
+ * `.then((r) => r.items)` everywhere. Pagination needs the envelope, so
+ * it goes through this helper instead.
+ */
+export function fetchChatsPage(
+  offset: number,
+  limit: number,
+  params?: {
+    projectId?: string;
+    workspaceId?: string;
+    entityType?: string;
+    entityId?: string;
+    q?: string;
+  },
+): Promise<PaginatedResponse<ChatResponse>> {
+  const qs = new URLSearchParams();
+  if (params?.projectId) qs.set("project_id", params.projectId);
+  if (params?.workspaceId) qs.set("workspace_id", params.workspaceId);
+  if (params?.entityType) qs.set("entity_type", params.entityType);
+  if (params?.entityId) qs.set("entity_id", params.entityId);
+  if (params?.q && params.q.trim().length > 0) qs.set("q", params.q.trim());
+  qs.set("offset", String(Math.max(0, Math.trunc(offset))));
+  qs.set("limit", String(Math.max(1, Math.min(100, Math.trunc(limit)))));
+  return apiFetch<PaginatedResponse<ChatResponse>>(`/chats?${qs.toString()}`);
+}
+
 export function fetchEntityChat(projectId: string, entityType: string, entityId: string): Promise<ChatDetailResponse | null> {
   const qs = new URLSearchParams({ project_id: projectId, entity_type: entityType, entity_id: entityId });
   return apiFetch<PaginatedResponse<ChatResponse>>(`/chats?${qs.toString()}`).then((r) => {
@@ -114,8 +148,114 @@ export async function streamMessage(
   });
 }
 
-export function deleteChat(chatId: string): Promise<void> {
-  return apiFetch<void>(`/chats/${chatId}`, { method: "DELETE" });
+export function deleteChat(chatId: string, opts: { force?: boolean } = {}): Promise<void> {
+  const qs = opts.force ? "?force=true" : "";
+  return apiFetch<void>(`/chats/${chatId}${qs}`, { method: "DELETE" });
+}
+
+/**
+ * Server response for `POST /chats/:id/end-session` and `DELETE
+ * /chats/:id/worktree` — same shape, two endpoints (one verb-y, one
+ * RESTful). `removed` is true when the worktree was wiped; `reason`
+ * is one of `clean` / `dirty` / `missing` / `not_a_git_repo` / `forced`.
+ */
+export interface ChatEndSessionResponse {
+  removed: boolean;
+  reason: string;
+  worktreePath: string;
+  worktreeBranch: string;
+}
+
+/**
+ * End the chat's session and wipe its per-chat git worktree (matches
+ * `claude --worktree` exit prompt). Throws `ApiError` 409 with a
+ * `details.reason === "dirty"` body on uncommitted changes when
+ * `force` is unset — the caller can re-issue with `force: true` to
+ * discard.
+ */
+export function endChatSession(
+  chatId: string,
+  opts: { force?: boolean } = {},
+): Promise<ChatEndSessionResponse> {
+  const qs = opts.force ? "?force=true" : "";
+  return apiFetch<ChatEndSessionResponse>(`/chats/${chatId}/end-session${qs}`, {
+    method: "POST",
+  });
+}
+
+/**
+ * Server response for `POST /chats/:id/worktree/apply`. Counterpart to
+ * `endChatSession` — instead of throwing the chat's commits away, lands
+ * them on the project's currently-checked-out branch via `git merge
+ * --no-ff`. The worktree itself is preserved (operator can keep
+ * iterating in the chat, or hit "End session" separately to wipe it).
+ *
+ * `applied: true` covers two reasons:
+ *   - `merged` — a new merge commit landed on the target branch.
+ *   - `already_merged` — source was already an ancestor of HEAD; no-op.
+ *
+ * Failures throw `ApiError` 409 with `details.reason` ∈ { worktree_dirty,
+ * project_dirty, project_detached, conflict, not_a_git_repo }. The UI
+ * branches on `details.reason` to show actionable copy ("commit your
+ * WIP first", "resolve conflicts manually", etc.).
+ */
+export interface ApplyChatWorktreeResponse {
+  applied: boolean;
+  reason: "merged" | "already_merged";
+  source_branch: string;
+  target_branch: string;
+  /** New tip of the target branch after the merge. Always set. */
+  merge_commit?: string;
+}
+
+export function applyChatWorktree(
+  chatId: string,
+): Promise<ApplyChatWorktreeResponse> {
+  return apiFetch<ApplyChatWorktreeResponse>(
+    `/chats/${chatId}/worktree/apply`,
+    { method: "POST" },
+  );
+}
+
+/**
+ * Server response for `POST /chats/batch-delete`. The server reports partial
+ * success honestly — `deleted` may be less than `requested` when some ids
+ * were already gone. `missing` echoes back the ids the server couldn't find,
+ * which lets the UI clear stale rows from local state without a refetch.
+ */
+export interface BatchDeleteChatsResponse {
+  deleted: number;
+  missing: number[];
+  requested: number;
+}
+
+/**
+ * Bulk-delete a set of chats. Modelled as a POST (not a body-bearing DELETE)
+ * because not every HTTP client/proxy forwards a body on DELETE — the server
+ * accepts both shapes for the legacy single-id path but the batch endpoint
+ * is POST-only by design.
+ *
+ * `chatIds` is an array of UI-stringified ids; the helper coerces them to
+ * the numeric ids the backend expects. Empty arrays are rejected client-side
+ * to avoid a guaranteed 422 round-trip.
+ */
+export function batchDeleteChats(
+  chatIds: ReadonlyArray<string>,
+): Promise<BatchDeleteChatsResponse> {
+  if (chatIds.length === 0) {
+    return Promise.reject(new Error("batchDeleteChats: ids must not be empty"));
+  }
+  const ids = chatIds.map((id) => {
+    const n = parseInt(id, 10);
+    if (!Number.isInteger(n) || n <= 0) {
+      throw new Error(`batchDeleteChats: invalid chat id ${id}`);
+    }
+    return n;
+  });
+  return apiFetch<BatchDeleteChatsResponse>("/chats/batch-delete", {
+    method: "POST",
+    body: JSON.stringify({ ids }),
+  });
 }
 
 export function updateChat(chatId: string, data: ChatUpdate): Promise<ChatResponse> {

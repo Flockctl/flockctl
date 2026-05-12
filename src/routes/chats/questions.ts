@@ -5,6 +5,7 @@ import { chats, agentQuestions } from "../../db/schema.js";
 import { eq } from "drizzle-orm";
 import { AppError, NotFoundError, ValidationError } from "../../lib/errors.js";
 import { parseIdParam } from "../../lib/route-params.js";
+import { flattenZodError } from "../../lib/zod-utils.js";
 import { chatExecutor } from "../../services/chat-executor.js";
 import { getChatOrThrow } from "../../lib/db-helpers.js";
 
@@ -12,9 +13,10 @@ import { getChatOrThrow } from "../../lib/db-helpers.js";
 // Mirrors the task route of the same name. 404 means the requestId is
 // unknown or belongs to another chat; 409 means the row was already
 // answered/cancelled; oversize body → 400.
-export const chatQuestionIdParamsSchema = z.object({
-  id: z.coerce.number().int().positive(),
-});
+//
+// The two-param `:id/:requestId` shape still uses a zod schema because we
+// want a single failure envelope across both segments; the single-`:id`
+// listing route goes through `parseIdParam(c)` directly.
 export const chatQuestionAnswerParamsSchema = z.object({
   id: z.coerce.number().int().positive(),
   requestId: z.string().min(1).max(200),
@@ -67,10 +69,7 @@ export function registerChatQuestions(router: Hono): void {
 
   // GET /chats/:id/questions — list pending agent questions for the chat.
   router.get("/:id/questions", (c) => {
-    const params = chatQuestionIdParamsSchema.safeParse({ id: c.req.param("id") });
-    if (!params.success) throw new AppError(400, "invalid chat id");
-    const id = params.data.id;
-
+    const id = parseIdParam(c);
     getChatOrThrow(id);
 
     return c.json({ items: chatExecutor.pendingQuestions(id) });
@@ -90,12 +89,7 @@ export function registerChatQuestions(router: Hono): void {
     const rawBody = await c.req.json().catch(() => ({}));
     const body = chatQuestionAnswerBodySchema.safeParse(rawBody);
     if (!body.success) {
-      const details: Record<string, string[]> = {};
-      for (const issue of body.error.issues) {
-        const key = issue.path.length > 0 ? String(issue.path[0]) : "_";
-        (details[key] ||= []).push(issue.message);
-      }
-      throw new AppError(400, "invalid request body", details);
+      throw new AppError(400, "invalid request body", flattenZodError(body.error));
     }
 
     const db = getDb();

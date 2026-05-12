@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useState } from "react";
 
 type Theme = "light" | "dark" | "system";
 
@@ -46,10 +46,16 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     return () => mq.removeEventListener("change", handler);
   }, [theme]);
 
+  // Memoize the context value so consumers don't re-render on every parent
+  // re-render (setTheme is stable from useState, theme is primitive — only the
+  // wrapping object identity changes per call).
+  const value = useMemo<ThemeContextValue>(
+    () => ({ theme, setTheme }),
+    [theme],
+  );
+
   return (
-    <ThemeContext.Provider value={{ theme, setTheme }}>
-      {children}
-    </ThemeContext.Provider>
+    <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>
   );
 }
 

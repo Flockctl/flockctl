@@ -1,4 +1,4 @@
-import { memo, useEffect, useState, useCallback } from "react";
+import { memo, useEffect, useRef, useState, useCallback } from "react";
 import { X } from "lucide-react";
 import { getApiBaseUrl } from "@/lib/api";
 import type { ChatMessageAttachment } from "@/lib/types";
@@ -32,7 +32,31 @@ export const MessageAttachments = memo(function MessageAttachments({ chatId, att
   const activeAttachment =
     activeId !== null ? attachments.find((a) => a.id === activeId) ?? null : null;
 
-  const closeLightbox = useCallback(() => setActiveId(null), []);
+  // Audit-round-8: focus restoration on close. We capture the element
+  // that opened the lightbox so Tab focus returns there after dismiss,
+  // mirroring native dialog semantics. Without this, focus lands on
+  // `<body>` and keyboard navigation has to rewind from the top.
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+  const closeBtnRef = useRef<HTMLButtonElement | null>(null);
+
+  const closeLightbox = useCallback(() => {
+    setActiveId(null);
+    previousFocusRef.current?.focus?.();
+    previousFocusRef.current = null;
+  }, []);
+
+  // Open: stash the trigger element + send focus to the close button
+  // so the next Tab/Shift+Tab cycle stays trapped within the overlay.
+  // (The overlay only has one focusable control — the X button — so
+  // there's nothing for a full trap to cycle through; focusing the
+  // close button satisfies the "initial focus inside the dialog"
+  // requirement.)
+  useEffect(() => {
+    if (!activeAttachment) return;
+    previousFocusRef.current = (document.activeElement as HTMLElement | null) ?? null;
+    // Defer focus to the next microtask so the close button is mounted.
+    queueMicrotask(() => closeBtnRef.current?.focus());
+  }, [activeAttachment]);
 
   // Escape closes the lightbox — a minimum-viable keyboard affordance that
   // matches what users expect from a gallery overlay. We only bind while the
@@ -85,9 +109,10 @@ export const MessageAttachments = memo(function MessageAttachments({ chatId, att
         >
           <button
             type="button"
-            aria-label="Close"
+            ref={closeBtnRef}
+            aria-label="Close attachment"
             onClick={closeLightbox}
-            className="absolute right-4 top-4 rounded-full bg-black/40 p-1.5 text-white hover:bg-black/60"
+            className="absolute right-4 top-4 rounded-full bg-black/40 p-1.5 text-white hover:bg-black/60 focus:outline-none focus-visible:ring-2 focus-visible:ring-white"
           >
             <X className="h-5 w-5" />
           </button>

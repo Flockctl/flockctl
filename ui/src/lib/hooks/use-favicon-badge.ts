@@ -106,15 +106,24 @@ export function useFaviconBadge(): void {
   useEffect(() => {
     if (!linkRef.current) return;
     if (timerRef.current) clearTimeout(timerRef.current);
+    // Per-effect cancellation flag. The setTimeout fires *after* the
+    // debounce, then awaits `renderBadge`. While the canvas work is
+    // in-flight, `total` can tick again, scheduling a newer render. If
+    // the older render then resolves, it would clobber the newer one's
+    // result on `linkRef.current.href`. The flag is closed-over by
+    // both this effect and its cleanup so the cleanup can mark the
+    // in-flight render as stale.
+    let cancelled = false;
     timerRef.current = setTimeout(async () => {
       const base = originalHrefRef.current ?? BASE_FAVICON;
       const url = await renderBadge(total, base);
-      // The link ref may have been cleared by the unmount cleanup that
-      // ran while this timer was queued; guard against assigning to a
-      // stale reference.
+      // Guard 1: another effect run cancelled this render. Guard 2: the
+      // unmount cleanup nulled the link ref while we were awaiting.
+      if (cancelled) return;
       if (linkRef.current) linkRef.current.href = url;
     }, DEBOUNCE_MS);
     return () => {
+      cancelled = true;
       if (timerRef.current) {
         clearTimeout(timerRef.current);
         timerRef.current = null;

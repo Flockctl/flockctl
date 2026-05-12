@@ -41,12 +41,19 @@ export interface ViewModeToggleProps {
 export function ViewModeToggle({ projectId, className }: ViewModeToggleProps) {
   const [mode, setMode] = useViewMode(projectId);
 
+  // M18/02 — segmented-pill visual: a single rounded container holding
+  // three flush-buttons. The active option lifts via background +
+  // shadow; inactive options stay flat with a hover tint. Behaviour
+  // (URL persistence, "coming soon" badge) is unchanged.
   return (
     <div
       role="group"
       aria-label="View mode"
       data-slot="button-group"
-      className={cn("inline-flex items-center gap-1", className)}
+      className={cn(
+        "inline-flex h-8 items-center rounded-md border bg-muted/30 p-0.5",
+        className,
+      )}
     >
       {OPTIONS.map((opt) => {
         const active = mode === opt.value;
@@ -55,11 +62,17 @@ export function ViewModeToggle({ projectId, className }: ViewModeToggleProps) {
             key={opt.value}
             type="button"
             size="sm"
-            variant={active ? "secondary" : "outline"}
+            variant="ghost"
             aria-pressed={active}
             data-view-mode={opt.value}
             data-active={active ? "true" : undefined}
             onClick={() => setMode(opt.value)}
+            className={cn(
+              "h-7 rounded-sm px-2.5 text-xs transition-colors",
+              active
+                ? "bg-background text-foreground shadow-sm hover:bg-background"
+                : "text-muted-foreground hover:bg-muted hover:text-foreground",
+            )}
           >
             <span>{opt.label}</span>
             {opt.comingSoon ? (

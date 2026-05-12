@@ -4,11 +4,11 @@ import {
   useMemo,
   useRef,
   useState,
+  type ClipboardEvent,
   type DragEvent,
   type ReactNode,
 } from "react";
 import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
 import { Paperclip, Send, Square } from "lucide-react";
 import { AttachmentChip } from "@/components/AttachmentChip";
 import { uploadChatAttachment } from "@/lib/api";
@@ -92,6 +92,27 @@ function makePendingId(): string {
  * chip list. Client-side validation (image MIME, ≤10MB, ≤10 chips) runs
  * before each upload to mirror the server caps. The textarea itself stays
  * in the parent's control so quick-prompt buttons keep working.
+ *
+ * Visual shell follows the M25 "Claude.ai-style" prototype: a rounded-xl card
+ * with `divider-y` border colour, a mono input baseline, arranged as TWO ROWS
+ * inside the same surface — textarea on top, action row on the bottom. The
+ * action row hosts (left → right): paperclip, the toolbar slot
+ * (Key / Model / PermissionMode / Thinking-effort, all rendered as borderless
+ * inline triggers), a flex spacer, then Stop (while streaming) and Send.
+ * Putting the toolbar inside the card means the controls read as "part of
+ * this composer turn" rather than as floating page-level config — and frees
+ * up the vertical space the previous `flex items-center gap-1.5` strip used.
+ *
+ * Keybindings preserved from the pre-redesign composer:
+ *   - Cmd/Ctrl+Enter → submit (queued if a turn is already streaming)
+ *   - Esc            → clear the textarea (does nothing while empty)
+ *   - Tab            → insert a literal tab character; focus is NOT trapped
+ *                      when modifiers are held so Shift+Tab still moves focus
+ *                      out of the composer
+ *   - Paste an image → upload as an attachment (skips the drop-zone path)
+ *   - Cmd/Ctrl+K     → passthrough; the global command palette listens at
+ *                      window scope and we deliberately never `preventDefault`
+ *                      it
  */
 export function ChatComposer({
   chatId,
@@ -185,11 +206,11 @@ export function ChatComposer({
   );
 
   /**
-   * Entry point for every "files just arrived" event (file picker, drop).
-   * Applies client-side validation, seeds a pending chip per accepted file,
-   * and fires the upload. Rejected files surface as a single composer-level
-   * error string — we deliberately do NOT create error chips for rejected
-   * input so the user can't accidentally "remove" them.
+   * Entry point for every "files just arrived" event (file picker, drop,
+   * paste-image). Applies client-side validation, seeds a pending chip per
+   * accepted file, and fires the upload. Rejected files surface as a single
+   * composer-level error string — we deliberately do NOT create error chips
+   * for rejected input so the user can't accidentally "remove" them.
    */
   const ingestFiles = useCallback(
     (files: FileList | File[]) => {
@@ -309,13 +330,78 @@ export function ChatComposer({
   }, [canSend, value, readyAttachmentIds, onChange, onSend]);
 
   const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent) => {
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      // Cmd/Ctrl+K — global command palette. We never `preventDefault` this:
+      // the palette listens at window scope, so the textarea has to let the
+      // event bubble out untouched. Explicit early-return so a future patch
+      // doesn't accidentally fold this branch into the Tab handler below.
+      if (e.key === "k" && (e.ctrlKey || e.metaKey)) {
+        return;
+      }
+
+      // Cmd/Ctrl+Enter — submit (queued if a turn is in flight; the parent's
+      // `handleComposerSend` decides which path to take).
       if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
         e.preventDefault();
         void doSend();
+        return;
+      }
+
+      // Esc — clear the draft. Bare Esc only; Esc+modifiers are reserved for
+      // browser/OS chrome. Doing nothing when the field is already empty
+      // avoids stomping on a parent that might want Esc to close a modal
+      // hosting the composer.
+      if (e.key === "Escape" && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+        if (value.length > 0) {
+          e.preventDefault();
+          onChange("");
+          if (textareaRef.current) textareaRef.current.style.height = "auto";
+        }
+        return;
+      }
+
+      // Tab — insert a literal tab character at the caret. Modifier-held
+      // variants (Shift+Tab, Ctrl+Tab, etc.) fall through so the user can
+      // still escape focus from the composer with the standard shortcut.
+      if (e.key === "Tab" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        e.preventDefault();
+        const el = e.currentTarget;
+        const start = el.selectionStart ?? value.length;
+        const end = el.selectionEnd ?? value.length;
+        const next = value.slice(0, start) + "\t" + value.slice(end);
+        onChange(next);
+        // Reposition the caret after the inserted tab. setSelectionRange has
+        // to run after React flushes the controlled value, so defer it.
+        queueMicrotask(() => {
+          if (textareaRef.current) {
+            textareaRef.current.selectionStart = start + 1;
+            textareaRef.current.selectionEnd = start + 1;
+          }
+        });
+        return;
       }
     },
-    [doSend],
+    [doSend, onChange, value],
+  );
+
+  /**
+   * Paste handler — when the clipboard carries one or more files (typically
+   * a screenshot from Cmd+Shift+4 → Cmd+V), divert them into the attachment
+   * pipeline instead of letting the browser dump base64 into the textarea.
+   * `clipboardData.files` is non-empty for image-bearing clipboards in every
+   * supported browser; if it's empty we leave the event alone so plain-text
+   * paste keeps working.
+   */
+  const handlePaste = useCallback(
+    (e: ClipboardEvent<HTMLTextAreaElement>) => {
+      if (disabled || !chatId) return;
+      const files = e.clipboardData?.files;
+      if (files && files.length > 0) {
+        e.preventDefault();
+        ingestFiles(files);
+      }
+    },
+    [disabled, chatId, ingestFiles],
   );
 
   const handleTextareaChange = useCallback(
@@ -331,7 +417,6 @@ export function ChatComposer({
   return (
     <div className="border-t p-3" data-testid="chat-composer">
       <div className="flex w-full flex-col gap-1.5">
-        {toolbar && <div className="flex items-center gap-1.5">{toolbar}</div>}
         {attachments.length > 0 && (
           <div className="flex flex-wrap gap-1.5" data-testid="chat-composer-chips">
             {attachments.map((a) => (
@@ -348,8 +433,21 @@ export function ChatComposer({
             {globalError}
           </p>
         )}
+        {/*
+          Composer card. M25 redesign — two stacked rows inside one rounded-xl
+          card. Top row is the textarea (full-width, no flanking buttons);
+          bottom row is the action strip with paperclip on the left, the
+          toolbar slot in the middle (Key / Model / PermissionMode / Thinking
+          rendered as borderless inline triggers by the parent), a flex
+          spacer, then Stop (while streaming) and Send on the right.
+
+          The wrapper keeps `rounded-xl border divider-y bg-card` so the card
+          shell still reads the same in light/dark mode and the `divider-y`
+          utility continues to pin border-color to `--border`. The drag-active
+          ring renders on top via `ring-2`.
+        */}
         <div
-          className={`relative flex items-end gap-2 rounded-md transition-colors ${
+          className={`rounded-xl border divider-y bg-card p-2 flex flex-col gap-1 transition-colors ${
             dragActive
               ? "ring-2 ring-primary ring-offset-1 ring-offset-background"
               : ""
@@ -360,18 +458,6 @@ export function ChatComposer({
           onDrop={handleDrop}
           data-testid="chat-composer-dropzone"
         >
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="shrink-0"
-            onClick={handlePaperclip}
-            disabled={disabled || !chatId || attachments.length >= MAX_ATTACHMENTS_PER_MESSAGE}
-            aria-label="Attach file"
-            data-testid="chat-composer-paperclip"
-          >
-            <Paperclip className="h-4 w-4" />
-          </Button>
           <input
             ref={fileInputRef}
             type="file"
@@ -385,48 +471,98 @@ export function ChatComposer({
             onChange={handleFileInputChange}
             data-testid="chat-composer-file-input"
           />
-          <Textarea
+          {/*
+            Plain `<textarea>` rather than the shadcn `<Textarea>` wrapper:
+            the prototype calls for a borderless, transparent, monospace
+            input that flows naturally inside the rounded-xl shell, and the
+            shadcn variant ships with its own border + focus ring that fight
+            this layout. The disabled style mirrors shadcn's so consumers
+            still get the muted feel when `chatId` is null.
+
+            Padded to align visually with the bottom row's icon buttons
+            (px-2 ≈ icon-button left edge), so the placeholder hangs under
+            the same vertical line as the paperclip glyph below.
+          */}
+          <textarea
             ref={textareaRef}
             value={value}
             onChange={handleTextareaChange}
             onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
             placeholder={
               dragActive ? "Drop file to attach…" : placeholder ?? "Type a message..."
             }
             rows={1}
-            className="max-h-32 min-h-[2.5rem] flex-1 resize-none"
+            // `aria-label` so screen readers announce the field purpose
+            // (audit-round-8) — the placeholder isn't sufficient because
+            // it's only narrated when the field is empty. `Chat message`
+            // is the canonical phrasing the rest of the app uses.
+            aria-label="Chat message"
+            className="mono w-full resize-none bg-transparent px-2 pt-1 pb-0.5 text-[13.5px] leading-5 outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed disabled:opacity-50 max-h-32 min-h-[2.5rem]"
             disabled={disabled || !chatId}
             data-testid="chat-composer-textarea"
           />
           {/*
+            Bottom action row. Paperclip + the parent-supplied toolbar slot
+            sit on the left; Stop (while streaming) + Send on the right with
+            a flex spacer in between. Gap is tight (`gap-1`) so a row of 4
+            inline triggers + paperclip still leaves headroom for Stop/Send
+            without wrapping at usable composer widths.
+
             Stop renders alongside Send while a turn streams — not instead of
-            it — so the user can enqueue a follow-up prompt (Send) at the same
-            time they stop the running response (Stop). Esc-equivalent: Stop
-            aborts only the current turn; the queue keeps draining into the
-            next turn.
+            it — so the user can enqueue a follow-up prompt (Send) at the
+            same time they stop the running response (Stop). Esc-equivalent:
+            Stop aborts only the current turn; the queue keeps draining into
+            the next turn.
           */}
-          {isStreaming && (
-            <Button
-              variant="destructive"
-              size="icon"
-              className="shrink-0"
-              onClick={onCancel}
-              data-testid="chat-composer-cancel"
-              aria-label="Stop current response"
-            >
-              <Square className="h-4 w-4" />
-            </Button>
-          )}
-          <Button
-            size="icon"
-            className="shrink-0"
-            disabled={!canSend}
-            onClick={() => void doSend()}
-            data-testid="chat-composer-send"
-            aria-label={isStreaming ? "Queue message" : "Send message"}
+          <div
+            className="flex items-center gap-1"
+            data-testid="chat-composer-actions"
           >
-            <Send className="h-4 w-4" />
-          </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              className="shrink-0"
+              onClick={handlePaperclip}
+              disabled={disabled || !chatId || attachments.length >= MAX_ATTACHMENTS_PER_MESSAGE}
+              aria-label="Attach file"
+              data-testid="chat-composer-paperclip"
+            >
+              <Paperclip className="h-4 w-4" />
+            </Button>
+            {toolbar && (
+              <div
+                className="flex min-w-0 flex-wrap items-center gap-1"
+                data-testid="chat-composer-toolbar"
+              >
+                {toolbar}
+              </div>
+            )}
+            <span className="flex-1" />
+            {isStreaming && (
+              <Button
+                variant="destructive"
+                size="icon-sm"
+                className="shrink-0"
+                onClick={onCancel}
+                data-testid="chat-composer-cancel"
+                aria-label="Stop current response"
+              >
+                <Square className="h-4 w-4" />
+              </Button>
+            )}
+            <Button
+              size="icon-sm"
+              className="shrink-0"
+              disabled={!canSend}
+              onClick={() => void doSend()}
+              data-testid="chat-composer-send"
+              aria-label={isStreaming ? "Queue message" : "Send message"}
+            >
+              <Send className="h-4 w-4" />
+            </Button>
+          </div>
         </div>
         {hint && (
           <span className="text-[10px] text-muted-foreground">{hint}</span>

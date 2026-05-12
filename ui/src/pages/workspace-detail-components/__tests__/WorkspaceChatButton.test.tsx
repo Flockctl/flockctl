@@ -22,6 +22,15 @@ vi.mock("@/pages/workspace-detail-components/WorkspaceTemplatesSection", () => (
 vi.mock("@/components/todo-md-dialog", () => ({
   TodoMdDialog: () => null,
 }));
+// The header now mounts `<GitDropdownButton>`, which calls react-query
+// hooks at the top of its body. This test doesn't supply a
+// QueryClientProvider (the tests below are scoped to the Chat button's
+// chat-creation contract — not the git surface), so we stub the
+// dropdown with a marker. The git dropdown's own behaviour is covered
+// by `src/__tests__/git-dropdown-button.test.tsx`.
+vi.mock("@/components/git/git-dropdown-button", () => ({
+  GitDropdownButton: () => <div data-testid="git-dropdown-stub" />,
+}));
 vi.mock("@/components/confirm-dialog", () => ({
   ConfirmDialog: () => null,
   useConfirmDialog: () => ({

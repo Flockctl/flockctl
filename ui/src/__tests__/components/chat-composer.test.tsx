@@ -204,4 +204,152 @@ describe("ChatComposer", () => {
     renderComposer({ value: "" });
     expect(screen.queryByTestId("attachment-chip")).toBeNull();
   });
+
+  // ---------------------------------------------------------------------------
+  // M25 redesign: two-row composer (textarea on top, action row below) +
+  // keybinding contract
+  // ---------------------------------------------------------------------------
+  // The M25 prototype splits the composer into two stacked rows inside the
+  // same rounded-xl card: textarea on top, paperclip + toolbar slot + Stop /
+  // Send on the bottom. The previous M24 single-row `flex items-end gap-2`
+  // shell is replaced by `flex flex-col gap-1`. The block below pins the new
+  // shape and the keyboard affordances (Esc clear, Tab insert, paste image,
+  // Cmd+K passthrough) — losing any of these is a user-visible regression.
+
+  it("renders the M25 two-row card shell on the dropzone wrapper", () => {
+    renderComposer();
+    const dropzone = screen.getByTestId("chat-composer-dropzone");
+    const cls = dropzone.className;
+    // Container shape pinned by the M25 prototype: a rounded-xl card with
+    // the theme-aware divider-y border, surface bg-card, p-2 padding, and a
+    // `flex flex-col gap-1` stack so the textarea hangs above the action
+    // row instead of sharing it.
+    for (const token of [
+      "rounded-xl",
+      "border",
+      "divider-y",
+      "bg-card",
+      "p-2",
+      "flex",
+      "flex-col",
+      "gap-1",
+    ]) {
+      expect(cls.split(/\s+/)).toContain(token);
+    }
+  });
+
+  it("renders paperclip and Send inside the bottom action row, not a single shared row", () => {
+    renderComposer({ value: "hi" });
+    const actions = screen.getByTestId("chat-composer-actions");
+    // Action row exists as its own element — paperclip + Send must live
+    // here, not as siblings of the textarea. This keeps the textarea full-
+    // width on the top row of the card.
+    expect(actions.contains(screen.getByTestId("chat-composer-paperclip"))).toBe(true);
+    expect(actions.contains(screen.getByTestId("chat-composer-send"))).toBe(true);
+    // Textarea must NOT be inside the action row (regression guard against
+    // accidentally collapsing back to the M24 single-row shape).
+    expect(actions.contains(screen.getByTestId("chat-composer-textarea"))).toBe(false);
+  });
+
+  it("uses a mono textarea baseline", () => {
+    renderComposer();
+    const textarea = screen.getByTestId("chat-composer-textarea");
+    // The `.mono` utility comes from index.css and is what gives the input
+    // the JetBrains-Mono code feel called for in the prototype.
+    expect(textarea.className.split(/\s+/)).toContain("mono");
+  });
+
+  it("clears the textarea when Esc is pressed with content", async () => {
+    const user = userEvent.setup();
+    const { onChange } = renderComposer({ value: "draft" });
+    const textarea = screen.getByTestId("chat-composer-textarea");
+    textarea.focus();
+    await user.keyboard("{Escape}");
+    // Esc resets the controlled value to the empty string. The parent owns
+    // the value, so all we can assert is that the right onChange was fired.
+    expect(onChange).toHaveBeenCalledWith("");
+  });
+
+  it("does not call onChange on Esc when the textarea is already empty", async () => {
+    const user = userEvent.setup();
+    const { onChange } = renderComposer({ value: "" });
+    const textarea = screen.getByTestId("chat-composer-textarea");
+    textarea.focus();
+    await user.keyboard("{Escape}");
+    // No change should fire — the field was empty to begin with. This guard
+    // keeps Esc from "stealing" the keystroke from a parent (e.g. a modal
+    // hosting the composer) that wants to handle it itself.
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("inserts a tab character on Tab without moving focus", async () => {
+    const user = userEvent.setup();
+    const { onChange } = renderComposer({ value: "abc" });
+    const textarea = screen.getByTestId("chat-composer-textarea") as HTMLTextAreaElement;
+    textarea.focus();
+    // Drop the caret at end-of-text so the inserted tab lands after "abc".
+    textarea.setSelectionRange(3, 3);
+    await user.keyboard("{Tab}");
+    // Tab is intercepted: a literal \t is spliced into the controlled value
+    // and focus stays on the textarea (so the user can keep typing). Without
+    // preventDefault the browser would jump focus to the next tabbable.
+    expect(onChange).toHaveBeenCalledWith("abc\t");
+    expect(document.activeElement).toBe(textarea);
+  });
+
+  it("lets Shift+Tab fall through so focus can leave the composer", async () => {
+    const user = userEvent.setup();
+    const { onChange } = renderComposer({ value: "abc" });
+    const textarea = screen.getByTestId("chat-composer-textarea") as HTMLTextAreaElement;
+    textarea.focus();
+    await user.keyboard("{Shift>}{Tab}{/Shift}");
+    // Shift+Tab is the standard "escape this field backwards" shortcut; the
+    // composer must NOT swallow it, so no \t insertion happens.
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("does not preventDefault on Cmd+K so the global palette can claim it", async () => {
+    renderComposer({ value: "" });
+    const textarea = screen.getByTestId("chat-composer-textarea");
+    textarea.focus();
+    // Use a raw KeyboardEvent so we can inspect defaultPrevented after the
+    // React handler runs. userEvent's higher-level helpers don't expose the
+    // event object back to the test.
+    const ev = new KeyboardEvent("keydown", {
+      key: "k",
+      metaKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    textarea.dispatchEvent(ev);
+    expect(ev.defaultPrevented).toBe(false);
+  });
+
+  it("uploads a pasted image instead of dumping it into the textarea", async () => {
+    mockUpload.mockResolvedValueOnce({ id: 88 });
+    renderComposer({ value: "" });
+    const textarea = screen.getByTestId("chat-composer-textarea");
+    const file = new File(["pix"], "screenshot.png", { type: "image/png" });
+
+    // jsdom doesn't ship a working `DataTransfer` constructor, and
+    // `userEvent.paste` only carries text — neither helps us hit the files
+    // branch of the paste handler. Build a minimal duck-typed event the
+    // handler can read: the only properties it touches are
+    // `clipboardData.files` (FileList-like, with a `length` and an iterable
+    // of File entries), so a one-element array masquerading as a FileList
+    // is enough.
+    const fakeFiles = [file] as unknown as FileList;
+    const ev = new Event("paste", { bubbles: true, cancelable: true }) as Event & {
+      clipboardData: { files: FileList };
+    };
+    Object.defineProperty(ev, "clipboardData", { value: { files: fakeFiles } });
+    textarea.dispatchEvent(ev);
+
+    // Once the paste fires, the file goes through `ingestFiles` → an
+    // attachment chip materialises and the upload is requested.
+    await waitFor(() => {
+      expect(screen.getByTestId("attachment-chip")).toBeTruthy();
+    });
+    expect(mockUpload).toHaveBeenCalledTimes(1);
+  });
 });

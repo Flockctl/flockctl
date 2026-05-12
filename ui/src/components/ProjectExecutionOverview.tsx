@@ -302,7 +302,7 @@ export default function ProjectExecutionOverview({ milestones }: ProjectExecutio
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <h2 className="text-lg font-semibold">Execution Overview</h2>
+        <h2 className="text-[13px] font-semibold leading-tight">Execution Overview</h2>
         <div className="flex items-center gap-4 text-xs text-muted-foreground">
           <span>Slices: {stats.completedSlices}/{stats.totalSlices} ({slicePct}%)</span>
           <span>Tasks: {stats.completedTasks}/{stats.totalTasks} ({taskPct}%)</span>

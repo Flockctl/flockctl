@@ -1,4 +1,5 @@
 import { ValidationError } from "../../lib/errors.js";
+import { DEFAULT_DAEMON_PORT } from "../../config/index.js";
 import type { RemoteServerConfig } from "./types.js";
 
 /**
@@ -64,10 +65,14 @@ export function validatePort(value: unknown, label: string): asserts value is nu
 }
 
 /**
- * Default port the remote flockctl daemon listens on.
- * Mirrors the value hard-coded in server-entry.ts / CLAUDE.md.
+ * Re-exported under a tunnel-specific name for readability at call sites
+ * that contrast LOCAL daemon port (the daemon-this-process-is) with the
+ * REMOTE daemon port (the daemon-on-the-other-end-of-the-ssh-tunnel).
+ * Both default to the same number — `DEFAULT_DAEMON_PORT` from
+ * `config/defaults.ts` — but a future split (e.g. distinct dev/prod
+ * defaults) would only have to thread through this one alias.
  */
-const DEFAULT_REMOTE_DAEMON_PORT = 52077;
+const DEFAULT_REMOTE_DAEMON_PORT = DEFAULT_DAEMON_PORT;
 
 /**
  * Build the argv array for `spawn('ssh', …)` that opens a local port-forward

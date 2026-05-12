@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { useAutoExecStatus, useDeleteMilestone } from "@/lib/hooks";
+import { useWsAwarePolling } from "@/lib/global-ws";
+import { ConfirmDialog, useConfirmDialog } from "@/components/confirm-dialog";
 import type { MilestoneTree } from "@/lib/types";
 import { statusBadge } from "@/components/status-badge";
 import {
@@ -34,12 +36,18 @@ export function MilestoneCard({
   onToggleSlice: (id: string) => void;
   onOpenChat?: (entityType: ChatContext["entity_type"], entityId: string, milestoneId: string | undefined, sliceId: string | undefined, title: string) => void;
 }) {
+  const execRefetchInterval = useWsAwarePolling(30_000);
   const { data: execStatus } = useAutoExecStatus(projectId, milestone.id, {
-    refetchInterval: 30_000,
+    refetchInterval: execRefetchInterval,
   });
   const autoExecActive = execStatus?.status === "active";
   const deleteMilestone = useDeleteMilestone(projectId);
   const [readmeOpen, setReadmeOpen] = useState(false);
+  // Audit-round-7: replace window.confirm with the shared ConfirmDialog
+  // so the destructive flow is a proper modal (focus-trapped, escape-
+  // closable, screen-reader friendly) instead of a browser-native popup
+  // that's inconsistent across platforms.
+  const deleteConfirm = useConfirmDialog();
 
   return (
     <Card>
@@ -63,6 +71,7 @@ export function MilestoneCard({
             size="icon"
             className="h-7 w-7"
             title="View README"
+            aria-label={`View README for ${milestone.title}`}
             onClick={() => setReadmeOpen(true)}
           >
             <BookOpen className="h-4 w-4" />
@@ -79,6 +88,7 @@ export function MilestoneCard({
               variant="ghost"
               size="icon"
               className="h-7 w-7"
+              aria-label={`Open chat for milestone ${milestone.title}`}
               onClick={() => onOpenChat("milestone", milestone.id, undefined, undefined, milestone.title)}
             >
               <MessageSquare className="h-4 w-4" />
@@ -89,14 +99,25 @@ export function MilestoneCard({
             variant="ghost"
             size="icon"
             className="h-7 w-7 text-muted-foreground hover:text-destructive"
-            onClick={() => {
-              if (window.confirm(`Delete milestone "${milestone.title}" and all its slices/tasks?`)) {
-                deleteMilestone.mutate(milestone.id);
-              }
-            }}
+            aria-label={`Delete milestone ${milestone.title}`}
+            onClick={() => deleteConfirm.requestConfirm(milestone.id)}
           >
             <Trash2 className="h-4 w-4" />
           </Button>
+          <ConfirmDialog
+            open={deleteConfirm.open}
+            onOpenChange={deleteConfirm.onOpenChange}
+            title="Delete milestone?"
+            description={`Delete "${milestone.title}" and all its slices and tasks? This cannot be undone.`}
+            confirmLabel="Delete"
+            confirmVariant="destructive"
+            isPending={deleteMilestone.isPending}
+            onConfirm={() => {
+              if (deleteConfirm.targetId) {
+                deleteMilestone.mutate(deleteConfirm.targetId);
+              }
+            }}
+          />
         </div>
       </CardHeader>
       {expanded && (

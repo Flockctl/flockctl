@@ -487,7 +487,7 @@ describe("Chats — workspace-aware system prompt (stream handler)", () => {
     expect(names).not.toContain("Orphan");
   });
 
-  it("walks up from chat.projectId to the workspace when chat.workspaceId is null (stream)", async () => {
+  it("does NOT inject workspaceContext for a project-scoped chat (stream) — sibling projects must not leak when the user picked one project in the UI", async () => {
     agentSessionCalls.length = 0;
 
     const projRow = testDb.db
@@ -496,8 +496,9 @@ describe("Chats — workspace-aware system prompt (stream handler)", () => {
       .where(eq(projects.name, "Alpha"))
       .get()!;
 
-    // Only projectId is set — workspaceContext must still resolve via the
-    // project's workspaceId.
+    // Only projectId is set. Even though Alpha belongs to "Demo Workspace",
+    // we deliberately do NOT walk up: a chat opened on a single project must
+    // see only that project, not its siblings (Beta, Orphan).
     const chat = testDb.db
       .insert(chats)
       .values({ projectId: projRow.id })
@@ -513,8 +514,12 @@ describe("Chats — workspace-aware system prompt (stream handler)", () => {
     await res.text();
 
     const ctx = agentSessionCalls[0].opts.workspaceContext;
-    expect(ctx).toBeDefined();
-    expect(ctx.name).toBe("Demo Workspace");
+    expect(ctx).toBeUndefined();
+    // And the rendered system prompt must not carry the workspace_projects
+    // block — that's the user-visible symptom of the leak.
+    const sys = agentSessionCalls[0].opts.systemPromptOverride ?? "";
+    expect(sys).not.toContain("<workspace_projects");
+    expect(sys).not.toContain("Beta");
   });
 
   it("non-stream POST also resolves workspace prompt + workspaceContext", async () => {

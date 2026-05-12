@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
+import { Plus } from "lucide-react";
+import { useWsAwarePolling } from "@/lib/global-ws";
 import {
   useCancelTask,
   useCreateTask,
@@ -33,14 +35,16 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
+  BottomSheet,
+  BottomSheetContent,
+  BottomSheetDescription,
+  BottomSheetFooter,
+  BottomSheetHeader,
+  BottomSheetStages,
+  BottomSheetTitle,
+  BottomSheetTrigger,
+  type StagePill,
+} from "@/components/design";
 
 /**
  * Filters bar + tabular listing for the /tasks page. Extracted from tasks.tsx
@@ -55,7 +59,6 @@ const PAGE_SIZE = 20;
 
 const TASK_STATUS_VALUES: TaskStatus[] = [
   TaskStatus.queued,
-  TaskStatus.assigned,
   TaskStatus.running,
   TaskStatus.done,
   TaskStatus.failed,
@@ -84,9 +87,17 @@ function activeFilterCount(filters: TaskFilters): number {
 }
 
 /**
- * Create-task dialog — trigger button + modal form. Owns its own open state,
- * form values, and submission flow; no props because the /tasks page header
- * only needs it to render inline at the top-right.
+ * Create-task dialog — trigger button + bottom-sheet form. Owns its own
+ * open state, form values, and submission flow; no props because the
+ * /tasks page header only needs it to render inline at the top-right.
+ *
+ * M27 refresh: surface migrated from a centered shadcn Dialog
+ * (`sm:max-w-lg`) to the shared `BottomSheet` primitive — slides up
+ * from the bottom edge of the viewport (~760px wide), with a stage
+ * pills strip (Agent → Settings → Review) and a 2-column body
+ * (form + live "Summary" sidebar). Behaviour is preserved verbatim:
+ * same `useCreateTask` mutation, same defaulting of timeout, same
+ * `__none__` / `__auto__` / `__default__` sentinels for "unset".
  */
 export function CreateTaskDialog() {
   const [open, setOpen] = useState(false);
@@ -119,6 +130,7 @@ export function CreateTaskDialog() {
     if (formValues.selectedProjectId && formValues.selectedProjectId !== "__none__") data.project_id = formValues.selectedProjectId;
     if (formValues.assignedKeyId && formValues.assignedKeyId !== "__auto__") data.assigned_key_id = parseInt(formValues.assignedKeyId);
     if (formValues.permissionMode) data.permission_mode = formValues.permissionMode;
+    if (formValues.isolateWorktree) data.isolation = "worktree";
 
     try {
       await createTask.mutateAsync(data);
@@ -129,31 +141,139 @@ export function CreateTaskDialog() {
     }
   }
 
+  // Stage-pills derived from form state.
+  const agentDone = formValues.agent.trim().length > 0;
+  const promptDone = formValues.prompt.trim().length > 0;
+  const allDone = agentDone;
+  const stages: StagePill[] = [
+    { label: "Agent", state: agentDone ? "done" : "active" },
+    {
+      label: "Settings",
+      state: !agentDone ? "todo" : promptDone ? "done" : "active",
+    },
+    { label: "Review", state: allDone ? "active" : "todo" },
+  ];
+
   return (
-    <Dialog open={open} onOpenChange={(v) => { setOpen(v); if (!v) resetForm(); }}>
-      <DialogTrigger asChild>
-        <Button>Create Task</Button>
-      </DialogTrigger>
-      <DialogContent className="max-w-lg">
-        <DialogHeader>
-          <DialogTitle>Create Task</DialogTitle>
-          <DialogDescription>
+    <BottomSheet open={open} onOpenChange={(v) => { setOpen(v); if (!v) resetForm(); }}>
+      <BottomSheetTrigger asChild>
+        <Button size="sm" data-testid="new-task-trigger">
+          <Plus aria-hidden="true" />
+          New task
+        </Button>
+      </BottomSheetTrigger>
+      <BottomSheetContent className="p-0" data-testid="new-task-dialog">
+        <BottomSheetHeader className="px-6 pt-2 pb-3">
+          <BottomSheetTitle>Create Task</BottomSheetTitle>
+          <BottomSheetDescription>
             Submit a new task to the swarm.
-          </DialogDescription>
-        </DialogHeader>
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <TaskFormFields values={formValues} onChange={setFormValues} idPrefix="ct" />
-          {formError && (
-            <p className="text-sm text-destructive">{formError}</p>
-          )}
-          <DialogFooter>
-            <Button type="submit" disabled={createTask.isPending}>
+          </BottomSheetDescription>
+        </BottomSheetHeader>
+
+        <BottomSheetStages stages={stages} data-testid="ct-stages" />
+
+        <form
+          onSubmit={handleSubmit}
+          className="flex min-h-0 flex-1 flex-col"
+          data-testid="new-task-form"
+        >
+          <div className="grid min-h-0 flex-1 grid-cols-1 sm:grid-cols-[1fr_240px]">
+            <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-6 py-4">
+              <div className="space-y-3">
+                <TaskFormFields values={formValues} onChange={setFormValues} idPrefix="ct" />
+                {formError && (
+                  <p className="text-sm text-destructive" data-testid="new-task-error">
+                    {formError}
+                  </p>
+                )}
+              </div>
+            </div>
+
+            {/* Summary sidebar */}
+            <aside
+              className="hidden border-l border-zinc-200 bg-zinc-50/60 px-4 py-4 sm:flex sm:flex-col dark:border-zinc-800 dark:bg-zinc-900/40"
+              aria-label="Summary"
+            >
+              <p className="text-[10.5px] font-semibold tracking-widest text-zinc-500 uppercase">
+                Summary
+              </p>
+              <dl className="mt-3 space-y-3 text-[11.5px]">
+                <div>
+                  <dt className="text-zinc-500">Agent</dt>
+                  <dd className="mt-0.5 truncate font-medium text-zinc-900 dark:text-zinc-100">
+                    {formValues.agent.trim() || (
+                      <span className="text-zinc-400 italic">required</span>
+                    )}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-zinc-500">Project</dt>
+                  <dd className="mt-0.5 truncate font-medium text-zinc-900 dark:text-zinc-100">
+                    {formValues.selectedProjectId &&
+                    formValues.selectedProjectId !== "__none__" ? (
+                      formValues.selectedProjectId
+                    ) : (
+                      <span className="text-zinc-400 italic">standalone</span>
+                    )}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-zinc-500">Model</dt>
+                  <dd className="mt-0.5 truncate font-medium text-zinc-900 dark:text-zinc-100">
+                    {formValues.model.trim() && formValues.model !== "__default__"
+                      ? formValues.model
+                      : <span className="text-zinc-400 italic">default</span>}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-zinc-500">AI key</dt>
+                  <dd className="mt-0.5 truncate font-medium text-zinc-900 dark:text-zinc-100">
+                    {formValues.assignedKeyId &&
+                    formValues.assignedKeyId !== "__auto__" ? (
+                      `Key #${formValues.assignedKeyId}`
+                    ) : (
+                      <span className="text-zinc-400 italic">auto</span>
+                    )}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-zinc-500">Timeout</dt>
+                  <dd className="mt-0.5 font-mono font-medium text-zinc-900 dark:text-zinc-100">
+                    {Number(formValues.timeout) || 300}s
+                  </dd>
+                </div>
+                {formValues.permissionMode && (
+                  <div>
+                    <dt className="text-zinc-500">Permission</dt>
+                    <dd className="mt-0.5 truncate font-medium text-zinc-900 dark:text-zinc-100">
+                      {formValues.permissionMode}
+                    </dd>
+                  </div>
+                )}
+              </dl>
+
+              <div className="mt-auto border-t border-zinc-200 pt-3 dark:border-zinc-800">
+                <p className="text-[10.5px] font-semibold tracking-widest text-zinc-500 uppercase">
+                  Side-effects
+                </p>
+                <ul className="mt-1.5 space-y-1 text-[10.5px] text-zinc-600 dark:text-zinc-400">
+                  <li>
+                    +1 row in <span className="font-mono">tasks</span>
+                  </li>
+                  <li>queued for the next free agent</li>
+                </ul>
+              </div>
+            </aside>
+          </div>
+
+          <BottomSheetFooter>
+            <Button type="submit" disabled={createTask.isPending} data-testid="new-task-submit">
               {createTask.isPending ? "Creating…" : "Create"}
             </Button>
-          </DialogFooter>
+          </BottomSheetFooter>
         </form>
-      </DialogContent>
-    </Dialog>
+      </BottomSheetContent>
+    </BottomSheet>
   );
 }
 
@@ -172,8 +292,14 @@ export function TasksTableView() {
   const navigate = useNavigate();
   const { data: projects } = useProjects();
 
+  // WS-aware fallback: when the global WS is connected, task_* events
+  // already invalidate the cache through `task-stream.ts` — polling at
+  // 10s on top of that is duplicate work. The helper returns `false`
+  // (no polling) on a connected socket or on a hidden tab, and the
+  // 10s fallback only when the WS is genuinely down.
+  const taskRefetchInterval = useWsAwarePolling(10_000);
   const { data, isLoading, error } = useTasks(offset, PAGE_SIZE, filters, {
-    refetchInterval: 10_000,
+    refetchInterval: taskRefetchInterval,
   });
   const cancelTaskMutation = useCancelTask();
   const rerunTaskMutation = useRerunTask();
@@ -347,7 +473,7 @@ export function TasksTableView() {
         </div>
       </div>
 
-      <div className="mt-6">
+      <div className="mt-4">
         {isLoading && (
           <div className="space-y-2">
             {Array.from({ length: 5 }).map((_, i) => (
@@ -388,10 +514,23 @@ export function TasksTableView() {
               </TableHeader>
               <TableBody>
                 {data.items.map((task) => (
+                  // Audit-round-7 a11y: row acts as a navigational link
+                  // — give it `role="link"`, `tabIndex={0}`, and a
+                  // keyboard handler so users without a mouse can open
+                  // the task. Enter / Space trigger the same navigate.
                   <TableRow
                     key={task.id}
-                    className="cursor-pointer"
+                    role="link"
+                    tabIndex={0}
+                    aria-label={`Open task ${String(task.id).slice(0, 8)}`}
+                    className="cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                     onClick={() => navigate(`/tasks/${task.id}`)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        navigate(`/tasks/${task.id}`);
+                      }
+                    }}
                   >
                     <TableCell>
                       <TaskStatusBadge
@@ -423,7 +562,7 @@ export function TasksTableView() {
                     </TableCell>
                     <TableCell>
                       <div className="flex gap-1" onClick={(e) => e.stopPropagation()}>
-                        {(task.status === "queued" || task.status === "assigned" || task.status === "running") && (
+                        {(task.status === "queued" || task.status === "running") && (
                           <Button
                             variant="ghost"
                             size="sm"

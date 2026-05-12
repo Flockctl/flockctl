@@ -109,3 +109,32 @@ export function cancelTask(taskId: string): Promise<Task> {
 export function rerunTask(taskId: string): Promise<Task> {
   return apiFetch(`/tasks/${taskId}/rerun`, { method: "POST" });
 }
+
+/**
+ * Server response shape for `DELETE /tasks/:id/worktree`. `removed`
+ * indicates whether the worktree directory was actually nuked;
+ * `reason` is one of `clean` / `dirty` / `missing` / `not_a_git_repo`
+ * / `forced`. The `details.reason === "dirty"` 409 path uses the
+ * same enum, so the UI's confirm-dialog flow can switch on the same
+ * field whether the call succeeded or threw.
+ */
+export interface TaskWorktreeRemoveResponse {
+  removed: boolean;
+  reason: string;
+}
+
+/**
+ * Tear down a per-task git worktree. Mirrors `endChatSession` for
+ * tasks. Throws `ApiError` 409 on `details.reason === "dirty"` when
+ * `force` is unset; the caller catches and re-issues with `force:
+ * true` after operator confirmation.
+ */
+export function removeTaskWorktree(
+  taskId: string,
+  opts: { force?: boolean } = {},
+): Promise<TaskWorktreeRemoveResponse> {
+  const qs = opts.force ? "?force=true" : "";
+  return apiFetch<TaskWorktreeRemoveResponse>(`/tasks/${taskId}/worktree${qs}`, {
+    method: "DELETE",
+  });
+}

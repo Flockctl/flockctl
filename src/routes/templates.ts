@@ -21,6 +21,7 @@ import {
   NotFoundError,
   ValidationError,
 } from "../lib/errors.js";
+import { parseJsonBodySafe } from "../lib/route-params.js";
 import {
   createTemplate,
   deleteTemplate,
@@ -110,7 +111,7 @@ templateRoutes.get("/:scope/:name", (c) => {
 // snake_case shape the UI uses (workspace_id, timeout_seconds, …). We
 // normalise here so callers on either side stay ergonomic.
 templateRoutes.post("/", async (c) => {
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
   if (!body || typeof body !== "object") throw new ValidationError("Body is required");
   if (typeof body.name !== "string" || body.name.length === 0) {
     throw new ValidationError("name is required");
@@ -134,6 +135,7 @@ templateRoutes.post("/", async (c) => {
       envVars: body.envVars ?? body.env_vars ?? null,
       timeoutSeconds: body.timeoutSeconds ?? body.timeout_seconds ?? null,
       labelSelector: body.labelSelector ?? body.label_selector ?? null,
+      isolation: parseTemplateIsolation(body),
     });
     return c.json(tpl, 201);
   } catch (err) {
@@ -148,7 +150,7 @@ templateRoutes.patch("/:scope/:name", async (c) => {
   const workspaceId = parseOptionalInt(c.req.query("workspace_id"), "workspace_id");
   const projectId = parseOptionalInt(c.req.query("project_id"), "project_id");
 
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
   if (!body || typeof body !== "object") throw new ValidationError("Body is required");
 
   // Accept both camelCase (workingDir, timeoutSeconds, …) and snake_case
@@ -159,6 +161,7 @@ templateRoutes.patch("/:scope/:name", async (c) => {
   const envVars = "envVars" in body ? body.envVars : body.env_vars;
   const timeoutSeconds = "timeoutSeconds" in body ? body.timeoutSeconds : body.timeout_seconds;
   const labelSelector = "labelSelector" in body ? body.labelSelector : body.label_selector;
+  const hasIsolation = "isolation" in body;
 
   try {
     const updated = updateTemplate(scope, name, { workspaceId, projectId }, {
@@ -171,12 +174,29 @@ templateRoutes.patch("/:scope/:name", async (c) => {
       ...(envVars !== undefined && { envVars }),
       ...(timeoutSeconds !== undefined && { timeoutSeconds }),
       ...(labelSelector !== undefined && { labelSelector }),
+      ...(hasIsolation && { isolation: parseTemplateIsolation(body) }),
     });
     return c.json(updated);
   } catch (err) {
     toTemplateError(err);
   }
 });
+
+/**
+ * Validate the `isolation` field on template create/update bodies.
+ * Mirrors `parseIsolationBody` for tasks/chats but kept inline here so
+ * the templates route doesn't depend on the routes/_isolation.ts
+ * runtime helper (that one is HTTP-shaped — returns
+ * `undefined`/`null`/string and throws ValidationError; here we only
+ * need the value, callers handle key-presence themselves).
+ */
+function parseTemplateIsolation(body: Record<string, unknown>): "worktree" | null {
+  if (!("isolation" in body)) return null;
+  const raw = body.isolation;
+  if (raw === null || raw === undefined || raw === "") return null;
+  if (raw === "worktree") return "worktree";
+  throw new ValidationError(`unknown isolation mode '${String(raw)}' — allowed: worktree`);
+}
 
 // DELETE /templates/:scope/:name
 templateRoutes.delete("/:scope/:name", (c) => {

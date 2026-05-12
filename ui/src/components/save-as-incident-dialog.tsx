@@ -158,13 +158,20 @@ export function SaveAsIncidentDialog({
 
   // Suggestions filter: case-insensitive contains match against the current
   // tag-input draft, excluding tags already picked. Capped at 8 to fit a
-  // compact dropdown without scroll.
+  // compact dropdown without scroll. Set.has + early-break avoids
+  // O(known × picked) work per keystroke.
   const suggestions = useMemo(() => {
     const q = tagInput.trim().toLowerCase();
     if (!q) return [];
-    return knownTags
-      .filter((t) => !tags.includes(t) && t.toLowerCase().includes(q))
-      .slice(0, 8);
+    const pickedSet = new Set(tags);
+    const out: string[] = [];
+    for (const t of knownTags) {
+      if (pickedSet.has(t)) continue;
+      if (!t.toLowerCase().includes(q)) continue;
+      out.push(t);
+      if (out.length >= 8) break;
+    }
+    return out;
   }, [tagInput, knownTags, tags]);
 
   function addTag(raw: string) {
@@ -192,6 +199,16 @@ export function SaveAsIncidentDialog({
     }
     setSaving(true);
     setSaveError(null);
+    // Coerce optional id strings to integers, preserving the `null` sentinel
+    // for "unscoped" so the server-side schema does not have to special-case
+    // NaN. `parseInt` without a radix is technically OK for decimal input,
+    // but ESLint's `radix` rule still flags it; a finite-integer guard is
+    // the only thing that matters for the JSON body.
+    const toIdOrNull = (s: string | undefined | null): number | null => {
+      if (s === null || s === undefined || s === "") return null;
+      const n = Number.parseInt(s, 10);
+      return Number.isFinite(n) ? n : null;
+    };
     try {
       const incident = await createIncident({
         title: trimmedTitle,
@@ -199,8 +216,8 @@ export function SaveAsIncidentDialog({
         rootCause: rootCause.trim() || null,
         resolution: resolution.trim() || null,
         tags: tags,
-        projectId: projectId ? parseInt(projectId) : null,
-        createdByChatId: chatId ? parseInt(chatId) : null,
+        projectId: toIdOrNull(projectId),
+        createdByChatId: toIdOrNull(chatId),
       });
       onCreated?.(incident);
       onOpenChange(false);
@@ -223,7 +240,7 @@ export function SaveAsIncidentDialog({
           </DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-4 py-2">
+        <div className="space-y-3 py-2">
           <div className="space-y-1.5">
             <Label htmlFor="incident-title" className="flex items-center gap-2">
               Title

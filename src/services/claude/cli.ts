@@ -1,6 +1,7 @@
 import { execFileSync, execSync } from "node:child_process";
 import { homedir } from "node:os";
 import { getFlockctlHome } from "../../config/index.js";
+import { listClaudeChildren, markAbort, trackPid } from "./process-reaper.js";
 
 // ─── Tilde expansion ───
 
@@ -145,6 +146,13 @@ export async function* streamViaClaudeAgentSDK(
 
   const hasMcpServers = !!opts.mcpServers && Object.keys(opts.mcpServers).length > 0;
 
+  // Snapshot existing claude PIDs *before* the query so we can attribute the
+  // freshly-spawned subprocess on the abort path. The SDK never exposes its
+  // child handle, so we discover via `ps` and the diff of "claude PIDs that
+  // appeared since this call started". See process-reaper for the full rationale.
+  const pidsBeforeQuery = new Set(listClaudeChildren().map((c) => c.pid));
+  let ourPid: number | null = null;
+
   const queryResult = sdk.query({
     prompt,
     options: {
@@ -162,28 +170,85 @@ export async function* streamViaClaudeAgentSDK(
     },
   });
 
-  for await (const msg of queryResult) {
-    switch (msg.type) {
-      case "stream_event": {
-        const event = msg.event;
-        if (event.type === "content_block_delta" && event.delta?.type === "text_delta") {
-          yield { type: "text", text: event.delta.text };
-        }
-        break;
+  // Watchdog: when the caller aborts, the SDK is *supposed* to kill its
+  // spawned subprocess, but several paths (hung MCP, stdio deadlock,
+  // stream-parser race) leave it running. Mark our PID for the reaper so it
+  // gets SIGTERM/SIGKILL after the grace window, even if the `for await` loop
+  // below never returns. Synchronous via the `abort` event, so the mark lands
+  // BEFORE the SDK's own teardown has a chance to fail.
+  const onAbort = (): void => {
+    /* v8 ignore start — watchdog kill paths exercise live `ps`/`kill`; covered
+       by integration testing rather than unit mocks of the SDK */
+    if (ourPid !== null) {
+      markAbort(ourPid);
+      return;
+    }
+    // PID not discovered yet (abort fired before first message). Try a one-shot
+    // diff now and again on the next tick — beyond that, the periodic reaper
+    // takes over.
+    const tryDiscover = (): void => {
+      const candidates = listClaudeChildren()
+        .filter((c) => !pidsBeforeQuery.has(c.pid))
+        .filter((c) => (opts.resumeSessionId ? c.resumeId === opts.resumeSessionId : true));
+      // Only attribute confidently when there's a single new match. Multiple
+      // matches mean a sibling session spawned concurrently — better to leak
+      // and let the reaper sort it out than to kill someone else's subprocess.
+      if (candidates.length === 1) {
+        const found = candidates[0]!;
+        trackPid(found.pid);
+        markAbort(found.pid);
       }
-      case "result": {
-        yield {
-          type: "done",
-          sessionId: msg.session_id,
-          usage: {
-            inputTokens: msg.usage?.input_tokens ?? 0,
-            outputTokens: msg.usage?.output_tokens ?? 0,
-            totalCostUsd: msg.total_cost_usd ?? 0,
-          },
-        };
-        return;
+    };
+    tryDiscover();
+    setTimeout(tryDiscover, 1_000);
+    /* v8 ignore stop */
+  };
+  controller.signal.addEventListener("abort", onAbort, { once: true });
+
+  try {
+    for await (const msg of queryResult) {
+      // First yielded message means the subprocess is running — discover its
+      // PID via the diff and start tracking. Single-shot because PIDs are
+      // stable for the lifetime of one query.
+      if (ourPid === null) {
+        const newPids = listClaudeChildren().filter((c) => !pidsBeforeQuery.has(c.pid));
+        const matching = opts.resumeSessionId
+          ? newPids.filter((c) => c.resumeId === opts.resumeSessionId)
+          : newPids;
+        if (matching.length === 1) {
+          ourPid = matching[0]!.pid;
+          trackPid(ourPid);
+        }
+      }
+      switch (msg.type) {
+        case "stream_event": {
+          const event = msg.event;
+          if (event.type === "content_block_delta" && event.delta?.type === "text_delta") {
+            yield { type: "text", text: event.delta.text };
+          }
+          break;
+        }
+        case "result": {
+          yield {
+            type: "done",
+            sessionId: msg.session_id,
+            usage: {
+              inputTokens: msg.usage?.input_tokens ?? 0,
+              outputTokens: msg.usage?.output_tokens ?? 0,
+              totalCostUsd: msg.total_cost_usd ?? 0,
+            },
+          };
+          return;
+        }
       }
     }
+  } finally {
+    // Clean-exit safety net — the SDK occasionally returns from its iterator
+    // without killing the spawned subprocess (orphan path #2 in the
+    // process-reaper docstring). Mark for reap so the poller force-kills it
+    // after the grace window. No-op when the SDK already cleaned up: reapNow
+    // detects dead PIDs and untracks without sending a signal.
+    if (ourPid !== null) markAbort(ourPid);
   }
 }
 

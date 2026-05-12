@@ -151,7 +151,7 @@ export function SkillsPanel({
           SKILL.md files at the {level} level. Skills define specialized instructions for AI agents.
         </p>
       </CardHeader>
-      <CardContent className="space-y-4">
+      <CardContent className="space-y-3">
         {inherited.length > 0 && (
           <div className="space-y-1">
             <p className="text-xs font-medium text-muted-foreground">
@@ -258,6 +258,7 @@ export function SkillsPanel({
                       size="icon"
                       className="h-7 w-7"
                       title="Edit skill"
+                      aria-label={`Edit skill ${skill.name}`}
                       onClick={(e) => {
                         e.stopPropagation();
                         handleEdit(skill);
@@ -270,6 +271,7 @@ export function SkillsPanel({
                       size="icon"
                       className="h-7 w-7"
                       title="Delete skill"
+                      aria-label={`Delete skill ${skill.name}`}
                       onClick={(e) => {
                         e.stopPropagation();
                         handleDelete(skill);

@@ -213,6 +213,13 @@ describe("GET /meta", () => {
 describe("/meta/version", () => {
   const originalFetch = globalThis.fetch;
 
+  beforeEach(async () => {
+    // Drop the in-memory version cache between test cases so each swap of
+    // globalThis.fetch is observed fresh by the handler.
+    const metaMod = await import("../../routes/meta.js");
+    metaMod.__resetVersionCacheForTests();
+  });
+
   afterEach(() => {
     globalThis.fetch = originalFetch;
     vi.restoreAllMocks();

@@ -1,23 +1,49 @@
 import type { Hono } from "hono";
 import { getDb } from "../../db/index.js";
-import { tasks, aiProviderKeys, projects } from "../../db/schema.js";
-import { eq, and, sql, desc, gte, lte, like } from "drizzle-orm";
+import { tasks, aiProviderKeys, usageRecords } from "../../db/schema.js";
+import { eq, and, sql, desc, gte, lte, like, inArray, type SQL } from "drizzle-orm";
 import { paginationParams } from "../../lib/pagination.js";
 import { validateTaskTransition, TaskStatus } from "../../lib/types.js";
 import { AppError, NotFoundError, ValidationError } from "../../lib/errors.js";
-import { parseIdParam } from "../../lib/route-params.js";
+import { parseIdParam, parseIdQuery } from "../../lib/route-params.js";
 import { taskExecutor } from "../../services/task-executor/index.js";
+import { resolvePermissionMode } from "../../services/permission-resolver.js";
+import { loadProjectConfig } from "../../services/project-config.js";
+import { loadWorkspaceConfig } from "../../services/workspace-config.js";
 import { wsManager } from "../../services/ws-manager.js";
 import { emitAttentionChanged } from "../../services/attention.js";
 import { findMilestoneBySlice } from "../../services/plan-store/index.js";
-import { execFileSync } from "child_process";
+import { execa } from "execa";
 import { parsePermissionModeBody } from "../_permission-mode.js";
+import { parseIsolationBody } from "../_isolation.js";
 import {
   parseSpecFieldsOrThrow,
   parseJsonOrNull,
   serializeSpec,
 } from "./helpers.js";
-import { getTaskOrThrow } from "../../lib/db-helpers.js";
+import { getTaskOrThrow, getProjectById, getWorkspaceById } from "../../lib/db-helpers.js";
+import { assertSafeWritePath } from "../../lib/safe-fs-path.js";
+
+/**
+ * Correlated subquery: total USD spend for one task across every
+ * `usage_records` row pointing at it. `COALESCE(... , 0)` so a task without
+ * any usage rows reports `0` rather than `null`, letting the UI render
+ * `$0.00` directly without a second-round fallback.
+ *
+ * Centralised here to keep the list and detail endpoints byte-identical;
+ * a drift between them used to be how cost columns desynced after schema
+ * tweaks.
+ */
+const taskCostUsdSubquery = sql<number>`COALESCE((SELECT SUM(total_cost_usd) FROM usage_records WHERE task_id = ${tasks.id}), 0)`;
+
+/**
+ * Subquery for the most-recently-recorded model on a task. Mirrors the
+ * `actualModelUsed` column on the list and detail endpoints. NULL when the
+ * task never produced a usage row (e.g. still queued, failed before a first
+ * turn, or used a provider that does not report usage). Frontend falls back
+ * to `task.model` / "Default".
+ */
+const taskActualModelSubquery = sql<string | null>`(SELECT model FROM usage_records WHERE task_id = ${tasks.id} ORDER BY id DESC LIMIT 1)`;
 
 export function registerTaskList(router: Hono): void {
   // GET /tasks — list with filters
@@ -25,9 +51,9 @@ export function registerTaskList(router: Hono): void {
     const db = getDb();
     const { page, perPage, offset } = paginationParams(c);
 
-    const conditions: any[] = [];
+    const conditions: SQL[] = [];
     const status = c.req.query("status");
-    const projectId = c.req.query("project_id");
+    const projectId = parseIdQuery(c, "project_id");
     const taskType = c.req.query("task_type");
     const label = c.req.query("label");
     const createdAfter = c.req.query("created_after");
@@ -40,7 +66,7 @@ export function registerTaskList(router: Hono): void {
     const includeSuperseded = c.req.query("include_superseded") === "true";
 
     if (status) conditions.push(eq(tasks.status, status));
-    if (projectId) conditions.push(eq(tasks.projectId, parseInt(projectId)));
+    if (projectId !== undefined) conditions.push(eq(tasks.projectId, projectId));
     if (taskType) conditions.push(eq(tasks.taskType, taskType));
     if (label) conditions.push(like(tasks.label, `%${label}%`));
     if (createdAfter) conditions.push(gte(tasks.createdAt, createdAfter));
@@ -64,21 +90,84 @@ export function registerTaskList(router: Hono): void {
 
     const where = conditions.length > 0 ? and(...conditions) : undefined;
 
-    const rows = db.select({
-      task: tasks,
-      assignedKeyLabel: aiProviderKeys.label,
-      // Correlated subquery: most recent model actually used during execution
-      // (from usage_records). NULL when the task never produced a usage record
-      // (e.g. still queued, failed before a first turn, or used a provider that
-      // does not report usage). Frontend falls back to `task.model`/"Default".
-      actualModelUsed: sql<string | null>`(SELECT model FROM usage_records WHERE task_id = ${tasks.id} ORDER BY id DESC LIMIT 1)`,
-    }).from(tasks)
+    // ─── Page query ───
+    //
+    // Audit-round-4: the previous shape used two correlated subqueries
+    // (`taskCostUsdSubquery`, `taskActualModelSubquery`) that fired per
+    // returned row → 2 × perPage = up to 100 extra usage_records scans
+    // per `/tasks` request. We now run the page in three queries:
+    //
+    //   1. The task page itself + assigned-key label (existing query
+    //      minus the correlated columns).
+    //   2. A batched `SUM(total_cost_usd) GROUP BY task_id` over the
+    //      returned task ids — one scan regardless of page size.
+    //   3. A batched "latest model per task" lookup over the same id
+    //      set — one scan, JS picks the first row per task.
+    //
+    // Plus the `count(*)` for total. Total: 4 queries instead of
+    // 2 × perPage + 1. Result shape is byte-identical to the legacy
+    // response.
+    const rows = db
+      .select({
+        task: tasks,
+        assignedKeyLabel: aiProviderKeys.label,
+      })
+      .from(tasks)
       .leftJoin(aiProviderKeys, eq(tasks.assignedKeyId, aiProviderKeys.id))
-      .where(where).orderBy(desc(tasks.createdAt)).limit(perPage).offset(offset).all();
-    const items = rows.map(r => ({
+      .where(where)
+      .orderBy(desc(tasks.createdAt))
+      .limit(perPage)
+      .offset(offset)
+      .all();
+
+    const pageTaskIds = rows
+      .map((r) => r.task.id)
+      .filter((id): id is number => typeof id === "number");
+
+    // Cost aggregation — one query.
+    const costByTask = new Map<number, number>();
+    if (pageTaskIds.length > 0) {
+      const costRows = db
+        .select({
+          taskId: usageRecords.taskId,
+          cost: sql<number>`COALESCE(SUM(${usageRecords.totalCostUsd}), 0)`.as(
+            "cost_usd",
+          ),
+        })
+        .from(usageRecords)
+        .where(inArray(usageRecords.taskId, pageTaskIds))
+        .groupBy(usageRecords.taskId)
+        .all();
+      for (const r of costRows) {
+        if (r.taskId !== null) costByTask.set(r.taskId, r.cost);
+      }
+    }
+
+    // Latest-model lookup — one query ordered (task_id, id DESC) so
+    // the first row per task_id in JS is the latest.
+    const modelByTask = new Map<number, string>();
+    if (pageTaskIds.length > 0) {
+      const modelRows = db
+        .select({
+          taskId: usageRecords.taskId,
+          model: usageRecords.model,
+        })
+        .from(usageRecords)
+        .where(inArray(usageRecords.taskId, pageTaskIds))
+        .orderBy(usageRecords.taskId, desc(usageRecords.id))
+        .all();
+      for (const r of modelRows) {
+        if (r.taskId === null) continue;
+        if (modelByTask.has(r.taskId)) continue;
+        modelByTask.set(r.taskId, r.model);
+      }
+    }
+
+    const items = rows.map((r) => ({
       ...r.task,
       assigned_key_label: r.assignedKeyLabel,
-      actual_model_used: r.actualModelUsed,
+      actual_model_used: modelByTask.get(r.task.id) ?? null,
+      cost_usd: costByTask.get(r.task.id) ?? 0,
     }));
     /* v8 ignore next — SQL count(*) always returns one row, so `?? 0` is unreachable */
     const total = db.select({ count: sql<number>`count(*)` }).from(tasks).where(where).get()?.count ?? 0;
@@ -91,10 +180,10 @@ export function registerTaskStats(router: Hono): void {
   // GET /tasks/stats — aggregated task counts by status
   router.get("/stats", (c) => {
     const db = getDb();
-    const projectId = c.req.query("project_id");
+    const projectId = parseIdQuery(c, "project_id");
 
-    const conditions: any[] = [];
-    if (projectId) conditions.push(eq(tasks.projectId, parseInt(projectId)));
+    const conditions: SQL[] = [];
+    if (projectId !== undefined) conditions.push(eq(tasks.projectId, projectId));
     const where = conditions.length > 0 ? and(...conditions) : undefined;
 
     const rows = db.select({
@@ -193,7 +282,8 @@ export function registerTaskGetById(router: Hono): void {
     const row = db.select({
       task: tasks,
       assignedKeyLabel: aiProviderKeys.label,
-      actualModelUsed: sql<string | null>`(SELECT model FROM usage_records WHERE task_id = ${tasks.id} ORDER BY id DESC LIMIT 1)`,
+      actualModelUsed: taskActualModelSubquery,
+      costUsd: taskCostUsdSubquery,
     }).from(tasks)
       .leftJoin(aiProviderKeys, eq(tasks.assignedKeyId, aiProviderKeys.id))
       .where(eq(tasks.id, id)).get();
@@ -216,6 +306,7 @@ export function registerTaskGetById(router: Hono): void {
       ...row.task,
       assigned_key_label: row.assignedKeyLabel,
       actual_model_used: row.actualModelUsed,
+      cost_usd: row.costUsd,
       children,
       ...serializeSpec(row.task),
     };
@@ -244,8 +335,18 @@ export function registerTaskCreate(router: Hono): void {
   // POST /tasks — create and queue
   router.post("/", async (c) => {
     const db = getDb();
-    const body = await c.req.json();
+    const body = await c.req.json().catch(() => ({}));
     if (!body.prompt && !body.promptFile) throw new ValidationError("prompt or promptFile is required");
+    // Path-safety (audit-round-7 SECURITY finding): the task executor
+    // later does `mkdirSync(workingDir, { recursive: true })` and uses
+    // workingDir as cwd for `execa("git", ...)` + the agent session.
+    // Without this guard a POST `{ workingDir: "/etc/foo" }` would
+    // create directories under privileged paths. `assertSafeWritePath`
+    // rejects system directories and absolute traversal — same gate
+    // POST /projects + POST /workspaces use.
+    if (typeof body.workingDir === "string" && body.workingDir.length > 0) {
+      assertSafeWritePath(body.workingDir);
+    }
     if ("disabledSkills" in body) {
       throw new ValidationError("disabledSkills removed — task-level disable is no longer supported; set at workspace or project level");
     }
@@ -260,6 +361,13 @@ export function registerTaskCreate(router: Hono): void {
       ...(body.acceptanceCriteria !== undefined && { acceptanceCriteria: body.acceptanceCriteria }),
       ...(body.decisionTable !== undefined && { decisionTable: body.decisionTable }),
     });
+    // Isolation mode (added in migration 0060). Accepts the explicit
+    // `'worktree'` opt-in or null/undefined for legacy shared-cwd
+    // behaviour. Rejects any other string up front so the DB never holds
+    // a value the executor doesn't know how to honour. Future modes
+    // (`'container'`, `'sandbox'`, …) extend this set without a
+    // CHECK-drop migration — the column itself is just `TEXT NULL`.
+    const isolation = parseIsolationBody(body);
     const newTask = db.insert(tasks).values({
       projectId: body.projectId ?? null,
       prompt: body.prompt ?? null,
@@ -275,6 +383,7 @@ export function registerTaskCreate(router: Hono): void {
       assignedKeyId: body.assignedKeyId ?? null,
       requiresApproval: body.requiresApproval ?? false,
       ...(createPerm !== undefined && { permissionMode: createPerm }),
+      ...(isolation !== undefined && { isolation }),
       ...(spec.acceptanceCriteria !== undefined && {
         acceptanceCriteria: spec.acceptanceCriteria === null ? null : JSON.stringify(spec.acceptanceCriteria),
       }),
@@ -312,6 +421,31 @@ export function registerTaskPatch(router: Hono): void {
       .run();
 
     const updated = db.select().from(tasks).where(eq(tasks.id, id)).get();
+
+    // Variant-B live propagation (parity with chats PATCH): if the PATCH
+    // touched `permission_mode` AND the task has an in-flight AgentSession,
+    // push the new EFFECTIVE mode (task → project → workspace → "auto")
+    // into the running session. This is what lets the user flip
+    // `default` → `bypassPermissions` while an agent is blocked on a
+    // permission prompt and have the pending prompt auto-resolve instead
+    // of waiting for the next turn. The DB PATCH already handles the
+    // "next turn" case on its own; this block is purely about the CURRENT
+    // turn. We skip the work when no session is running.
+    if (permissionMode !== undefined && updated && taskExecutor.isRunning(id)) {
+      const projectRecord = updated.projectId ? getProjectById(updated.projectId) : null;
+      const workspaceRecord = projectRecord?.workspaceId
+        ? getWorkspaceById(projectRecord.workspaceId)
+        : null;
+      const projectConfig = projectRecord?.path ? loadProjectConfig(projectRecord.path) : {};
+      const workspaceConfig = workspaceRecord?.path ? loadWorkspaceConfig(workspaceRecord.path) : {};
+      const effective = resolvePermissionMode({
+        task: updated.permissionMode,
+        project: projectConfig.permissionMode,
+        workspace: workspaceConfig.permissionMode,
+      });
+      taskExecutor.updatePermissionMode(id, effective);
+    }
+
     return c.json(updated);
   });
 }
@@ -350,7 +484,7 @@ export function registerTaskPut(router: Hono): void {
       const isEmpty = !mergedCriteria || mergedCriteria.length === 0;
 
       if (isEmpty && existing.targetSliceSlug && existing.projectId != null) {
-        const project = db.select().from(projects).where(eq(projects.id, existing.projectId)).get();
+        const project = getProjectById(existing.projectId);
         /* v8 ignore next — the `!project?.path` branch fires only when the project row was deleted between fetch-and-check or its path column is null; both states are prevented by FK + NOT NULL constraints on the schema */
         if (project?.path) {
           const milestone = findMilestoneBySlice(project.path, existing.targetSliceSlug);
@@ -433,6 +567,9 @@ export function registerTaskRerun(router: Hono): void {
       targetSliceSlug: original.targetSliceSlug,
       permissionMode: original.permissionMode,
       envVars: original.envVars,
+      // Inherit isolation intent — the rerun gets its own fresh
+      // worktree (different task id ⇒ different branch / path).
+      isolation: original.isolation,
     }).returning().get();
 
     /* v8 ignore next — `.returning().get()` on a just-inserted row is always defined in better-sqlite3 */
@@ -497,7 +634,9 @@ export function registerTaskApproval(router: Hono): void {
     if (task.gitCommitBefore && task.workingDir) {
       /* v8 ignore start — rollback exec depends on real git repo state */
       try {
-        execFileSync("git", ["checkout", task.gitCommitBefore, "--", "."], { cwd: task.workingDir });
+        await execa("git", ["checkout", task.gitCommitBefore, "--", "."], {
+          cwd: task.workingDir,
+        });
       } catch { /* rollback failed — continue */ }
       /* v8 ignore stop */
     }

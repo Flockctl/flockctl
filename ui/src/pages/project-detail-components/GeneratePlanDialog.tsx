@@ -164,8 +164,8 @@ export function GeneratePlanDialog({ projectId }: { projectId: string }) {
     >
       <DialogTrigger asChild>
         <Button size="sm">
-          <Sparkles className="mr-1 h-4 w-4" />
-          Generate Plan
+          <Sparkles aria-hidden="true" />
+          Generate plan
         </Button>
       </DialogTrigger>
       <DialogContent className="sm:max-w-xl">
@@ -264,12 +264,12 @@ export function GeneratePlanDialog({ projectId }: { projectId: string }) {
             >
               {generatePlan.isPending ? (
                 <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  <Loader2 className="animate-spin" aria-hidden="true" />
                   Starting...
                 </>
               ) : (
                 <>
-                  <Sparkles className="mr-1 h-4 w-4" />
+                  <Sparkles aria-hidden="true" />
                   Generate
                 </>
               )}

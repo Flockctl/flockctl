@@ -130,4 +130,48 @@ describe("auto-executor — dedupe branches for non-terminal exec statuses", () 
 
     rmSync(projPath, { recursive: true, force: true });
   });
+
+  /*
+   * Regression for the "stopAutoExecution waits up to 1000 ms for the next
+   * poll tick" bug. Prior code only checked `state.running` inside the
+   * 1000 ms-cadence setInterval, so a cancel could sit unnoticed for almost
+   * a full second. The fix wires `state.abortController.signal` directly
+   * to the executePlanTask Promise — abort fires synchronously through
+   * `addEventListener("abort", ...)` and rejects in the next microtask.
+   *
+   * We assert that with no fake-timer advances at all (i.e. zero polling
+   * ticks have run), the auto-execution still settles. If the polling were
+   * the only cancellation path, the Promise would hang forever here.
+   */
+  it("stopAutoExecution cancels executePlanTask without waiting for the next poll tick", async () => {
+    const projPath = mkdtempSync(join(tmpdir(), "ae-stop-fast-"));
+    const proj = db.insert(projects).values({ name: `p-stop-fast-${Date.now()}`, path: projPath }).returning().get()!;
+    const m = createMilestone(projPath, { title: "M" });
+    const s = createSlice(projPath, m.slug, { title: "S" });
+    createPlanTask(projPath, m.slug, s.slug, { title: "T" });
+
+    // Mock execute as a no-op so the task never reaches a terminal state.
+    (taskExecutor.execute as any).mockImplementation(() => {});
+
+    // Real timers — we deliberately do NOT advance any fake clock. The
+    // cancellation must come from AbortController, not from a poll tick.
+    const p = startAutoExecution(proj.id, projPath, m.slug);
+
+    // Yield a microtask so executeMilestone → executeSlice → executePlanTask
+    // has a chance to reach the polling Promise body. Then abort.
+    await Promise.resolve();
+    await Promise.resolve();
+    stopAutoExecution(m.slug);
+
+    // The Promise must settle on the abort signal without any setInterval
+    // tick firing. If this hangs, the cancellation regression has returned.
+    await Promise.race([
+      p,
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("auto-execution did not cancel within 500 ms")), 500),
+      ),
+    ]);
+
+    rmSync(projPath, { recursive: true, force: true });
+  });
 });

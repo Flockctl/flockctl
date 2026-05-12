@@ -15,7 +15,8 @@
  *    `DaemonError` exposes `statusCode` and `details` so commands can render a
  *    helpful message without re-parsing JSON.
  */
-import { getConfiguredTokens } from "../config/index.js";
+import { DEFAULT_DAEMON_PORT, getConfiguredTokens } from "../config/index.js";
+import { isLoopbackBindHost } from "../middleware/remote-auth.js";
 
 export interface DaemonClientOptions {
   host?: string;
@@ -45,10 +46,6 @@ export class DaemonError extends Error {
   }
 }
 
-function isLoopback(host: string): boolean {
-  return host === "127.0.0.1" || host === "::1" || host === "localhost";
-}
-
 function resolveBaseUrl(opts: DaemonClientOptions): { baseUrl: string; host: string } {
   const host =
     opts.host ??
@@ -56,7 +53,7 @@ function resolveBaseUrl(opts: DaemonClientOptions): { baseUrl: string; host: str
     "127.0.0.1";
   const port =
     opts.port ??
-    (process.env.FLOCKCTL_PORT ? parseInt(process.env.FLOCKCTL_PORT, 10) : 52077);
+    (process.env.FLOCKCTL_PORT ? parseInt(process.env.FLOCKCTL_PORT, 10) : DEFAULT_DAEMON_PORT);
   return { baseUrl: `http://${host}:${port}`, host };
 }
 
@@ -64,7 +61,11 @@ function resolveToken(host: string, explicit: string | undefined): string | null
   if (explicit) return explicit;
   if (process.env.FLOCKCTL_TOKEN) return process.env.FLOCKCTL_TOKEN;
   // Loopback works without a token — don't send one unless caller asked for it.
-  if (isLoopback(host)) return null;
+  // Uses the same `isLoopbackBindHost` check as `security-gate.ts` so the
+  // CLI client and the daemon's bind-safety gate agree on what counts as
+  // local (127.0.0.1 / ::1 / localhost — but NOT 0.0.0.0 / ::, which are
+  // any-interface binds).
+  if (isLoopbackBindHost(host)) return null;
   const tokens = getConfiguredTokens();
   return tokens[0]?.token ?? null;
 }

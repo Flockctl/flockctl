@@ -11,6 +11,7 @@ import {
   nextOrder,
   dedupeSlug,
   toSlug,
+  assertSafePlanSlug,
 } from "./md-io.js";
 import { parseMissionId } from "./schema.js";
 
@@ -106,6 +107,7 @@ export function listMilestones(projectPath: string): MilestoneData[] {
 }
 
 export function getMilestone(projectPath: string, slug: string): MilestoneData | null {
+  assertSafePlanSlug(slug, "milestone slug");
   const mdPath = join(getPlanDir(projectPath), slug, "milestone.md");
   if (!existsSync(mdPath)) return null;
   const { frontmatter, body } = parseMd(mdPath);
@@ -153,6 +155,7 @@ export function createMilestone(projectPath: string, data: Partial<MilestoneData
 }
 
 export function updateMilestone(projectPath: string, slug: string, data: Partial<MilestoneData>): MilestoneData {
+  assertSafePlanSlug(slug, "milestone slug");
   const existing = getMilestone(projectPath, slug);
   if (!existing) throw new Error(`Milestone not found: ${slug}`);
 
@@ -169,6 +172,7 @@ export function updateMilestone(projectPath: string, slug: string, data: Partial
 }
 
 export function deleteMilestone(projectPath: string, slug: string): void {
+  assertSafePlanSlug(slug, "milestone slug");
   const dir = join(getPlanDir(projectPath), slug);
   if (!existsSync(dir)) throw new Error(`Milestone not found: ${slug}`);
   rmSync(dir, { recursive: true, force: true });

@@ -53,13 +53,20 @@ function DialogContent({
 }: React.ComponentProps<typeof DialogPrimitive.Content> & {
   showCloseButton?: boolean
 }) {
+  // No default `sm:max-w-*` here — consumer classes like `max-w-2xl` (no
+  // breakpoint prefix) are emitted *before* a default `sm:max-w-sm` in the
+  // generated stylesheet, so the prefixed default would silently win at
+  // ≥640px and shrink every dialog back to 384px. Each callsite is expected
+  // to declare its own width class (`sm:max-w-lg`, `max-w-xl sm:max-w-xl`,
+  // etc.). The `max-w-[calc(100%-2rem)]` floor below still keeps mobile
+  // dialogs from running off-screen if a consumer forgets to set a cap.
   return (
     <DialogPortal>
       <DialogOverlay />
       <DialogPrimitive.Content
         data-slot="dialog-content"
         className={cn(
-          "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
+          "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-xl bg-popover p-4 text-sm text-popover-foreground ring-1 ring-foreground/10 duration-100 outline-none data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
           className
         )}
         {...props}

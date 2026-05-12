@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { apiFetch, getApiBaseUrl, getAuthHeaders } from "@/lib/api";
+import { apiFetch, ApiError, getApiBaseUrl, getAuthHeaders } from "@/lib/api";
 import {
   setActiveServerId,
   setServerMap,
@@ -211,6 +211,62 @@ describe("apiFetch — error handling", () => {
       new Response("<html>oops</html>", { status: 500, statusText: "Server" }),
     );
     await expect(apiFetch("/x")).rejects.toThrow(/Server|API error 500/);
+  });
+
+  // Regression: the chat-with-worktree delete bug came from `apiFetch`
+  // throwing a plain `Error` that dropped both `status` and `details`.
+  // The 409→`force=true` retry handshake (chat delete + end-session)
+  // narrows on these fields, so they MUST survive the throw or the
+  // dirty-worktree confirm prompt never fires and the operator sees
+  // "ничего не происходит" — the exact symptom this fix addresses.
+  it("throws ApiError carrying status + details on 409 dirty-worktree", async () => {
+    (globalThis as any).fetch = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error:
+            "Chat worktree has uncommitted changes — pass ?force=true to discard",
+          details: {
+            reason: "dirty",
+            worktreePath: "/proj/.flockctl/worktrees/c-1",
+            worktreeBranch: "flockctl/c-1",
+          },
+        }),
+        { status: 409, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    let caught: unknown;
+    try {
+      await apiFetch("/chats/c-1");
+    } catch (e) {
+      caught = e;
+    }
+
+    expect(caught).toBeInstanceOf(ApiError);
+    const err = caught as ApiError;
+    expect(err).toBeInstanceOf(Error); // backwards-compat: still an Error
+    expect(err.status).toBe(409);
+    expect(err.details).toMatchObject({ reason: "dirty" });
+    expect(err.message).toMatch(/uncommitted changes/);
+  });
+
+  it("ApiError.details is undefined when the server omits it (e.g. 422)", async () => {
+    (globalThis as any).fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: "bad input" }), {
+        status: 422,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    let caught: unknown;
+    try {
+      await apiFetch("/x");
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(ApiError);
+    expect((caught as ApiError).status).toBe(422);
+    expect((caught as ApiError).details).toBeUndefined();
   });
 });
 

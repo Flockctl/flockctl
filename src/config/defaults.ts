@@ -1,5 +1,21 @@
 import { loadRc, saveRc } from "./paths.js";
 
+/**
+ * The TCP port the local daemon binds to by default. Used by the CLI
+ * (`flockctl start --port`), the daemon entry point, the daemon HTTP
+ * client, and the SSH tunnel builder for the remote-port assumption.
+ *
+ * Hard-coded to 52077 because:
+ *   1. The daemon is single-tenant per host — there's no fleet of
+ *      daemons that needs distinct ports.
+ *   2. `${secret:NAME}` placeholder URLs in `.flockctlrc` and the
+ *      `flockctl-host` MCP server hard-code this number; changing it
+ *      here without a migration would silently break user configs.
+ *
+ * Override at runtime via the `--port` CLI flag or `FLOCKCTL_PORT` env.
+ */
+export const DEFAULT_DAEMON_PORT = 52077;
+
 export function getDefaultModel(): string {
   return loadRc().defaultModel ?? "claude-sonnet-4-6";
 }

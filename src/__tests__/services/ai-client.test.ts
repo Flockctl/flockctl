@@ -443,3 +443,156 @@ describe("createAIClient.chat — AskUserQuestion bridge wiring", () => {
     expect(result.content[0]!.text).toBe("user picked option A");
   });
 });
+
+// ─── Regression: chat 372 — Anthropic image-dimension error left a chat
+// hung forever with `isRunning=true`. Root cause: the `result` message
+// branch in client.ts returned the SDK's error text as a normal chat
+// response, then waited for the next SDK message that never came (the
+// subprocess sat in stream-json input mode with stdout open, blocking the
+// for-await iterator). The fix detects `is_error` / `subtype: 'error_*'`
+// on result messages, throws so the caller's catch path runs, and breaks
+// out of the for-await on every result so a non-closing stream can never
+// pin us forever.
+describe("createAIClient.chat — error result handling (chat 372 regression)", () => {
+  it("throws when the SDK reports `is_error: true` on a result message", async () => {
+    // Reproduces the exact shape Anthropic returned for chat 372 — the API
+    // rejected the request because too many large images had accumulated in
+    // the conversation history. The SDK packages this as a result with
+    // is_error=true and the error text in `result`.
+    mockQuery.mockImplementationOnce(() => asStream([
+      {
+        type: "result",
+        is_error: true,
+        subtype: "error_during_execution",
+        result: "An image in the conversation exceeds the dimension limit for many-image requests (2000px). Start a new session with fewer images.",
+        session_id: "sess-372",
+        total_cost_usd: 0,
+        usage: {},
+      },
+    ]));
+
+    const client = createAIClient();
+    await expect(
+      client.chat({
+        model: "claude-opus-4-7",
+        system: "",
+        messages: [{ role: "user", content: "look at this screenshot" }],
+      }),
+    ).rejects.toThrow(/image in the conversation exceeds the dimension limit/);
+  });
+
+  it("throws on result messages whose subtype starts with `error_`", async () => {
+    // Covers the other error subtypes the SDK declares: error_max_turns,
+    // error_max_budget_usd, error_max_structured_output_retries. Without the
+    // is_error flag we still detect the error via the subtype prefix so a
+    // missing flag (older SDK build) doesn't silently swallow the failure.
+    mockQuery.mockImplementationOnce(() => asStream([
+      {
+        type: "result",
+        subtype: "error_max_turns",
+        result: "Max turns reached",
+        session_id: "sess-x",
+        total_cost_usd: 0,
+        usage: {},
+      },
+    ]));
+
+    const client = createAIClient();
+    await expect(
+      client.chat({
+        model: "m",
+        system: "",
+        messages: [{ role: "user", content: "x" }],
+      }),
+    ).rejects.toThrow(/Max turns reached/);
+  });
+
+  it("falls back to the subtype name when the SDK error result has no message body", async () => {
+    // Defensive: if the SDK ever ships an error result with empty `result`,
+    // the thrown Error must still carry a usable label so the SSE error
+    // frame and any logs aren't blank.
+    mockQuery.mockImplementationOnce(() => asStream([
+      {
+        type: "result",
+        is_error: true,
+        subtype: "error_during_execution",
+        result: "",
+        session_id: "sess-x",
+        total_cost_usd: 0,
+        usage: {},
+      },
+    ]));
+
+    const client = createAIClient();
+    await expect(
+      client.chat({
+        model: "m",
+        system: "",
+        messages: [{ role: "user", content: "x" }],
+      }),
+    ).rejects.toThrow(/SDK error_during_execution/);
+  });
+
+  it("breaks out of the for-await after a successful result message", async () => {
+    // Without the explicit break, a stream that yields the terminal `result`
+    // and then sits idle (stream-json input mode keeps stdin open between
+    // turns) would block the iterator on `next()` forever — exactly what
+    // chat 372 hit. This test wraps the stream so iteration past `result`
+    // would throw, proving we never advance past it.
+    let advancedPastResult = false;
+    mockQuery.mockImplementationOnce(() => {
+      async function* gen() {
+        yield {
+          type: "result",
+          result: "ok",
+          session_id: "sess-x",
+          total_cost_usd: 0,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        };
+        // If client.ts forgets to break, the for-await pulls another
+        // message and trips this flag — the test then fails with a clear
+        // signal instead of timing out.
+        advancedPastResult = true;
+        yield { type: "assistant", message: { content: [{ type: "text", text: "ghost" }] } };
+      }
+      return gen();
+    });
+
+    const client = createAIClient();
+    const result = await client.chat({
+      model: "m",
+      system: "",
+      messages: [{ role: "user", content: "x" }],
+    });
+
+    expect(result.text).toBe("ok");
+    expect(advancedPastResult).toBe(false);
+  });
+
+  it("forwards the caller's AbortSignal into the SDK's abortController", async () => {
+    // Without this wiring, calling `cancel` on the chat fired our outer
+    // AbortSignal but never reached the SDK — so a hung `for await ...
+    // next()` could not be unblocked, and `POST /chats/:id/cancel` was a
+    // no-op. The regression test checks the wiring at the option-pass
+    // boundary: aborting our signal must abort the SDK's controller.
+    let captured: any;
+    mockQuery.mockImplementationOnce((opts: any) => {
+      captured = opts;
+      return asStream([{ type: "result", result: "", session_id: "s", total_cost_usd: 0, usage: {} }]);
+    });
+
+    const ctrl = new AbortController();
+    const client = createAIClient();
+    await client.chat({
+      model: "m",
+      system: "",
+      messages: [{ role: "user", content: "x" }],
+      abortSignal: ctrl.signal,
+    });
+
+    expect(captured.options.abortController).toBeInstanceOf(AbortController);
+    expect(captured.options.abortController.signal.aborted).toBe(false);
+    ctrl.abort();
+    expect(captured.options.abortController.signal.aborted).toBe(true);
+  });
+});

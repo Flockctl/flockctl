@@ -44,7 +44,7 @@ export function WorkspaceTemplatesSchedulesTab({
   workspaceId: string;
 }) {
   return (
-    <div className="space-y-6" data-testid="workspace-templates-schedules-tab">
+    <div className="space-y-4" data-testid="workspace-templates-schedules-tab">
       <WorkspaceTemplatesSection workspaceId={workspaceId} />
       <Separator />
       <SchedulesStub />

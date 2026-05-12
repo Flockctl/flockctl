@@ -58,9 +58,11 @@ interface StreamEvent {
 /**
  * Reasoning effort levels surfaced by the Claude Agent SDK. Mirrors the
  * SDK's `EffortLevel` type so consumers don't have to import from the SDK
- * directly. `high` is the pre-toggle default.
+ * directly. `xhigh` is the default; the SDK silently falls back to `high`
+ * on models that don't support it (Opus 4.7 is the only one that does
+ * today — see the SDK docs).
  */
-export type EffortLevel = "low" | "medium" | "high" | "max";
+export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 
 interface ChatOptions {
   model: string;
@@ -81,8 +83,9 @@ interface ChatOptions {
    */
   thinkingEnabled?: boolean;
   /**
-   * Reasoning effort level. Defaults to `"high"` when omitted — byte-
-   * identical to the pre-toggle behavior. The SDK guides thinking depth
+   * Reasoning effort level. Defaults to `"xhigh"` when omitted — the SDK
+   * gracefully degrades to `"high"` on models that don't support xhigh
+   * (everything other than Opus 4.7 today). The SDK guides thinking depth
    * from this value when adaptive thinking is enabled.
    */
   effort?: EffortLevel;
@@ -257,11 +260,11 @@ export function createAIClient(options?: { configDir?: string }): AIClient {
         disallowedTools.push(ASK_USER_QUESTION_BUILTIN_NAME);
       }
       const hasMcpServers = Object.keys(mergedMcpServers).length > 0;
-      // Thinking / effort resolution — both default to the pre-toggle
-      // behavior (adaptive thinking on, effort `high`) so existing callers
-      // and existing DB rows (where the columns are NULL / default) are
-      // byte-identical to the previous SDK invocation.
-      const effort: EffortLevel = opts.effort ?? "high";
+      // Thinking / effort resolution — adaptive thinking defaults on,
+      // effort defaults to `xhigh` (the SDK transparently falls back to
+      // `high` on models that don't support xhigh, so existing DB rows
+      // with a NULL effort still produce a valid SDK invocation).
+      const effort: EffortLevel = opts.effort ?? "xhigh";
       const thinkingEnabled = opts.thinkingEnabled ?? true;
       const queryOpts: Record<string, any> = {
         model: opts.model,
@@ -286,6 +289,52 @@ export function createAIClient(options?: { configDir?: string }): AIClient {
         queryOpts.env = { ...process.env, CLAUDE_CONFIG_DIR: dir };
       }
 
+      // Wire the caller's AbortSignal into the SDK's `query()` via an
+      // AbortController. WHY: the per-message check in the for-await loop
+      // below only fires *between* SDK messages — if the iterator is blocked
+      // on `next()` waiting for output the subprocess will never produce
+      // (e.g. an API error left the SDK in a "waiting on stdin" state under
+      // stream-json input mode), the caller's `cancel` propagates nowhere
+      // and the chat hangs. Forwarding into the SDK's own abortController
+      // gives the SDK a chance to tear down the subprocess synchronously.
+      // Mirrors the wiring in `streamViaClaudeAgentSDK` (claude/cli.ts).
+      const sdkAbortController = new AbortController();
+      if (opts.abortSignal) {
+        if (opts.abortSignal.aborted) {
+          sdkAbortController.abort();
+        } else {
+          opts.abortSignal.addEventListener("abort", () => sdkAbortController.abort(), { once: true });
+        }
+      }
+      queryOpts.abortController = sdkAbortController;
+
+      // Snapshot existing claude PIDs *before* the query so we can attribute
+      // the freshly-spawned subprocess to *this* call. The SDK never exposes
+      // its child handle, so we discover via `ps`. Used by the process-reaper
+      // to SIGKILL hung subprocesses on abort or after a clean iterator
+      // return — same belt-and-suspenders pattern as `streamViaClaudeAgentSDK`.
+      // Without this, a subprocess that ignores SIGTERM (or that the SDK
+      // never killed in the first place) lingers indefinitely after the
+      // chat row is unregistered. Production hit: chat 372 sat hung for
+      // 9+ hours with `isRunning=true` after an Anthropic image-dimension
+      // error left the SDK iterator pending forever.
+      const { listClaudeChildren, trackPid, markAbort } = await import(
+        "../claude/process-reaper.js"
+      );
+      const pidsBeforeQuery = new Set(listClaudeChildren().map((c) => c.pid));
+      let ourPid: number | null = null;
+      // If the caller aborts before we even discover the PID, do a one-shot
+      // diff later inside the for-await loop. After that fallback the periodic
+      // reaper takes over.
+      const onAbort = (): void => {
+        /* v8 ignore start — abort-during-pre-discovery branch needs a real
+           subprocess + a precisely-timed AbortSignal; covered by integration
+           paths, not unit-tested. */
+        if (ourPid !== null) markAbort(ourPid);
+        /* v8 ignore stop */
+      };
+      sdkAbortController.signal.addEventListener("abort", onAbort, { once: true });
+
       const stream = query({
         prompt: promptForSDK,
         options: queryOpts,
@@ -305,6 +354,28 @@ export function createAIClient(options?: { configDir?: string }): AIClient {
           if (opts.abortSignal?.aborted) {
             throw new DOMException("Task cancelled", "AbortError");
           }
+          // First yielded message means the subprocess is running — discover
+          // its PID via the diff and start tracking. Single-shot because PIDs
+          // are stable for the lifetime of one query. Best-effort: if we can't
+          // attribute uniquely (sibling chat spawned a sub at the same instant)
+          // we leak this one to the periodic reaper rather than risk killing
+          // someone else's subprocess.
+          /* v8 ignore start — PID discovery branch only fires for live SDK
+             subprocesses; unit tests mock `query()` so no `ps`-visible child
+             ever exists, and the reaper module is unavailable in test env. */
+          if (ourPid === null) {
+            try {
+              const newPids = listClaudeChildren().filter((c) => !pidsBeforeQuery.has(c.pid));
+              const matching = opts.resumeSessionId
+                ? newPids.filter((c) => c.resumeId === opts.resumeSessionId)
+                : newPids;
+              if (matching.length === 1) {
+                ourPid = matching[0]!.pid;
+                trackPid(ourPid);
+              }
+            } catch { /* `ps` failure — let the periodic reaper handle cleanup */ }
+          }
+          /* v8 ignore stop */
           // Eagerly surface the session_id from the FIRST SDK message that
           // carries one (system `init`, first `assistant`, etc.). This is the
           // fix for "context lost after make reinstall" — without it, we only
@@ -395,11 +466,12 @@ export function createAIClient(options?: { configDir?: string }): AIClient {
               toolName: (message as any).tool_name,
             });
           } else if (message.type === "result") {
-            resultText = (message as any).result ?? "";
+            const resultMsg = message as any;
+            resultText = resultMsg.result ?? "";
             // Terminal result's session_id is the authoritative post-turn id
             // (the SDK may fork on resume). Overwrite the eagerly-captured
             // value from the first assistant/system message.
-            sessionId = (message as any).session_id ?? sessionId;
+            sessionId = resultMsg.session_id ?? sessionId;
             // NOTE: result.usage and result.total_cost_usd from Claude Agent SDK
             // describe only the LAST turn, not the full session. Keep the values
             // accumulated from assistant messages above, which sum across all turns.
@@ -422,6 +494,36 @@ export function createAIClient(options?: { configDir?: string }): AIClient {
                 totalCostUsd,
               },
             });
+            // Surface SDK error results as thrown errors so the caller's
+            // try/catch path runs and the chat unregisters cleanly.
+            //
+            // The SDK packages provider failures (Anthropic 4xx like
+            // "image exceeds 2000px dimension limit", max-turns/max-budget
+            // ceilings, MCP step failures) as `{ type: 'result',
+            // is_error: true, subtype: 'error_*', result: '<message>' }`.
+            // Without this branch we previously copied `result` into
+            // `resultText`, returned it as if it were a normal assistant
+            // response, and the run "succeeded" with the error string as
+            // its body — see the production hit on chat 372 where the
+            // Anthropic image-dimension error landed as a plain assistant
+            // message. Now it propagates as a real Error and the SSE
+            // handler emits a typed `error:` frame instead of pretending
+            // the agent said "Start a new session with fewer images."
+            const isErrorResult = resultMsg.is_error === true
+              || (typeof resultMsg.subtype === "string" && resultMsg.subtype.startsWith("error_"));
+            if (isErrorResult) {
+              const subtypeStr = typeof resultMsg.subtype === "string" ? resultMsg.subtype : "error";
+              throw new Error(resultText || `SDK ${subtypeStr}`);
+            }
+            // Per the SDK protocol the `result` message is terminal — break
+            // out so a subprocess that doesn't close stdout (stream-json
+            // input mode keeps stdin open between turns; an orphan SDK that
+            // already finished its turn but never got SIGTERM) can NOT pin
+            // the iterator on `next()` forever. Without this break, the
+            // for-await blocks indefinitely whenever the SDK lingers past
+            // its terminal `result` message, which is exactly the path
+            // that left chat 372 hung for 9+ hours with isRunning=true.
+            break;
           }
         }
       } catch (err) {
@@ -430,6 +532,18 @@ export function createAIClient(options?: { configDir?: string }): AIClient {
            the plain-Error AbortError branch exists for older Node fallbacks. */
         if (err instanceof Error && err.name === "AbortError") throw err;
         throw new Error(`AI stream error: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        // Clean-exit safety net: even when the for-await returned without
+        // anyone calling abort, the SDK occasionally leaves the spawned
+        // subprocess running (orphan path #2 in the process-reaper docstring).
+        // Marking for reap on every exit — not just abort — guarantees the
+        // subprocess is reaped within `graceMs`. No-op when the SDK already
+        // cleaned up: `reapNow` detects dead PIDs and untracks without
+        // sending a signal.
+        /* v8 ignore next 2 — `ourPid` is only set when a real claude
+           subprocess was discovered via `ps`; unit tests with mocked SDK
+           never populate it, so this safety net only runs in production. */
+        if (ourPid !== null) markAbort(ourPid);
       }
 
       // Tag session with [FLOCKCTL] prefix in Claude Code UI

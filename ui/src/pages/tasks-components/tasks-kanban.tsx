@@ -1,6 +1,7 @@
-import { useMemo } from "react";
+import { memo, useCallback, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import { useProjects, useTasks } from "@/lib/hooks";
+import { useWsAwarePolling } from "@/lib/global-ws";
 import { TaskStatus } from "@/lib/types";
 import type { Project, Task } from "@/lib/types";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -27,7 +28,7 @@ const KANBAN_COLUMNS: readonly {
   {
     key: "queued",
     label: "Queued",
-    matchStatuses: [TaskStatus.queued, TaskStatus.assigned],
+    matchStatuses: [TaskStatus.queued],
   },
   {
     key: "running",
@@ -51,6 +52,16 @@ const KANBAN_COLUMNS: readonly {
   },
 ] as const;
 
+// Module-scope status→column lookup. KANBAN_COLUMNS is static so we can
+// pre-flatten it once at module init; previously every render walked the
+// columns array via `.find(... includes(...))` for every task — O(tasks × cols
+// × statuses-per-col). Now lookup is O(1) per task.
+const STATUS_TO_COLUMN_KEY: ReadonlyMap<string, string> = new Map(
+  KANBAN_COLUMNS.flatMap((col) =>
+    col.matchStatuses.map((s) => [s as string, col.key] as const),
+  ),
+);
+
 /**
  * Cross-project kanban: pulls every task across every project (capped at 200
  * to keep the swimlanes from collapsing under a huge backfill) and groups
@@ -67,8 +78,12 @@ const KANBAN_COLUMNS: readonly {
 export function TasksKanbanView() {
   const navigate = useNavigate();
   const { data: projects } = useProjects();
+  // WS-aware polling — see tasks-table.tsx for rationale. Kanban shares
+  // the same task_* WS channel for live updates; polling is duplicate
+  // work when the socket is up.
+  const taskRefetchInterval = useWsAwarePolling(10_000);
   const { data, isLoading, error } = useTasks(0, 200, undefined, {
-    refetchInterval: 10_000,
+    refetchInterval: taskRefetchInterval,
   });
 
   const projectLabels = useMemo<Record<string, string>>(() => {
@@ -82,22 +97,26 @@ export function TasksKanbanView() {
   const tasks = data?.items ?? [];
 
   // Bucket tasks into the configured columns. Anything with a status that
+  // Stable callback so KanbanTaskCard's `memo` actually hits — without
+  // useCallback every parent render would allocate a fresh function
+  // and break the memo on every card (audit-round-5).
+  const handleTaskClick = useCallback(
+    (taskId: string) => navigate(`/tasks/${taskId}`),
+    [navigate],
+  );
+
   // isn't claimed by any column falls into "Other" so we never silently drop
   // rows on a schema bump.
   const { columnsWithTasks, otherTasks } = useMemo(() => {
-    const claimed = new Set<string>();
     const buckets: Record<string, Task[]> = {};
     for (const col of KANBAN_COLUMNS) {
       buckets[col.key] = [];
-      for (const s of col.matchStatuses) claimed.add(s);
     }
     const other: Task[] = [];
     for (const t of tasks) {
-      const col = KANBAN_COLUMNS.find((c) =>
-        (c.matchStatuses as readonly string[]).includes(t.status),
-      );
-      if (col) buckets[col.key]?.push(t);
-      else if (!claimed.has(t.status)) other.push(t);
+      const colKey = STATUS_TO_COLUMN_KEY.get(t.status);
+      if (colKey !== undefined) buckets[colKey]?.push(t);
+      else other.push(t);
     }
     return { columnsWithTasks: buckets, otherTasks: other };
   }, [tasks]);
@@ -139,7 +158,7 @@ export function TasksKanbanView() {
             columnKey={col.key}
             tasks={colTasks}
             projectLabels={projectLabels}
-            onTaskClick={(t) => navigate(`/tasks/${t.id}`)}
+            onTaskClick={handleTaskClick}
           />
         );
       })}
@@ -149,7 +168,7 @@ export function TasksKanbanView() {
           columnKey="other"
           tasks={otherTasks}
           projectLabels={projectLabels}
-          onTaskClick={(t) => navigate(`/tasks/${t.id}`)}
+          onTaskClick={handleTaskClick}
         />
       )}
     </div>
@@ -166,7 +185,10 @@ interface KanbanColumnProps {
   columnKey: string;
   tasks: Task[];
   projectLabels: Record<string, string>;
-  onTaskClick: (task: Task) => void;
+  /** Receives the task id so the parent's `useCallback` can stay
+   *  reference-stable across renders. See KanbanTaskCardProps for the
+   *  same rationale at the leaf. */
+  onTaskClick: (taskId: string) => void;
 }
 
 function KanbanColumn({
@@ -205,7 +227,10 @@ function KanbanColumn({
               projectLabel={
                 task.project_id ? projectLabels[task.project_id] : undefined
               }
-              onClick={() => onTaskClick(task)}
+              // KanbanTaskCard binds task.id inside via useCallback; we
+              // can forward the parent's stable id-callback straight
+              // through without allocating a new closure per render.
+              onClick={onTaskClick}
             />
           ))
         )}
@@ -225,10 +250,22 @@ function KanbanColumn({
 interface KanbanTaskCardProps {
   task: Task;
   projectLabel?: string | null;
-  onClick: () => void;
+  /**
+   * Called with the card's task id when clicked. Audit-round-5 change:
+   * accept the id rather than a bound `() => void` so the parent can
+   * memoise this callback once (instead of allocating a fresh arrow
+   * per task on every render of the column). Combined with `memo`,
+   * tasks whose status hasn't changed skip the re-render entirely.
+   */
+  onClick: (taskId: string) => void;
 }
 
-function KanbanTaskCard({ task, projectLabel, onClick }: KanbanTaskCardProps) {
+const KanbanTaskCard = memo(function KanbanTaskCard({
+  task,
+  projectLabel,
+  onClick,
+}: KanbanTaskCardProps) {
+  const handleClick = useCallback(() => onClick(task.id), [onClick, task.id]);
   const modelDisplay = task.actual_model_used ?? task.model ?? "Default";
   return (
     <Card
@@ -236,7 +273,7 @@ function KanbanTaskCard({ task, projectLabel, onClick }: KanbanTaskCardProps) {
       data-testid="tasks-kanban-card"
       data-task-id={task.id}
       className="cursor-pointer hover:bg-muted/40"
-      onClick={onClick}
+      onClick={handleClick}
     >
       <CardContent className="space-y-1.5">
         <div className="flex items-center gap-2">
@@ -271,4 +308,4 @@ function KanbanTaskCard({ task, projectLabel, onClick }: KanbanTaskCardProps) {
       </CardContent>
     </Card>
   );
-}
+});

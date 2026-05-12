@@ -1,4 +1,11 @@
-import { lstatSync, readFileSync, realpathSync, statSync } from "fs";
+import {
+  closeSync,
+  lstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+  statSync,
+} from "fs";
 import { join } from "path";
 
 export type LayerName = "user" | "workspace-public" | "project-public";
@@ -195,19 +202,34 @@ function readLayerSafely(
     }
   }
 
-  let buf: Buffer;
+  // Read at most PER_LAYER_CAP bytes — previously we slurped the entire
+  // file then truncated post-hoc, so a multi-MB AGENTS.md (operator dumped
+  // logs into it) would pin that much memory per session bootstrap. Now we
+  // cap the read itself: open fd, stat for the real size, read up to
+  // PER_LAYER_CAP into a fixed buffer, close.
+  let fd: number;
   try {
-    buf = readFileSync(path);
+    fd = openSync(path, "r");
   } catch {
     return null;
   }
-  const originalBytes = buf.byteLength;
-  if (originalBytes === 0) return null;
+  let originalBytes: number;
+  let bytesRead: number;
+  const buf = Buffer.allocUnsafe(PER_LAYER_CAP);
+  try {
+    originalBytes = statSync(path).size;
+    bytesRead = readSync(fd, buf, 0, PER_LAYER_CAP, 0);
+  } catch {
+    try { closeSync(fd); } catch { /* defensive */ }
+    return null;
+  }
+  try { closeSync(fd); } catch { /* defensive */ }
+  if (originalBytes === 0 || bytesRead === 0) return null;
 
   let content: string;
   let truncated = false;
   if (originalBytes > PER_LAYER_CAP) {
-    const keptUtf8 = buf.slice(0, PER_LAYER_CAP).toString("utf8");
+    const keptUtf8 = buf.subarray(0, bytesRead).toString("utf8");
     // `Buffer.slice(bytes).toString("utf8")` may leave a dangling multibyte
     // at the end; `toString` replaces it with U+FFFD. Strip any trailing U+FFFD
     // so the truncation marker starts on a clean line.
@@ -217,7 +239,7 @@ function readLayerSafely(
       `\n<!-- flockctl:truncated layer=${layer} original_bytes=${originalBytes} reason=per-layer-cap -->`;
     truncated = true;
   } else {
-    content = buf.toString("utf8");
+    content = buf.subarray(0, bytesRead).toString("utf8");
   }
 
   return { content, originalBytes, truncated };

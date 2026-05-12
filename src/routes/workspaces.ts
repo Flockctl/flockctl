@@ -4,13 +4,16 @@ import { workspaces, projects, tasks, usageRecords } from "../db/schema.js";
 import { eq, and, sql, desc, inArray } from "drizzle-orm";
 import { paginationParams } from "../lib/pagination.js";
 import { NotFoundError, ValidationError } from "../lib/errors.js";
-import { parseIdParam } from "../lib/route-params.js";
-import { mkdirSync, existsSync, writeFileSync } from "fs";
+import { parseIdParam, parseIdQuery, parseJsonBodySafe } from "../lib/route-params.js";
+import { computeEtag, etagMatches } from "../lib/etag.js";
+import { requireRow } from "../lib/db-helpers.js";
+import { existsSync } from "fs";
+import { mkdir, writeFile } from "fs/promises";
 import { join } from "path";
 import { slugify } from "../lib/slugify.js";
-import { homedir } from "os";
+import { assertSafeWritePath, defaultWorkspacePath } from "../lib/safe-fs-path.js";
 import { listMilestones, getProjectTree } from "../services/plan-store/index.js";
-import { execSync, execFileSync } from "child_process";
+import { execa } from "execa";
 import { parsePermissionModeBody } from "./_permission-mode.js";
 import {
   parseRequiredAllowedKeyIdsOnCreate,
@@ -44,18 +47,21 @@ import {
   TODO_FILE_MAX_BYTES,
 } from "../services/todo-file.js";
 import { getWorkspaceOrThrow } from "../lib/db-helpers.js";
+import { makeGitRouteHandlers } from "./git-route-handlers.js";
+import { makeFsRouteHandlers } from "./fs-route-handlers.js";
+import { listWorkspacesWithStats } from "../services/workspaces/list.js";
 
 export const workspaceRoutes = new Hono();
 
 // GET /workspaces
+//
+// Each row carries `active_task_count` — running tasks across every project
+// owned by the workspace. The aggregate is computed in a single correlated
+// subquery (see `services/workspaces/list.ts`) so a workspace list with N
+// rows costs one round-trip, not N+1.
 workspaceRoutes.get("/", (c) => {
-  const db = getDb();
   const { page, perPage, offset } = paginationParams(c);
-
-  const items = db.select().from(workspaces).orderBy(desc(workspaces.createdAt)).limit(perPage).offset(offset).all();
-  /* v8 ignore next — SQL count(*) always returns one row, so `?? 0` is unreachable */
-  const total = db.select({ count: sql<number>`count(*)` }).from(workspaces).get()?.count ?? 0;
-
+  const { items, total } = listWorkspacesWithStats(perPage, offset);
   return c.json({ items, total, page, perPage });
 });
 
@@ -72,16 +78,27 @@ workspaceRoutes.get("/:id", (c) => {
 // POST /workspaces — create workspace (local dir or git clone + .flockctl/ scaffold)
 workspaceRoutes.post("/", async (c) => {
   const db = getDb();
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
 
-  if (!body.name) throw new ValidationError("name is required");
+  // Audit-round-7: trim + cap name; reject whitespace-only.
+  if (typeof body.name !== "string" || !body.name.trim()) {
+    throw new ValidationError("name is required");
+  }
+  body.name = body.name.trim().slice(0, 200);
+  if (typeof body.description === "string") {
+    body.description = body.description.slice(0, 10_000);
+  }
 
   // Key selection is mandatory on create — pick at least one active key.
   // See src/routes/_allowed-keys.ts for the exact contract and why PATCH
   // still accepts null (relax the restriction post-creation).
   const allowedKeyIds = parseRequiredAllowedKeyIdsOnCreate(body.allowedKeyIds);
 
-  const wsPath: string = body.path || join(homedir(), "flockctl", "workspaces", slugify(body.name));
+  // Path safety: if the caller supplied a `path`, validate it is not a system
+  // directory before any FS write or `git clone` happens. The default fallback
+  // (~/flockctl/workspaces/<slug>) is always safe by construction.
+  const wsPath: string = body.path || defaultWorkspacePath(slugify(body.name));
+  if (body.path) assertSafeWritePath(wsPath);
   let resolvedRepoUrl: string | null = body.repoUrl ?? null;
 
   if (body.repoUrl) {
@@ -90,32 +107,35 @@ workspaceRoutes.post("/", async (c) => {
     }
 
     try {
-      // execFileSync (no shell) — argv passed directly to git, so repoUrl
+      // execa (no shell) — argv passed directly to git, so repoUrl
       // cannot be interpreted as shell metacharacters even if it contains
-      // quotes, semicolons, or backticks.
-      execFileSync("git", ["clone", "--", body.repoUrl, wsPath], { stdio: "pipe", timeout: 120_000 });
+      // quotes, semicolons, or backticks. Async variant so a slow remote
+      // clone doesn't block the event loop for up to 120 s — other
+      // concurrent requests (health, status, /tasks list) keep flowing.
+      await execa("git", ["clone", "--", body.repoUrl, wsPath], { timeout: 120_000 });
     } catch (err: unknown) {
-      const e = err as { stderr?: Buffer; message?: string };
-      throw new ValidationError(`Git clone failed: ${e.stderr?.toString().trim() || e.message || "unknown error"}`);
+      const e = err as { stderr?: string; message?: string };
+      throw new ValidationError(`Git clone failed: ${(typeof e.stderr === "string" && e.stderr.trim()) || e.message || "unknown error"}`);
     }
   } else {
     const dirExists = existsSync(wsPath);
     const hasGit = dirExists && existsSync(join(wsPath, ".git"));
 
     if (!dirExists) {
-      mkdirSync(wsPath, { recursive: true });
+      await mkdir(wsPath, { recursive: true });
     }
 
     if (!hasGit) {
       try {
-        execSync("git init", { cwd: wsPath, stdio: "pipe" });
+        await execa("git", ["init"], { cwd: wsPath });
       } catch {
         // Non-fatal: git might not be installed
       }
     /* v8 ignore start — the else-if branch cannot fire: the outer `else` runs only when body.repoUrl is falsy, so resolvedRepoUrl is null, so `!resolvedRepoUrl` is always true; the `false` side is structurally unreachable. The body below is covered when hasGit && outer-else both hold (e.g. adopting an existing repo into a pre-created workspace). */
     } else if (!resolvedRepoUrl) {
       try {
-        const remoteUrl = execSync("git remote get-url origin", { cwd: wsPath, stdio: ["pipe", "pipe", "pipe"] }).toString().trim();
+        const { stdout } = await execa("git", ["remote", "get-url", "origin"], { cwd: wsPath });
+        const remoteUrl = (typeof stdout === "string" ? stdout : "").trim();
         if (remoteUrl) resolvedRepoUrl = remoteUrl;
       } catch {
         // No 'origin' remote — leave repoUrl null
@@ -124,18 +144,17 @@ workspaceRoutes.post("/", async (c) => {
     /* v8 ignore stop */
   }
 
-  // Create .flockctl scaffold
+  // Create .flockctl scaffold (audit-round-5: async fs/promises so the
+  // event loop keeps serving while the OS hits the disk; mkdir
+  // `recursive: true` is idempotent so the explicit existsSync gates
+  // can be dropped — they were optimisation noise anyway).
   const flockctlDir = join(wsPath, ".flockctl");
-  if (!existsSync(flockctlDir)) {
-    mkdirSync(flockctlDir, { recursive: true });
-  }
+  await mkdir(flockctlDir, { recursive: true });
   const skillsDir = join(flockctlDir, "skills");
-  if (!existsSync(skillsDir)) {
-    mkdirSync(skillsDir, { recursive: true });
-  }
+  await mkdir(skillsDir, { recursive: true });
   const configPath = join(flockctlDir, "config.json");
   if (!existsSync(configPath)) {
-    writeFileSync(configPath, JSON.stringify({ skills: {} }, null, 2));
+    await writeFile(configPath, JSON.stringify({ skills: {} }, null, 2));
   }
   // Seed a root-level TODO.md. No-op if the directory already had one
   // (cloned repo, previously-existing workspace).
@@ -187,7 +206,7 @@ workspaceRoutes.patch("/:id", async (c) => {
   const id = parseIdParam(c);
   const existing = getWorkspaceOrThrow(id);
 
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
   const permissionMode = parsePermissionModeBody(body);
   const gitignoreToggles = parseGitignoreToggles(body);
   // Same mandatory-keys rule as POST, but only when the caller actually
@@ -237,7 +256,15 @@ workspaceRoutes.patch("/:id", async (c) => {
     });
   }
 
-  const updated = db.select().from(workspaces).where(eq(workspaces.id, id)).get();
+  // Re-fetch the post-update row. Surfaces 404 instead of an undefined
+  // body if the workspace was concurrently deleted between the UPDATE
+  // above and this SELECT — extremely rare in single-tenant Flockctl,
+  // but the ?? null default + c.json undefined was technically incorrect.
+  const updated = requireRow(
+    db.select().from(workspaces).where(eq(workspaces.id, id)).get(),
+    "Workspace",
+    id,
+  );
   return c.json(updated);
 });
 
@@ -263,9 +290,8 @@ workspaceRoutes.post("/:id/projects", async (c) => {
   const ws = getWorkspaceOrThrow(id);
 
   // Mode 1: link existing project
-  const projectIdParam = c.req.query("project_id");
-  if (projectIdParam) {
-    const projectId = parseInt(projectIdParam);
+  const projectId = parseIdQuery(c, "project_id");
+  if (projectId !== undefined) {
     const project = db.select().from(projects).where(eq(projects.id, projectId)).get();
     if (!project) throw new NotFoundError("Project");
 
@@ -274,12 +300,16 @@ workspaceRoutes.post("/:id/projects", async (c) => {
       .where(eq(projects.id, projectId))
       .run();
 
-    const updated = db.select().from(projects).where(eq(projects.id, projectId)).get();
+    const updated = requireRow(
+      db.select().from(projects).where(eq(projects.id, projectId)).get(),
+      "Project",
+      projectId,
+    );
     return c.json(updated, 200);
   }
 
   // Mode 2: create new project
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
   if (!body.name) throw new ValidationError("name is required");
 
   // Key selection is mandatory on project create — same rule as POST /projects.
@@ -287,24 +317,21 @@ workspaceRoutes.post("/:id/projects", async (c) => {
   const projGitignoreToggles = parseGitignoreToggles(body);
 
   const projectPath = body.path ?? join(ws.path, slugify(body.name));
+  if (body.path) assertSafeWritePath(projectPath);
 
-  // Create directory if needed
-  if (!existsSync(projectPath)) {
-    mkdirSync(projectPath, { recursive: true });
-  }
+  // Create directory if needed — async + idempotent recursive mkdir.
+  await mkdir(projectPath, { recursive: true });
 
   // Git init if no .git
   if (!existsSync(join(projectPath, ".git"))) {
     try {
-      execSync("git init", { cwd: projectPath, stdio: "pipe" });
+      await execa("git", ["init"], { cwd: projectPath });
     } catch { /* non-fatal */ }
   }
 
   // Create .flockctl/skills/ inside project
   const projSkillsDir = join(projectPath, ".flockctl", "skills");
-  if (!existsSync(projSkillsDir)) {
-    mkdirSync(projSkillsDir, { recursive: true });
-  }
+  await mkdir(projSkillsDir, { recursive: true });
 
   // Seed TODO.md at the nested project root so the UI always has something
   // to open. Idempotent: existing files are never overwritten.
@@ -353,7 +380,7 @@ workspaceRoutes.put("/:id/config", async (c) => {
 
   if (!ws.path) throw new ValidationError("Workspace has no path — cannot save config file");
 
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
 
   const existing = loadWorkspaceConfig(ws.path);
   const merged: Record<string, any> = { ...existing };
@@ -468,7 +495,7 @@ workspaceRoutes.put("/:id/todo", async (c) => {
   const ws = getWorkspaceOrThrow(id);
   if (!ws.path) throw new ValidationError("Workspace has no path — cannot save TODO.md");
 
-  const body = await c.req.json();
+  const body = await parseJsonBodySafe(c);
   const content = typeof body?.content === "string" ? body.content : "";
   if (Buffer.byteLength(content, "utf-8") > TODO_FILE_MAX_BYTES) {
     throw new ValidationError(`TODO.md exceeds ${TODO_FILE_MAX_BYTES} bytes`);
@@ -495,6 +522,42 @@ workspaceRoutes.delete("/:id/projects/:projectId", (c) => {
     .where(eq(projects.id, projectId))
     .run();
   return c.json({ removed: true });
+});
+
+// GET /workspaces/:id/allowed-keys — effective key allow-list for this workspace.
+//
+// Mirrors `GET /projects/:id/allowed-keys`: returns
+//   - { allowedKeyIds: null, source: "none" } when no whitelist is configured
+//     (callers should treat this as "all active keys are allowed");
+//   - { allowedKeyIds: number[], source: "workspace" } otherwise.
+//
+// Used by the chat key picker on workspace-only chats (started from the
+// workspace page) so the dropdown is filtered the same way it is for
+// project-scoped chats. Without this endpoint, a workspace with a strict
+// whitelist would still let the user pick any active key on the workspace
+// chat — visually, with no error — and only fail with a 422 at send time.
+workspaceRoutes.get("/:id/allowed-keys", (c) => {
+  const id = parseIdParam(c);
+  const ws = getWorkspaceOrThrow(id);
+
+  const parse = (raw: string | null | undefined): number[] | null => {
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return null;
+      return parsed
+        .map((v) => (typeof v === "number" ? v : parseInt(String(v), 10)))
+        .filter((n) => Number.isFinite(n));
+    } catch {
+      return null;
+    }
+  };
+
+  const ids = parse(ws.allowedKeyIds);
+  if (ids && ids.length > 0) {
+    return c.json({ allowedKeyIds: ids, source: "workspace" });
+  }
+  return c.json({ allowedKeyIds: null, source: "none" });
 });
 
 // GET /workspaces/:id/dashboard
@@ -524,20 +587,33 @@ workspaceRoutes.get("/:id/dashboard", (c) => {
     });
   }
 
-  /* v8 ignore next 3 — SQL count(*) always returns one row, so `?? 0` is unreachable */
-  const activeTasks = db.select({ count: sql<number>`count(*)` }).from(tasks)
-    .where(and(inArray(tasks.projectId, projectIds), eq(tasks.status, "running")))
-    .get()?.count ?? 0;
-
-  /* v8 ignore next 3 — SQL count(*) always returns one row, so `?? 0` is unreachable */
-  const completedTasks = db.select({ count: sql<number>`count(*)` }).from(tasks)
-    .where(and(inArray(tasks.projectId, projectIds), eq(tasks.status, "completed")))
-    .get()?.count ?? 0;
-
-  /* v8 ignore next 3 — SQL count(*) always returns one row, so `?? 0` is unreachable */
-  const failedTasks = db.select({ count: sql<number>`count(*)` }).from(tasks)
-    .where(and(inArray(tasks.projectId, projectIds), eq(tasks.status, "failed")))
-    .get()?.count ?? 0;
+  // ─── Task status counts ───
+  //
+  // Audit-round-3 finding: the previous shape ran THREE sequential
+  // `count(*)` queries (running / completed / failed) — each scanned
+  // the same task rows with a different WHERE filter. Collapsed into
+  // a single GROUP BY so SQLite reads the rows once and buckets them
+  // in-place. Counts for statuses that didn't appear default to 0
+  // via the destructuring below.
+  const statusCounts = db
+    .select({ status: tasks.status, count: sql<number>`count(*)` })
+    .from(tasks)
+    .where(
+      and(
+        inArray(tasks.projectId, projectIds),
+        sql`${tasks.status} IN ('running', 'completed', 'failed')`,
+      ),
+    )
+    .groupBy(tasks.status)
+    .all();
+  let activeTasks = 0;
+  let completedTasks = 0;
+  let failedTasks = 0;
+  for (const row of statusCounts) {
+    if (row.status === "running") activeTasks = row.count;
+    else if (row.status === "completed") completedTasks = row.count;
+    else if (row.status === "failed") failedTasks = row.count;
+  }
 
   // Milestone counts from filesystem
   const allMilestones = wsProjects.flatMap(p => p.path ? listMilestones(p.path) : []);
@@ -591,7 +667,7 @@ workspaceRoutes.get("/:id/dashboard", (c) => {
     };
   });
 
-  return c.json({
+  const dashboardBody = {
     project_count: projectIds.length,
     active_tasks: activeTasks,
     completed_tasks: completedTasks,
@@ -606,5 +682,84 @@ workspaceRoutes.get("/:id/dashboard", (c) => {
     cost_by_project: costByProject,
     recent_activity: recentActivity,
     project_summaries,
-  });
+  };
+  // ETag/304 — dashboard is polled on a 30s cadence; the payload is
+  // deterministic relative to underlying state so repeat-fetches save
+  // body bytes when nothing has changed.
+  const tag = computeEtag(dashboardBody);
+  if (etagMatches(c, tag)) {
+    return new Response(null, { status: 304, headers: { ETag: tag } });
+  }
+  c.header("ETag", tag);
+  return c.json(dashboardBody);
 });
+
+// ─── Workspace-scoped git routes (pull / commit / push) ────────────────────
+//
+// Sibling of the project-router git mounts in `routes/projects.ts`. Both
+// surfaces share the same factory so the wire contract is byte-identical:
+// HTTP 200 with a `{ ok, ... }` discriminated body on git outcomes (success
+// or recoverable failure), 4xx only for shape errors before git runs at all
+// (404 missing workspace, 422 missing path / malformed body).
+//
+// The attribution closure is the only thing that differs between the two
+// mounts: workspace invocations key the `git_audit_log` row on
+// `workspace_id` (project_id stays NULL); project invocations do the
+// reverse. The CHECK constraint on the audit table requires exactly one of
+// the two to be set, and the per-side recency indexes assume the asymmetry
+// is preserved — see `migrations/0046_git_audit_log.sql`.
+const workspaceGit = makeGitRouteHandlers({
+  resourceLabel: "Workspace",
+  getEntity: (id) => getWorkspaceOrThrow(id),
+  attribution: (workspace) => ({ workspaceId: workspace.id }),
+});
+
+workspaceRoutes.get("/:id/git-status", workspaceGit.status);
+workspaceRoutes.get("/:id/git-log", workspaceGit.log);
+workspaceRoutes.get("/:id/git-diff", workspaceGit.diff);
+workspaceRoutes.get("/:id/git-show", workspaceGit.show);
+workspaceRoutes.post("/:id/git-pull", workspaceGit.pull);
+workspaceRoutes.post("/:id/git-commit", workspaceGit.commit);
+workspaceRoutes.post("/:id/git-push", workspaceGit.push);
+workspaceRoutes.post("/:id/git-discard", workspaceGit.discard);
+workspaceRoutes.post("/:id/git-fetch", workspaceGit.fetch);
+
+// Branch operations: same factory as the project router. See projects.ts
+// for the rationale on the `:name{.+}` wildcard.
+workspaceRoutes.get("/:id/git-branches", workspaceGit.branchList);
+workspaceRoutes.post("/:id/git-checkout", workspaceGit.checkout);
+workspaceRoutes.delete("/:id/git-branches/:name{.+}", workspaceGit.branchDelete);
+
+// Stash operations: same factory as the project router. See projects.ts
+// for the rationale on the `:ref{.+}` wildcard.
+workspaceRoutes.post("/:id/git-stash-push", workspaceGit.stashPush);
+workspaceRoutes.get("/:id/git-stash-list", workspaceGit.stashList);
+workspaceRoutes.post("/:id/git-stash-pop", workspaceGit.stashPop);
+workspaceRoutes.delete("/:id/git-stash/:ref{.+}", workspaceGit.stashDrop);
+
+// Filesystem read endpoints. Same factory as the project router; the only
+// runtime difference is the audit-attribution scope (workspace_id vs
+// project_id), wired via the closure passed to `makeFsRouteHandlers`.
+const workspaceFs = makeFsRouteHandlers({
+  resourceLabel: "Workspace",
+  entityType: "workspace",
+  getEntity: (id) => getWorkspaceOrThrow(id),
+  attribution: (workspace) => ({ workspaceId: workspace.id }),
+});
+
+workspaceRoutes.get("/:id/fs/list", workspaceFs.list);
+workspaceRoutes.get("/:id/fs/file", workspaceFs.readFile);
+
+// Flat-path enumeration. Same factory as projects.ts; the only difference
+// is the audit-attribution scope (workspace_id vs project_id).
+workspaceRoutes.get("/:id/fs/index", workspaceFs.index);
+
+// Optimistic-concurrency write. Same factory as projects.ts so the wire
+// contract is byte-identical between the two routers; the only difference
+// is the audit-row attribution (workspace_id vs project_id).
+workspaceRoutes.put("/:id/fs/file", workspaceFs.writeFile);
+
+// Mutations: mkdir / create / rename / delete via a single discriminated
+// endpoint. Same factory as the project router; the only runtime difference
+// is the audit-attribution scope (workspace_id vs project_id).
+workspaceRoutes.post("/:id/fs/op", workspaceFs.op);

@@ -8,18 +8,53 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { createMilestone, createSlice, createPlanTask } from "../../services/plan-store/index.js";
 
-// Mock child_process to match sibling tests — git clone now uses execFileSync
-// which we forward to the execSync mock impl so we can use string matching.
+// Routes now invoke `execa` for git operations (async, see
+// audit-round-3 finding). Tests still drive behaviour through the
+// legacy `execSync` mock impl; the `execa` mock forwards to it and
+// reshapes return/throw values into execa's `{ stdout, stderr }`
+// envelope so route catch-blocks still extract the right message.
 vi.mock("child_process", async () => {
   const actual = await vi.importActual<any>("child_process");
   return {
     ...actual,
     execSync: vi.fn(actual.execSync),
-    execFileSync: vi.fn((file: string, args: readonly string[], opts: unknown) => {
+  };
+});
+
+vi.mock("execa", async () => {
+  return {
+    execa: vi.fn(async (file: string, args: readonly string[]) => {
       const fake = (execSync as unknown as { getMockImplementation?: () => (cmd: string) => unknown })
         .getMockImplementation?.();
       const rebuiltCmd = `${file} ${args.join(" ")}`;
-      return fake ? fake(rebuiltCmd) : actual.execFileSync(file, args, opts);
+      if (!fake) return { stdout: "", stderr: "", exitCode: 0 };
+      try {
+        const result = fake(rebuiltCmd);
+        const stdout =
+          typeof result === "string"
+            ? result
+            : result && typeof (result as Buffer).toString === "function"
+              ? (result as Buffer).toString()
+              : "";
+        return { stdout, stderr: "", exitCode: 0 };
+      } catch (err) {
+        // Preserve the raw thrown shape (see workspaces-branches.test.ts
+        // for the rationale — `{}` errors must still hit the
+        // "unknown error" fallback in the route catch block).
+        const e = err as { stderr?: Buffer | string; message?: string };
+        const stderrText =
+          typeof e.stderr === "string"
+            ? e.stderr
+            : e.stderr
+              ? e.stderr.toString()
+              : undefined;
+        const wrapped: { stderr?: string; message?: string; exitCode: number } = {
+          exitCode: 1,
+        };
+        if (stderrText !== undefined) wrapped.stderr = stderrText;
+        if (typeof e.message === "string") wrapped.message = e.message;
+        throw wrapped;
+      }
     }),
   };
 });

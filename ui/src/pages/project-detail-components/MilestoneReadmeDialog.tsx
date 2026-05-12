@@ -11,6 +11,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import "highlight.js/styles/github-dark.css";
+import { extractText } from "@/lib/react-children";
 
 // --- Milestone README Dialog ---
 
@@ -77,9 +78,20 @@ export function MilestoneReadmeDialog({
                     );
                   },
                   code({ className, children, ...rest }) {
+                    // Block-vs-inline detection — see chat-message.tsx for
+                    // the long-form rationale. Short version: untagged
+                    // fenced blocks (` ```\n…\n``` `) arrive with no
+                    // `language-*` className, so a className-only check
+                    // silently routes ASCII-art schemas through the
+                    // inline-pill branch where `break-all` mangles
+                    // box-drawing characters into a wrapped staircase.
+                    // Inline code never contains a newline; fenced code
+                    // always does. Check the text directly.
+                    const text = extractText(children);
                     const isBlock =
-                      className?.startsWith("language-") ||
-                      className?.startsWith("hljs");
+                      text.includes("\n") ||
+                      !!className?.startsWith("language-") ||
+                      !!className?.startsWith("hljs");
                     if (isBlock) {
                       return (
                         <code className={className} {...rest}>

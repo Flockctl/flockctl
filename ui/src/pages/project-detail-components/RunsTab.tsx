@@ -1,12 +1,19 @@
-import { useState } from "react";
-import { Link } from "react-router-dom";
+import { useMemo, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
 import {
   useUsageSummary,
   useUsageBreakdown,
   useProjectStats,
   useTasks,
 } from "@/lib/hooks";
-import { formatTokens as fmtTokens, formatDuration as fmtDuration } from "@/lib/format";
+import { useWsAwarePolling } from "@/lib/global-ws";
+import {
+  formatTokens as fmtTokens,
+  formatDuration as fmtDuration,
+  formatCost,
+  formatCostFine,
+  formatDateTime,
+} from "@/lib/format";
 import {
   Card,
   CardHeader,
@@ -17,7 +24,12 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { StatCard } from "@/components/stat-card";
-import { statusBadge } from "@/components/status-badge";
+import {
+  FlatCard,
+  SegmentToggle,
+  StatusPill,
+} from "@/components/design";
+import { statusPillTone, statusPillLabel } from "@/lib/task-status";
 import {
   DollarSign,
   Hash,
@@ -65,34 +77,60 @@ import type { TaskStatus } from "@/lib/types";
  * "planning" surface that competes with the Plan tab.
  */
 
-const STATUS_OPTIONS: Array<{ value: "" | TaskStatus; label: string }> = [
-  { value: "", label: "All" },
-  { value: "queued", label: "Queued" },
-  { value: "assigned", label: "Assigned" },
+/**
+ * Coarse-grained status filter buckets surfaced as a 4-way SegmentToggle
+ * above the runs table. The original status dropdown exposed the full
+ * `TaskStatus` enum (8 values) which is too noisy for the redesigned tab —
+ * the redesigned slice (M23 / 00-project-detail / T05) collapses the
+ * filter down to the four states an operator scans for at a glance:
+ *
+ *   - All        → no filter, shows every status the API returns.
+ *   - Running    → `status=running`.
+ *   - Completed  → `status=done` (the terminal-success state).
+ *   - Failed     → `status=failed`.
+ *
+ * Statuses outside that bucket (`queued`, `assigned`, `pending_approval`,
+ * `timed_out`, `rate_limited`) only ever surface in the "All" view.
+ * Filtering by them is a power-user operation we'd rather expose via a
+ * future advanced-filters drawer than clutter the segmented control.
+ */
+type RunsFilterBucket = "all" | "running" | "completed" | "failed";
+
+const FILTER_OPTIONS: Array<{ value: RunsFilterBucket; label: string }> = [
+  { value: "all", label: "All" },
   { value: "running", label: "Running" },
-  { value: "pending_approval", label: "Awaiting approval" },
-  { value: "done", label: "Done" },
+  { value: "completed", label: "Completed" },
   { value: "failed", label: "Failed" },
-  { value: "timed_out", label: "Timed out" },
 ];
 
-function fmtDateTime(iso: string | null | undefined) {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
-  return d.toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+function bucketToStatus(bucket: RunsFilterBucket): TaskStatus | undefined {
+  switch (bucket) {
+    case "running":
+      return "running";
+    case "completed":
+      return "done";
+    case "failed":
+      return "failed";
+    case "all":
+    default:
+      return undefined;
+  }
 }
 
+// Status pill mapping + label helper live in `@/lib/task-status` so RunsTab
+// and TasksTable stay in lockstep. `formatDateTime` lives in `@/lib/format`.
+
+/**
+ * Local USD-input wrapper around `formatCost` that distinguishes "no data"
+ * (`null` → `—`), "exactly zero" (`$0`), and "below cent" (`<$0.01`) from
+ * the regular two-decimals path. Misnamed — the input is USD, not cents —
+ * but kept under the same export name to avoid churning the call sites.
+ */
 function fmtCostCents(cost: number | null | undefined): string {
   if (cost == null) return "—";
   if (cost === 0) return "$0";
   if (cost < 0.01) return "<$0.01";
-  return `$${cost.toFixed(2)}`;
+  return formatCost(cost);
 }
 
 function fmtDurationMs(ms: number | null | undefined): string {
@@ -101,10 +139,13 @@ function fmtDurationMs(ms: number | null | undefined): string {
 }
 
 export function RunsTab({ projectId }: { projectId: string }) {
-  const [statusFilter, setStatusFilter] = useState<"" | TaskStatus>("");
+  const navigate = useNavigate();
+  const [statusBucket, setStatusBucket] = useState<RunsFilterBucket>("all");
   const [agentFilter, setAgentFilter] = useState<string>("");
   const [page, setPage] = useState(0);
   const limit = 25;
+
+  const statusFilter = useMemo(() => bucketToStatus(statusBucket), [statusBucket]);
 
   const { data: projectUsage } = useUsageSummary(
     { project_id: projectId },
@@ -121,6 +162,7 @@ export function RunsTab({ projectId }: { projectId: string }) {
     { enabled: !!projectId },
   );
 
+  const tasksRefetchInterval = useWsAwarePolling(15_000);
   const { data: tasksPage, isLoading: tasksLoading } = useTasks(
     page * limit,
     limit,
@@ -129,7 +171,7 @@ export function RunsTab({ projectId }: { projectId: string }) {
       ...(statusFilter ? { status: statusFilter } : {}),
       ...(agentFilter.trim() ? { agent: agentFilter.trim() } : {}),
     },
-    { refetchInterval: 15_000 },
+    { refetchInterval: tasksRefetchInterval },
   );
 
   const items = tasksPage?.items ?? [];
@@ -144,7 +186,7 @@ export function RunsTab({ projectId }: { projectId: string }) {
         <StatCard
           icon={DollarSign}
           label="Project Spend"
-          value={`$${(projectUsage?.total_cost_usd ?? 0).toFixed(2)}`}
+          value={formatCost(projectUsage?.total_cost_usd ?? 0)}
           isLoading={!projectUsage}
         />
         <StatCard
@@ -241,7 +283,7 @@ export function RunsTab({ projectId }: { projectId: string }) {
                   <Tooltip
                     {...CHART_TOOLTIP_PROPS}
                     formatter={(value) => [
-                      `$${Number(value).toFixed(4)}`,
+                      formatCostFine(Number(value)),
                       "Cost",
                     ]}
                   />
@@ -299,26 +341,32 @@ export function RunsTab({ projectId }: { projectId: string }) {
         </Card>
       </div>
 
-      {/* Tasks table */}
-      <Card>
-        <CardHeader className="flex flex-row items-center justify-between gap-4 space-y-0 pb-4">
-          <CardTitle className="text-sm font-medium">Tasks</CardTitle>
-          <div className="flex items-center gap-2">
-            <select
-              aria-label="Filter by status"
-              value={statusFilter}
-              onChange={(e) => {
-                setStatusFilter(e.target.value as "" | TaskStatus);
+      {/* Tasks table — flat card surface with header / rows / footer slots
+          separated by `border-b divider-y` hairlines. The filter row at
+          the top hosts the SegmentToggle (All / Running / Completed /
+          Failed) which is the redesigned status filter; the agent text
+          filter and total count sit alongside it. Row click navigates to
+          the task detail page; the existing "Open" button stays so
+          keyboard / middle-click discoverability is preserved. */}
+      <FlatCard className="overflow-hidden">
+        {/* Header / filter row. */}
+        <div
+          className="flex flex-row flex-wrap items-center justify-between gap-3 border-b divider-y px-3 py-2"
+          data-testid="project-runs-filter-row"
+        >
+          <h3 className="text-sm font-medium">Tasks</h3>
+          <div className="flex flex-wrap items-center gap-2">
+            <SegmentToggle<RunsFilterBucket>
+              options={FILTER_OPTIONS}
+              value={statusBucket}
+              onChange={(next) => {
+                setStatusBucket(next);
                 setPage(0);
               }}
-              className="h-8 rounded-md border border-input bg-background px-2 text-xs"
-            >
-              {STATUS_OPTIONS.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
+              size="sm"
+              aria-label="Filter by status"
+              data-testid="project-runs-status-filter"
+            />
             <Input
               aria-label="Filter by agent"
               placeholder="Agent…"
@@ -333,112 +381,128 @@ export function RunsTab({ projectId }: { projectId: string }) {
               {total} total
             </span>
           </div>
-        </CardHeader>
-        <CardContent className="p-0">
-          {tasksLoading && items.length === 0 ? (
-            <div className="space-y-2 p-4">
-              <Skeleton className="h-10 w-full" />
-              <Skeleton className="h-10 w-full" />
-              <Skeleton className="h-10 w-full" />
-            </div>
-          ) : items.length === 0 ? (
-            <p className="p-6 text-center text-sm text-muted-foreground">
-              No tasks match the current filters.
-            </p>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead className="text-[11px] uppercase tracking-wide text-muted-foreground">
-                  <tr className="border-b">
-                    <th className="px-3 py-2 text-left font-medium">Prompt / Agent</th>
-                    <th className="px-3 py-2 text-left font-medium">Status</th>
-                    <th className="px-3 py-2 text-left font-medium">Cost</th>
-                    <th className="px-3 py-2 text-left font-medium">Duration</th>
-                    <th className="px-3 py-2 text-left font-medium">Started</th>
-                    <th className="px-3 py-2"></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {items.map((task) => (
-                    <tr
-                      key={task.id}
-                      className="border-b last:border-b-0 hover:bg-muted/40"
-                      data-testid={`project-runs-task-row-${task.id}`}
-                    >
-                      <td className="px-3 py-2 align-top">
-                        <div className="line-clamp-2 max-w-[480px] text-xs">
-                          {task.prompt ?? (
-                            <span className="text-muted-foreground">
-                              (no prompt)
-                            </span>
-                          )}
-                        </div>
-                        <div className="mt-0.5 font-mono text-[11px] text-muted-foreground">
-                          {task.agent ?? "—"}
-                          {task.model ? ` · ${task.model}` : ""}
-                        </div>
-                      </td>
-                      <td className="px-3 py-2 align-top">
-                        {statusBadge(task.status)}
-                      </td>
-                      <td className="px-3 py-2 align-top font-mono text-xs">
-                        {fmtCostCents(task.liveMetrics?.total_cost_usd)}
-                      </td>
-                      <td className="px-3 py-2 align-top font-mono text-xs">
-                        {fmtDurationMs(task.liveMetrics?.duration_ms)}
-                      </td>
-                      <td className="px-3 py-2 align-top whitespace-nowrap text-xs text-muted-foreground">
-                        {fmtDateTime(task.started_at ?? task.created_at)}
-                      </td>
-                      <td className="px-3 py-2 align-top">
-                        <Button
-                          asChild
-                          variant="ghost"
-                          size="sm"
-                          className="h-7 px-2 text-xs"
-                        >
-                          <Link to={`/tasks/${task.id}`}>
-                            Open
-                            <ExternalLink className="ml-1 h-3 w-3" />
-                          </Link>
-                        </Button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-          {items.length > 0 && (
-            <div className="flex items-center justify-between gap-2 border-t px-4 py-2 text-xs text-muted-foreground">
-              <span>
-                Showing {page * limit + 1}–{page * limit + items.length} of{" "}
-                {total}
-              </span>
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={!hasPrev}
-                  onClick={() => setPage((p) => Math.max(0, p - 1))}
-                  className="h-7 px-2 text-xs"
-                >
-                  Previous
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={!hasNext}
-                  onClick={() => setPage((p) => p + 1)}
-                  className="h-7 px-2 text-xs"
-                >
-                  Next
-                </Button>
+        </div>
+
+        {/* Header row + rows. Both are 6-col grids so the column widths
+            line up vertically. The header uses uppercase tracking-wider
+            zinc-500 per the redesigned slice. */}
+        <div
+          className="grid grid-cols-[minmax(0,1fr)_8rem_5rem_5rem_8rem_4rem] gap-3 border-b divider-y px-4 py-2 text-[11px] uppercase tracking-wider font-semibold text-zinc-500"
+          data-testid="project-runs-header-row"
+        >
+          <div>Prompt / Agent</div>
+          <div>Status</div>
+          <div>Cost</div>
+          <div>Duration</div>
+          <div>Started</div>
+          <div className="sr-only">Actions</div>
+        </div>
+
+        {tasksLoading && items.length === 0 ? (
+          <div className="space-y-2 p-4">
+            <Skeleton className="h-10 w-full" />
+            <Skeleton className="h-10 w-full" />
+            <Skeleton className="h-10 w-full" />
+          </div>
+        ) : items.length === 0 ? (
+          <p className="p-4 text-center text-[12px] text-muted-foreground">
+            No tasks match the current filters.
+          </p>
+        ) : (
+          <div data-testid="project-runs-rows">
+            {items.map((task) => (
+              <div
+                key={task.id}
+                role="row"
+                tabIndex={0}
+                onClick={() => navigate(`/tasks/${task.id}`)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    navigate(`/tasks/${task.id}`);
+                  }
+                }}
+                className="grid grid-cols-[minmax(0,1fr)_8rem_5rem_5rem_8rem_4rem] gap-3 border-b divider-y last:border-b-0 px-3 py-2 cursor-pointer hover:bg-muted/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+                data-testid={`project-runs-task-row-${task.id}`}
+              >
+                <div className="min-w-0">
+                  <div className="line-clamp-2 text-xs">
+                    {task.prompt ?? (
+                      <span className="text-muted-foreground">
+                        (no prompt)
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-0.5 font-mono text-[11px] text-muted-foreground">
+                    {task.agent ?? "—"}
+                    {task.model ? ` · ${task.model}` : ""}
+                  </div>
+                </div>
+                <div>
+                  <StatusPill tone={statusPillTone(task.status)}>
+                    {statusPillLabel(task.status)}
+                  </StatusPill>
+                </div>
+                <div className="font-mono text-xs">
+                  {fmtCostCents(task.liveMetrics?.total_cost_usd)}
+                </div>
+                <div className="font-mono text-xs">
+                  {fmtDurationMs(task.liveMetrics?.duration_ms)}
+                </div>
+                <div className="whitespace-nowrap text-xs text-muted-foreground">
+                  {formatDateTime(task.started_at ?? task.created_at)}
+                </div>
+                <div className="flex items-center justify-end">
+                  <Button
+                    asChild
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 px-2 text-xs"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <Link to={`/tasks/${task.id}`}>
+                      Open
+                      <ExternalLink className="ml-1 h-3 w-3" />
+                    </Link>
+                  </Button>
+                </div>
               </div>
+            ))}
+          </div>
+        )}
+
+        {items.length > 0 && (
+          <div
+            className="flex items-center justify-between gap-2 border-t divider-y px-4 py-2 text-xs text-muted-foreground"
+            data-testid="project-runs-pagination"
+          >
+            <span>
+              Showing {page * limit + 1}–{page * limit + items.length} of{" "}
+              {total}
+            </span>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={!hasPrev}
+                onClick={() => setPage((p) => Math.max(0, p - 1))}
+                className="h-7 px-2 text-xs"
+              >
+                Previous
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={!hasNext}
+                onClick={() => setPage((p) => p + 1)}
+                className="h-7 px-2 text-xs"
+              >
+                Next
+              </Button>
             </div>
-          )}
-        </CardContent>
-      </Card>
+          </div>
+        )}
+      </FlatCard>
     </div>
   );
 }

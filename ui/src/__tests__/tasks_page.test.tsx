@@ -1,27 +1,25 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import { MemoryRouter, Routes, Route } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Task, Project, TaskFilters } from "@/lib/types";
 import { TaskStatus } from "@/lib/types";
 
 /**
- * Contract tests for the /tasks page view-mode dispatcher.
+ * Contract tests for the `/tasks` page (slice 24-00 T05 redesign).
  *
- * Corner cases guarded here:
+ * The legacy kanban + `?view=` dispatcher was retired during M23: the page
+ * always renders the flat `<TasksTable>` plus the URL-backed `<TasksFilters>`
+ * strip and the bulk toolbar that surfaces when one or more rows are selected.
  *
- *   1. Table mode is the default and renders byte-for-byte — users have
- *      saved filters + workflows tied to it, so the legacy filter bar
- *      (project / status / agent) must appear on `/tasks` with no `?view=`.
- *   2. An unknown `?view=` value falls back to the table.
- *   3. The legacy `?view=cards` value also falls back to the table — the
- *      cards view was removed; saved bookmarks must not 404 or render an
- *      empty page.
- *   4. `?view=kanban` mounts the cross-project Kanban with one swim-lane
- *      per status bucket. The status counts mirror the bucketing rule
- *      defined in `KANBAN_COLUMNS`.
- *   5. Kanban cards expose the project label, the AI key label, and the
- *      model that actually ran (preferring `actual_model_used` over the
- *      requested `model`, falling back to "Default" when both are null).
+ * What this suite pins:
+ *
+ *   1. The empty state shows up on a fresh load with no rows.
+ *   2. A populated `useTasks` payload produces the table testid plus a row
+ *      per item.
+ *   3. Filter widgets — status segment, project select, range select — are
+ *      always mounted (the redesigned page is the page; there is no view
+ *      switch to hide them).
  */
 
 const cancelMutate = vi.fn();
@@ -112,13 +110,21 @@ vi.mock("@/lib/hooks", () => {
 import TasksPage from "@/pages/tasks";
 
 function renderAt(path: string) {
+  // The dialog/`<TasksTable>` subtree calls a few hooks transitively
+  // that need a `QueryClientProvider` even when the network-touching
+  // ones are mocked.
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, gcTime: 0 } },
+  });
   return render(
-    <MemoryRouter initialEntries={[path]}>
-      <Routes>
-        <Route path="/tasks" element={<TasksPage />} />
-        <Route path="/tasks/:taskId" element={<div data-testid="task-detail" />} />
-      </Routes>
-    </MemoryRouter>,
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={[path]}>
+        <Routes>
+          <Route path="/tasks" element={<TasksPage />} />
+          <Route path="/tasks/:taskId" element={<div data-testid="task-detail" />} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 
@@ -134,122 +140,34 @@ beforeEach(() => {
   }
 });
 
-describe("tasks_page view-mode dispatch", () => {
-  it("tasks_page renders the existing table view by default (baseline)", () => {
+describe("tasks_page rendering", () => {
+  it("renders the empty-state placeholder when no tasks are loaded", () => {
     renderAt("/tasks");
-
-    expect(screen.getByTestId("tasks-table-view")).toBeInTheDocument();
-    expect(screen.getByText("Project")).toBeInTheDocument();
-    expect(screen.getByText("Status")).toBeInTheDocument();
-    expect(screen.getByText("Agent")).toBeInTheDocument();
-    expect(screen.getByText("Created after")).toBeInTheDocument();
-    expect(screen.getByText("Created before")).toBeInTheDocument();
-    expect(screen.queryByTestId("tasks-kanban-view")).toBeNull();
+    expect(screen.getByTestId("tasks-page")).toBeInTheDocument();
+    expect(screen.getByTestId("tasks-empty-state")).toBeInTheDocument();
+    expect(screen.queryByTestId("tasks-table")).toBeNull();
   });
 
-  it("tasks_page falls back to table when ?view= is garbage (view param fallback)", () => {
-    renderAt("/tasks?view=not-a-real-mode");
-    expect(screen.getByTestId("tasks-table-view")).toBeInTheDocument();
-    expect(screen.queryByTestId("tasks-kanban-view")).toBeNull();
+  it("renders the table when the hook surfaces rows", () => {
+    tasksItems = [makeTask({ id: "t-1" })];
+    renderAt("/tasks");
+    expect(screen.getByTestId("tasks-table")).toBeInTheDocument();
+    expect(screen.queryByTestId("tasks-empty-state")).toBeNull();
   });
 
-  it("tasks_page treats the legacy ?view=cards as table (cards view removed)", () => {
-    // The cards view was retired; we keep the URL guard so any saved
-    // bookmark (or external link) continues to land on a useful page
-    // instead of rendering an empty / unknown shell.
+  it("ignores the legacy `?view=` URL param without crashing", () => {
+    // Saved bookmarks may still carry `?view=cards` or `?view=kanban`.
+    // The page no longer looks at that param — render must be identical
+    // to the no-query path.
     renderAt("/tasks?view=cards");
-    expect(screen.getByTestId("tasks-table-view")).toBeInTheDocument();
-    expect(screen.queryByTestId("tasks-kanban-view")).toBeNull();
+    expect(screen.getByTestId("tasks-page")).toBeInTheDocument();
   });
 
-  it("tasks_page renders the kanban with one column per status bucket when ?view=kanban", () => {
-    tasksItems = [
-      makeTask({ id: "q-1", status: TaskStatus.queued }),
-      makeTask({ id: "r-1", status: TaskStatus.running }),
-      makeTask({ id: "p-1", status: TaskStatus.pending_approval }),
-      makeTask({ id: "d-1", status: TaskStatus.done }),
-      makeTask({ id: "f-1", status: TaskStatus.failed }),
-      makeTask({ id: "f-2", status: TaskStatus.timed_out }),
-    ];
-    renderAt("/tasks?view=kanban");
-
-    expect(screen.getByTestId("tasks-kanban-view")).toBeInTheDocument();
-    // Five columns; failed + timed_out share the "Failed" lane.
-    expect(screen.getByTestId("tasks-kanban-count-queued")).toHaveTextContent(
-      "1",
-    );
-    expect(screen.getByTestId("tasks-kanban-count-running")).toHaveTextContent(
-      "1",
-    );
-    expect(
-      screen.getByTestId("tasks-kanban-count-pending_approval"),
-    ).toHaveTextContent("1");
-    expect(screen.getByTestId("tasks-kanban-count-done")).toHaveTextContent(
-      "1",
-    );
-    expect(screen.getByTestId("tasks-kanban-count-failed")).toHaveTextContent(
-      "2",
-    );
-  });
-
-  it("tasks_page kanban card surfaces project label, AI key label and the actual model used", () => {
-    tasksItems = [
-      makeTask({
-        id: "r-1",
-        status: TaskStatus.running,
-        project_id: "p-alpha",
-        assigned_key_label: "Prod Anthropic",
-        // task.model was the *requested* model; actual_model_used is what
-        // the provider actually billed against. The kanban card must show
-        // the latter.
-        model: "claude-opus-4",
-        actual_model_used: "claude-sonnet-4",
-      }),
-    ];
-    renderAt("/tasks?view=kanban");
-
-    const card = screen.getByTestId("tasks-kanban-card");
-    expect(within(card).getByText("Alpha")).toBeInTheDocument();
-    expect(within(card).getByTestId("tasks-kanban-card-key")).toHaveTextContent(
-      "Prod Anthropic",
-    );
-    expect(
-      within(card).getByTestId("tasks-kanban-card-model"),
-    ).toHaveTextContent("claude-sonnet-4");
-  });
-
-  it("tasks_page kanban card falls back to task.model and 'Default' when usage is absent", () => {
-    tasksItems = [
-      makeTask({
-        id: "r-1",
-        status: TaskStatus.running,
-        model: "claude-opus-4",
-        actual_model_used: null,
-        assigned_key_label: null,
-      }),
-      makeTask({
-        id: "q-1",
-        status: TaskStatus.queued,
-        model: null,
-        actual_model_used: null,
-      }),
-    ];
-    renderAt("/tasks?view=kanban");
-
-    // Cards are bucketed by status into separate columns, so we pick them
-    // by `data-task-id` rather than render order. The fallback chain is:
-    // actual_model_used → task.model → "Default".
-    const allCards = screen.getAllByTestId("tasks-kanban-card");
-    const byId = (id: string) => {
-      const el = allCards.find((c) => c.getAttribute("data-task-id") === id);
-      if (!el) throw new Error(`no card for ${id}`);
-      return el;
-    };
-    expect(
-      within(byId("r-1")).getByTestId("tasks-kanban-card-model"),
-    ).toHaveTextContent("claude-opus-4");
-    expect(
-      within(byId("q-1")).getByTestId("tasks-kanban-card-model"),
-    ).toHaveTextContent("Default");
+  it("mounts the URL-driven filter widgets at the top of the page", () => {
+    renderAt("/tasks");
+    // The filter strip — status segment + project select + range select —
+    // is unconditional (the kanban view that used to hide it was retired).
+    expect(screen.getByTestId("tasks-project-select")).toBeInTheDocument();
+    expect(screen.getByTestId("tasks-range-select")).toBeInTheDocument();
   });
 });

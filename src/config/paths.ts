@@ -35,11 +35,18 @@ export function loadRc(): Record<string, any> {
 }
 
 export function saveRc(data: Record<string, any>): void {
-  writeFileSync(RC_FILE, JSON.stringify(data, null, 2), "utf-8");
+  // Pass mode in the open() syscall so the rc file (which carries bearer
+  // tokens once `flockctl token add --save` writes it) never exists with
+  // anything looser than 0o600. Eliminates the TOCTOU window between
+  // writeFileSync and a follow-up chmod.
+  writeFileSync(RC_FILE, JSON.stringify(data, null, 2), { encoding: "utf-8", mode: 0o600 });
+  // Belt-and-braces: writeFileSync respects existing perms when the file
+  // already exists, so re-chmod handles the (rare) overwrite path. Failure
+  // is non-fatal — Windows is unsupported per CLAUDE.md rule 6 anyway.
   try {
     chmodSync(RC_FILE, 0o600);
   } catch {
-    // chmod may fail on some filesystems (Windows) — non-fatal
+    /* v8 ignore next — non-POSIX filesystems may reject chmod; the open() mode bits already applied. */
   }
   _rcCache = data;
   _rcCacheMs = Date.now();
@@ -89,3 +96,44 @@ export function getGlobalMcpDir(): string {
 export function getGlobalTemplatesDir(): string {
   return join(getFlockctlHome(), "templates");
 }
+
+// ─── Workspace / project `.flockctl/` helpers ────────────────────────
+//
+// Both workspaces and projects own a `<root>/.flockctl/` directory that
+// holds per-scope MCP servers, skills, templates, and plan files. The
+// concrete sub-directory names (`mcp`, `skills`, `templates`, `plan`)
+// were repeated as string literals across ~20 callsites in
+// routes/{mcp,skills,workspaces}.ts and services/plan-store/. Centralising
+// them makes a future rename (or path-jail tweak) a one-line change and
+// removes the chance of typos like ".flockcl/mcp".
+//
+// The helpers are deliberately scope-agnostic — both `getProjectMcpDir`
+// and `getWorkspaceMcpDir` are aliases for the same `<root>/.flockctl/mcp`
+// shape. We expose them under separate names so call sites read
+// naturally, but neither does any path-validation: it's the caller's
+// job to make sure `root` is a real workspace or project path.
+const FLOCKCTL_SUBDIR = ".flockctl";
+
+export function getFlockctlDir(root: string): string {
+  return join(root, FLOCKCTL_SUBDIR);
+}
+
+export function getMcpDir(root: string): string {
+  return join(root, FLOCKCTL_SUBDIR, "mcp");
+}
+
+export function getSkillsDir(root: string): string {
+  return join(root, FLOCKCTL_SUBDIR, "skills");
+}
+
+export function getTemplatesDir(root: string): string {
+  return join(root, FLOCKCTL_SUBDIR, "templates");
+}
+
+// Note: there is intentionally NO `getPlanDir` here. The plan store
+// already owns its own copy at `services/plan-store/md-io.ts::getPlanDir`
+// and re-exports it from the plan-store barrel; layering plan-store on
+// top of `paths.ts` would push the FS layer up the dependency graph
+// for every consumer of `getFlockctlHome()`, including the CLI client.
+// Two copies of a one-line `join(p, ".flockctl/plan")` is the lesser
+// cost.

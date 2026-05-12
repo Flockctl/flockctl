@@ -6,7 +6,9 @@
     // Production code keeps `noUncheckedIndexedAccess: true` via the base
     // tsconfig.
     "noUncheckedIndexedAccess": false,
-    "noEmit": true
+    "noEmit": true,
+    "incremental": true,
+    "tsBuildInfoFile": "./node_modules/.cache/tsc/test.tsbuildinfo"
   },
   "include": [
     "src/__tests__/**/*",

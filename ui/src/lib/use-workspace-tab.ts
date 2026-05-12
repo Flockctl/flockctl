@@ -20,15 +20,27 @@ import { useSearchParams } from "react-router-dom";
  * preserved).
  */
 
-export type WorkspaceTab = "plan" | "runs" | "templates" | "config";
+export type WorkspaceTab =
+  | "overview"
+  | "projects"
+  | "plan"
+  | "runs"
+  | "templates"
+  | "config";
 
 const ALLOWED_TABS: readonly WorkspaceTab[] = [
+  "overview",
+  "projects",
   "plan",
   "runs",
   "templates",
   "config",
 ] as const;
-const DEFAULT_TAB: WorkspaceTab = "plan";
+// M20/00 — Overview is now the landing tab. The bare `/workspaces/:id`
+// (no `?tab=`) drops onto the at-a-glance KPI + projects view rather
+// than the Plan editor. Existing deep links with `?tab=plan` still
+// resolve correctly.
+const DEFAULT_TAB: WorkspaceTab = "overview";
 
 function isWorkspaceTab(value: unknown): value is WorkspaceTab {
   return (

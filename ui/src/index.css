@@ -1,7 +1,12 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
+/* Geist is kept as the active body font through M22–M25 and removed in M26.
+   Inter + JetBrains Mono are loaded alongside (vendored, no CDN fetch) so the
+   body rule below and the .mono utility can resolve them during the soak. */
 @import "@fontsource-variable/geist";
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -48,73 +53,112 @@
     --radius-4xl: calc(var(--radius) * 2.6);
 }
 
+/* M22 slice 00 / T02 — shadcn semantic variables remapped to the prototype's
+ * zinc + indigo palette. Variable names are unchanged (the @theme inline
+ * block above still aliases bg-card → var(--card), etc., so every shadcn
+ * primitive picks the new values up automatically). Only values change.
+ *
+ * HSL is used here (Tailwind v4 accepts either oklch or hsl; the prototype's
+ * reference values are HSL, and HSL keeps the zinc-N / indigo-N anchors
+ * legible to humans reading this file).
+ *
+ * Normative mapping table — see .flockctl/plan/22-ui-redesign-foundation/
+ * 00-fonts-and-palette/slice.md (T02) for derivation. Pixel diffs against
+ * the prototype are checked in slice 03 baselines.
+ *
+ * | variable               | light                    | dark                      |
+ * |------------------------|--------------------------|---------------------------|
+ * | --background           | hsl(0 0% 98%)   zinc-50  | hsl(240 10% 4%)  zinc-950 |
+ * | --foreground           | hsl(240 6% 10%) zinc-900 | hsl(0 0% 95%)    zinc-100 |
+ * | --card                 | hsl(0 0% 100%)  white    | hsl(240 6% 11%)  zinc-900 |
+ * | --card-foreground      | = --foreground           | = --foreground            |
+ * | --popover              | = --card                 | = --card                  |
+ * | --popover-foreground   | = --foreground           | = --foreground            |
+ * | --primary              | hsl(239 84% 60%) indigo  | hsl(239 84% 60%) indigo   |
+ * | --primary-foreground   | hsl(0 0% 100%)           | hsl(0 0% 100%)            |
+ * | --secondary            | hsl(240 5% 96%) zinc-100 | hsl(240 4% 16%) zinc-800  |
+ * | --secondary-foreground | = --foreground           | = --foreground            |
+ * | --muted                | hsl(240 5% 96%) zinc-100 | hsl(240 4% 16%) zinc-800  |
+ * | --muted-foreground     | hsl(240 4% 46%) zinc-500 | hsl(240 5% 65%) zinc-400  |
+ * | --accent               | hsl(240 5% 96%) zinc-100 | hsl(240 4% 16%) zinc-800  |
+ * | --accent-foreground    | = --foreground           | = --foreground            |
+ * | --destructive          | hsl(0 84% 60%)  red-500  | hsl(0 84% 60%)  red-500   |
+ * | --border               | hsl(240 6% 90%) zinc-200 | hsl(240 4% 16%) zinc-800  |
+ * | --input                | = --border               | = --border                |
+ * | --ring                 | = --primary              | = --primary               |
+ * | --sidebar              | hsl(0 0% 100%) white     | hsl(240 6% 11%) zinc-900  |
+ * | --sidebar-foreground   | = --foreground           | = --foreground            |
+ *
+ * Charts kept on the prior achromatic ramp; they're not in the redesign's
+ * scope and the consuming surfaces are rebuilt in M25.
+ */
 :root {
-    --background: oklch(1 0 0);
-    --foreground: oklch(0.145 0 0);
-    --card: oklch(1 0 0);
-    --card-foreground: oklch(0.145 0 0);
-    --popover: oklch(1 0 0);
-    --popover-foreground: oklch(0.145 0 0);
-    --primary: oklch(0.205 0 0);
-    --primary-foreground: oklch(0.985 0 0);
-    --secondary: oklch(0.97 0 0);
-    --secondary-foreground: oklch(0.205 0 0);
-    --muted: oklch(0.97 0 0);
-    --muted-foreground: oklch(0.556 0 0);
-    --accent: oklch(0.97 0 0);
-    --accent-foreground: oklch(0.205 0 0);
-    --destructive: oklch(0.577 0.245 27.325);
-    --border: oklch(0.922 0 0);
-    --input: oklch(0.922 0 0);
-    --ring: oklch(0.708 0 0);
+    --background: hsl(0 0% 98%);
+    --foreground: hsl(240 6% 10%);
+    --card: hsl(0 0% 100%);
+    --card-foreground: hsl(240 6% 10%);
+    --popover: hsl(0 0% 100%);
+    --popover-foreground: hsl(240 6% 10%);
+    --primary: hsl(239 84% 60%);
+    --primary-foreground: hsl(0 0% 100%);
+    --secondary: hsl(240 5% 96%);
+    --secondary-foreground: hsl(240 6% 10%);
+    --muted: hsl(240 5% 96%);
+    --muted-foreground: hsl(240 4% 46%);
+    --accent: hsl(240 5% 96%);
+    --accent-foreground: hsl(240 6% 10%);
+    --destructive: hsl(0 84% 60%);
+    --border: hsl(240 6% 90%);
+    --input: hsl(240 6% 90%);
+    --ring: hsl(239 84% 60%);
     --chart-1: oklch(0.87 0 0);
     --chart-2: oklch(0.556 0 0);
     --chart-3: oklch(0.439 0 0);
     --chart-4: oklch(0.371 0 0);
     --chart-5: oklch(0.269 0 0);
     --radius: 0.625rem;
-    --sidebar: oklch(0.985 0 0);
-    --sidebar-foreground: oklch(0.145 0 0);
-    --sidebar-primary: oklch(0.205 0 0);
-    --sidebar-primary-foreground: oklch(0.985 0 0);
-    --sidebar-accent: oklch(0.97 0 0);
-    --sidebar-accent-foreground: oklch(0.205 0 0);
-    --sidebar-border: oklch(0.922 0 0);
-    --sidebar-ring: oklch(0.708 0 0);
+    --sidebar: hsl(0 0% 100%);
+    --sidebar-foreground: hsl(240 6% 10%);
+    --sidebar-primary: hsl(239 84% 60%);
+    --sidebar-primary-foreground: hsl(0 0% 100%);
+    --sidebar-accent: hsl(240 5% 96%);
+    --sidebar-accent-foreground: hsl(240 6% 10%);
+    --sidebar-border: hsl(240 6% 90%);
+    --sidebar-ring: hsl(239 84% 60%);
 }
 
 .dark {
-    --background: oklch(0.145 0 0);
-    --foreground: oklch(0.985 0 0);
-    --card: oklch(0.205 0 0);
-    --card-foreground: oklch(0.985 0 0);
-    --popover: oklch(0.205 0 0);
-    --popover-foreground: oklch(0.985 0 0);
-    --primary: oklch(0.922 0 0);
-    --primary-foreground: oklch(0.205 0 0);
-    --secondary: oklch(0.269 0 0);
-    --secondary-foreground: oklch(0.985 0 0);
-    --muted: oklch(0.269 0 0);
-    --muted-foreground: oklch(0.708 0 0);
-    --accent: oklch(0.269 0 0);
-    --accent-foreground: oklch(0.985 0 0);
-    --destructive: oklch(0.704 0.191 22.216);
-    --border: oklch(1 0 0 / 10%);
-    --input: oklch(1 0 0 / 15%);
-    --ring: oklch(0.556 0 0);
+    --background: hsl(240 10% 4%);
+    --foreground: hsl(0 0% 95%);
+    --card: hsl(240 6% 11%);
+    --card-foreground: hsl(0 0% 95%);
+    --popover: hsl(240 6% 11%);
+    --popover-foreground: hsl(0 0% 95%);
+    --primary: hsl(239 84% 60%);
+    --primary-foreground: hsl(0 0% 100%);
+    --secondary: hsl(240 4% 16%);
+    --secondary-foreground: hsl(0 0% 95%);
+    --muted: hsl(240 4% 16%);
+    --muted-foreground: hsl(240 5% 65%);
+    --accent: hsl(240 4% 16%);
+    --accent-foreground: hsl(0 0% 95%);
+    --destructive: hsl(0 84% 60%);
+    --border: hsl(240 4% 16%);
+    --input: hsl(240 4% 16%);
+    --ring: hsl(239 84% 60%);
     --chart-1: oklch(0.87 0 0);
     --chart-2: oklch(0.556 0 0);
     --chart-3: oklch(0.439 0 0);
     --chart-4: oklch(0.371 0 0);
     --chart-5: oklch(0.269 0 0);
-    --sidebar: oklch(0.205 0 0);
-    --sidebar-foreground: oklch(0.985 0 0);
-    --sidebar-primary: oklch(0.488 0.243 264.376);
-    --sidebar-primary-foreground: oklch(0.985 0 0);
-    --sidebar-accent: oklch(0.269 0 0);
-    --sidebar-accent-foreground: oklch(0.985 0 0);
-    --sidebar-border: oklch(1 0 0 / 10%);
-    --sidebar-ring: oklch(0.556 0 0);
+    --sidebar: hsl(240 6% 11%);
+    --sidebar-foreground: hsl(0 0% 95%);
+    --sidebar-primary: hsl(239 84% 60%);
+    --sidebar-primary-foreground: hsl(0 0% 100%);
+    --sidebar-accent: hsl(240 4% 16%);
+    --sidebar-accent-foreground: hsl(0 0% 95%);
+    --sidebar-border: hsl(240 4% 16%);
+    --sidebar-ring: hsl(239 84% 60%);
 }
 
 @layer base {
@@ -123,10 +167,38 @@
     }
   body {
     @apply bg-background text-foreground;
+    /* M22 — Inter becomes the primary body family; Geist (loaded above) and
+       system-ui remain in the stack as fallbacks during the soak. The full
+       .mono utility ships in slice 01; here we only register the body rule
+       and the family declarations. */
+    font-family: 'Inter Variable', Inter, system-ui, sans-serif;
+    font-feature-settings: "cv11", "ss01";
     }
   html {
     @apply font-sans;
     }
+}
+
+/* Custom utilities — registered in Tailwind's `utilities` layer so they
+   compose cleanly with the rest of the framework's classes (specificity
+   stays in line, dark-mode variants apply, etc.).
+
+   - `.divider-y` — hairline divider that auto-themes off `--border`. Use
+     in combination with Tailwind's `border-b` / `border-t` so the width
+     comes from there and only the colour is overridden.
+   - `.mono` — monospace family for primitives that need a code-like
+     surface (logs, diffs, git hashes, raw CLI output). The ligature
+     reset keeps `=>`, `!=`, etc. from collapsing into glyphs that look
+     wrong next to terminal output.
+*/
+@layer utilities {
+  .divider-y {
+    border-color: var(--border);
+  }
+  .mono {
+    font-family: 'JetBrains Mono Variable', 'JetBrains Mono', 'SF Mono', ui-monospace, monospace;
+    font-variant-ligatures: none;
+  }
 }
 
 /* Markdown rendered inside an assistant chat bubble. `@tailwindcss/typography`
@@ -168,3 +240,196 @@
 }
 .chat-markdown a { text-decoration: underline; text-underline-offset: 2px; }
 .chat-markdown strong { font-weight: 600; }
+
+/* Reset inherited `overflow-wrap: anywhere` / `word-break` from the markdown
+   container on fenced code blocks. The container needs aggressive wrapping
+   so long URLs and unbreakable identifiers in paragraphs don't overflow the
+   bubble, but those properties are inherited and would otherwise force
+   line-breaks inside `<pre>` even though `white-space: pre` is set — that's
+   what makes ASCII box-drawing diagrams (│ ─ ┌ ┐ └ ┘) render as a "staircase"
+   of broken boxes. Horizontal scroll on the `<pre>` (overflow-x-auto, applied
+   per-component) only kicks in once wrapping is disabled here. */
+.chat-markdown pre {
+  overflow-wrap: normal;
+  word-break: normal;
+  white-space: pre;
+  overflow-x: auto;
+  max-width: 100%;
+}
+.chat-markdown pre code {
+  overflow-wrap: normal;
+  word-break: normal;
+  white-space: pre;
+}
+
+/* M22 slice 02 / T05 — code-editor utilities lifted verbatim from the
+ * prototype (docs/prototypes/*.html lines 33–43). These classes are the
+ * structural primitives Monaco theme overlays will hook into in M23:
+ *
+ *   .editor-line — 56px gutter + 1fr content row, 22px line-height
+ *   .ln          — gutter cell (right-aligned, non-selectable line numbers)
+ *   .tok-*       — syntax-highlight token colours (kw, fn, str, com, num, type)
+ *   .diff-*      — added/removed line backgrounds + gutter markers
+ *
+ * Colour values are pinned to the prototype palette and MUST NOT be
+ * tweaked here — Monaco theme overlays in M23 reference the same hex
+ * values, and the visual baselines in slice 03 hash them. If a colour
+ * needs to change, change it in the prototype + the M23 theme + here in
+ * one PR.
+ *
+ * Wrapped in `@layer utilities` so the orphan/missing checker
+ * (css-utilities.test.ts) can find them — the checker scans the layer
+ * scope, not the whole file. */
+@layer utilities {
+  .editor-line { display: grid; grid-template-columns: 56px 1fr; line-height: 22px; }
+  .editor-line:hover { background: rgba(99,102,241,.05); }
+  .ln { color: rgb(113 113 122); text-align: right; padding-right: 18px; user-select: none; font-size: 12px; }
+  .dark .ln { color: rgb(82 82 91); }
+  .tok-kw { color: #c084fc; }
+  .tok-fn { color: #60a5fa; }
+  .tok-str { color: #86efac; }
+  .tok-com { color: #71717a; font-style: italic; }
+  .tok-num { color: #fbbf24; }
+  .tok-type { color: #f472b6; }
+  .diff-add { background: rgba(34,197,94,.10); border-left: 2px solid rgba(34,197,94,.5); }
+  .diff-rem { background: rgba(239,68,68,.10); border-left: 2px solid rgba(239,68,68,.5); }
+  .diff-add-marker { color: rgb(34 197 94); }
+  .diff-rem-marker { color: rgb(239 68 68); }
+}
+
+/* Activity affordance utilities — `pulse-dot` and `agent-glow` are the two
+ * motion primitives used across the SPA to signal "something is alive".
+ *   - `pulse-dot` is the status-dot primitive (a row in a list, a badge
+ *     in a header). It combines opacity with a subtle scale so the
+ *     motion still reads in monochrome / colour-blind palettes.
+ *   - `agent-glow` is the agent-message primitive. The inset box-shadow
+ *     walks the message's left rule from transparent to indigo and back,
+ *     which is geometrically distinct from an outline and never paints
+ *     outside the element's box (so it composes with rounded corners and
+ *     adjacent siblings without bleed).
+ *
+ * Both opt out under `prefers-reduced-motion: reduce` per WCAG 2.3.3 —
+ * .pulse-dot also resets opacity + transform so the dot doesn't freeze
+ * mid-cycle at 55% opacity / 0.85× scale. */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: .55; transform: scale(.85); }
+}
+@layer utilities {
+  .pulse-dot {
+    animation: pulse-dot 1.6s ease-in-out infinite;
+  }
+}
+
+@keyframes glow {
+  0%, 100% { box-shadow: inset 2px 0 0 rgba(99, 102, 241, 0); }
+  50%      { box-shadow: inset 2px 0 0 rgba(99, 102, 241, 1); }
+}
+@layer utilities {
+  .agent-glow {
+    animation: glow 2.4s ease-in-out infinite;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pulse-dot,
+  .agent-glow {
+    animation: none;
+  }
+  .pulse-dot {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Mission events feed — fresh-row enter animation. Applied via the
+ * `data-fresh="true"` attribute on a `MissionEventRow` when it has been
+ * prepended by the live SSE/WS stream (vs. landing via the canonical GET).
+ * Slide-down (4px) + fade-in over 200ms; opt-out under reduced-motion so
+ * users at the OS level see no movement and no fade — the row is simply
+ * present at full opacity. The data-attribute selector lets the parent
+ * surface decide which rows are "fresh" without re-keying the React tree. */
+@keyframes mission-event-fresh {
+  0%   { opacity: 0; transform: translateY(-4px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+@layer utilities {
+  [data-fresh="true"].mission-event-row {
+    animation: mission-event-fresh 200ms ease-out both;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-fresh="true"].mission-event-row {
+    animation: none;
+  }
+}
+
+/* Hover-lift utility for clickable cards (project tiles, slice tiles, etc.).
+   The 150ms transition covers transform, shadow, and border-color so the
+   lift, indigo glow, and indigo border arrive together — a single named
+   class keeps these three properties in lockstep across consumers and
+   prevents the "shadow without lift" or "lift without color" half-states
+   that creep in when each surface re-implements the effect locally. */
+@layer utilities {
+  .card-hover {
+    transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
+  }
+  .card-hover:hover {
+    transform: translateY(-1px);
+    border-color: rgb(99 102 241 / .5);
+    box-shadow: 0 8px 24px -8px rgba(99,102,241,.25);
+  }
+}
+
+/* Active-tab underline. We deliberately use a 1px ::after pseudo-element
+   pinned to bottom: -1px instead of `border-b-2` so the underline overlaps
+   the tab strip's own bottom border (which sits at y=0 of the strip's
+   border-box). A real border would push content up by 2px on activation
+   and produce a visible "tab grew" jolt; the pseudo-element layers cleanly
+   on top with zero layout shift. Color tracks --foreground so it auto-themes
+   without an extra dark-mode override. */
+@layer utilities {
+  .tab-active {
+    position: relative;
+  }
+  .tab-active::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: -1px;
+    height: 1px;
+    background: var(--foreground);
+  }
+}
+
+/* Sparkbar / bar utilities — used by inline sparkline-style chart strips
+ * (e.g. token usage strip on the project card) and the column-bar fill
+ * demo on the dev tokens preview.
+ *
+ * `.sparkbar` is intentionally `currentColor`-driven: the parent picks
+ * the tone (e.g. `<span class="text-emerald-500">` for "healthy",
+ * `text-destructive` for "over budget"). Don't hard-code a fill here.
+ *
+ * `.bar` ships the dark-mode gradient by default; `.light .bar` overrides
+ * for light mode per the prototype. The ThemeProvider toggles `.light` /
+ * `.dark` on the document root, so the override resolves correctly
+ * without any per-component handling. */
+@layer utilities {
+  .sparkbar {
+    display: inline-block;
+    width: 3px;
+    margin-right: 1px;
+    background: currentColor;
+    opacity: .65;
+    vertical-align: bottom;
+    border-radius: 1px;
+  }
+  .bar {
+    background: linear-gradient(180deg, #818cf8 0%, #6366f1 100%);
+    border-radius: 3px 3px 0 0;
+  }
+  .light .bar {
+    background: linear-gradient(180deg, #6366f1 0%, #4f46e5 100%);
+  }
+}

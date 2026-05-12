@@ -29,6 +29,14 @@ export interface TaskFormValues {
   selectedWorkspaceId: string;
   selectedProjectId: string;
   permissionMode: PermissionMode | null;
+  /**
+   * Worktree-isolation opt-in. When true, the submitter maps it to
+   * `isolation: 'worktree'` on the API payload and the executor
+   * materialises a per-task git worktree under
+   * `<project>/.flockctl/worktrees/task-<id>/` before launch
+   * (matches `claude --worktree`). False = legacy shared-cwd behaviour.
+   */
+  isolateWorktree: boolean;
 }
 
 export const defaultTaskFormValues: TaskFormValues = {
@@ -40,6 +48,7 @@ export const defaultTaskFormValues: TaskFormValues = {
   selectedWorkspaceId: "",
   selectedProjectId: "",
   permissionMode: null,
+  isolateWorktree: false,
 };
 
 interface TaskFormFieldsProps {
@@ -49,10 +58,34 @@ interface TaskFormFieldsProps {
   idPrefix: string;
   /** Hide the Agent selector (templates don't carry an agent binding today). */
   hideAgent?: boolean;
+  /**
+   * Hide the Model selector. Used by templates — model selection has
+   * moved onto schedules so a template can be reused with different
+   * models per schedule (matches the same migration `assigned_key_id`
+   * already went through). Without this flag, a template author would
+   * pick a model in the form, the field would be persisted on disk,
+   * and the schedule UI's model picker would silently override it on
+   * fire — confusing both ways.
+   */
+  hideModel?: boolean;
+  /**
+   * Hide the AI Key selector. Same rationale as `hideModel`: AI key is
+   * configured per schedule, not on the template. The legacy note
+   * directly under TaskFormFields ("AI key is configured per schedule…")
+   * lives on the parent dialog and should be removed alongside this
+   * flag — keeping the field hidden makes the note redundant.
+   */
+  hideKey?: boolean;
   /** Hide the Workspace/Project row — templates carry their own scope binding. */
   hideWorkspaceProject?: boolean;
   /** Render AI Key above Model instead of the default (Model → AI Key) order. */
   keyBeforeModel?: boolean;
+  /**
+   * Hide the worktree-isolation checkbox (rare — used by surfaces where
+   * the field doesn't apply, e.g. a future `flockctl run` ad-hoc form
+   * that bypasses the executor pipeline). Defaults to visible.
+   */
+  hideIsolation?: boolean;
 }
 
 export function TaskFormFields({
@@ -60,8 +93,11 @@ export function TaskFormFields({
   onChange,
   idPrefix,
   hideAgent = false,
+  hideModel = false,
+  hideKey = false,
   hideWorkspaceProject = false,
   keyBeforeModel = false,
+  hideIsolation = false,
 }: TaskFormFieldsProps) {
   const { data: meta } = useMeta();
   const { data: aiKeys } = useAIKeys();
@@ -178,19 +214,26 @@ export function TaskFormFields({
     </div>
   );
 
+  // Model / Key fields are conditionally hidden for templates — both
+  // moved onto Schedules in the same way `assigned_key_id` did. Pass
+  // `null` (rendered nothing) instead of stripping the slot entirely
+  // so the conditional below stays one clean expression.
+  const visibleModelField = hideModel ? null : modelField;
+  const visibleKeyField = hideKey ? null : keyField;
+
   return (
     <>
       {agentField}
 
       {keyBeforeModel ? (
         <>
-          {keyField}
-          {modelField}
+          {visibleKeyField}
+          {visibleModelField}
         </>
       ) : (
         <>
-          {modelField}
-          {keyField}
+          {visibleModelField}
+          {visibleKeyField}
         </>
       )}
 
@@ -262,6 +305,31 @@ export function TaskFormFields({
           inheritLabel="inherit from project / workspace"
         />
       </div>
+
+      {!hideIsolation && (
+        <div className="flex items-start gap-2 rounded-md border border-border bg-muted/30 p-3">
+          <input
+            id={`${idPrefix}-isolate`}
+            type="checkbox"
+            className="mt-1"
+            checked={values.isolateWorktree}
+            onChange={(e) => set("isolateWorktree", e.target.checked)}
+          />
+          <Label
+            htmlFor={`${idPrefix}-isolate`}
+            className="cursor-pointer"
+          >
+            <div className="font-medium">Run in isolated git worktree</div>
+            <div className="mt-0.5 text-xs text-muted-foreground">
+              Creates a fresh branch (<code>flockctl/task-&lt;id&gt;</code>)
+              and worktree under <code>.flockctl/worktrees/</code> so this
+              task's edits can't collide with parallel runs. Requires the
+              project to be a git repo with at least one commit; falls
+              back silently to the shared cwd otherwise.
+            </div>
+          </Label>
+        </div>
+      )}
     </>
   );
 }

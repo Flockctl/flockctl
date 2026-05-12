@@ -16,6 +16,7 @@ import {
   registerTaskQuestions,
   registerTaskPermissionResolve,
 } from "./permissions.js";
+import { registerTaskWorktreeCleanup } from "./worktree.js";
 
 export { taskSpecSchema, SPEC_MAX_ACCEPTANCE_CRITERIA_ITEMS, SPEC_MAX_ACCEPTANCE_CRITERION_CHARS, SPEC_MAX_DECISION_TABLE_RULES } from "./helpers.js";
 
@@ -67,3 +68,6 @@ registerTaskQuestions(taskRoutes);
 
 // POST /tasks/:id/permission/:requestId
 registerTaskPermissionResolve(taskRoutes);
+
+// DELETE /tasks/:id/worktree — manual cleanup of an isolated worktree
+registerTaskWorktreeCleanup(taskRoutes);

@@ -82,11 +82,24 @@ export function usePutWorkspaceAgentsMd() {
     }) => putWorkspaceAgentsMd(workspaceId, content),
     onSuccess: (_result, { workspaceId }) => {
       // Workspace AGENTS.md feeds into every child project's effective view,
-      // so invalidate the workspace's own caches and any project-scoped
-      // agents-md caches that might be open.
+      // so we MUST invalidate the workspace's own caches AND any
+      // project-scoped `agents-md/effective` previews that include this
+      // workspace's content. The previous implementation invalidated the
+      // bare `["projects"]` prefix — that wiped EVERY projects-tier query
+      // (list, tree, detail, per-project config) on every workspace
+      // AGENTS.md save, causing UI-wide refetch storms.
+      //
+      // Narrow predicate: target the `agents-md/effective` slot only.
+      // Project rows / lists / configs are unaffected by an AGENTS.md
+      // edit so they have no reason to refetch.
       queryClient.invalidateQueries({ queryKey: queryKeys.workspaceAgentsMd(workspaceId) });
       queryClient.invalidateQueries({ queryKey: workspaceEffectiveKey(workspaceId) });
-      queryClient.invalidateQueries({ queryKey: ["projects"] });
+      queryClient.invalidateQueries({
+        predicate: (q) =>
+          q.queryKey[0] === "projects" &&
+          q.queryKey[2] === "agents-md" &&
+          q.queryKey[3] === "effective",
+      });
     },
   });
 }

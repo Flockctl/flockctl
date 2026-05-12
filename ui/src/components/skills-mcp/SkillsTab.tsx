@@ -213,6 +213,7 @@ export function SkillsTab({
                             variant="ghost"
                             size="icon"
                             className="h-7 w-7"
+                            aria-label={`Edit skill ${skill.name}`}
                             onClick={(e) => {
                               e.stopPropagation();
                               openEdit(skill);
@@ -226,6 +227,7 @@ export function SkillsTab({
                             variant="ghost"
                             size="icon"
                             className="h-7 w-7"
+                            aria-label={`Delete skill ${skill.name}`}
                             onClick={(e) => {
                               e.stopPropagation();
                               handleDelete(skill);

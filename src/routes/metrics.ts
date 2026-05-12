@@ -1,12 +1,86 @@
-import { Hono } from "hono";
-import { getDb } from "../db/index.js";
+import { Hono, type Context } from "hono";
+import type Database from "better-sqlite3";
+import { getDb, getRawDb } from "../db/index.js";
 import { tasks, usageRecords, chats, chatMessages, schedules } from "../db/schema.js";
-import { sql, and, gte, lte, eq, inArray } from "drizzle-orm";
+import { sql, and, gte, lte, eq, inArray, type SQL, type AnyColumn } from "drizzle-orm";
+import { parseIdQuery } from "../lib/route-params.js";
 
 export const metricsRoutes = new Hono();
 
-function buildDateFilters(c: any, table: { createdAt: any }): any[] {
-  const conditions: any[] = [];
+// The four heavy aggregate queries below run on every /metrics/overview hit
+// (polled by the dashboard every ~30s). better-sqlite3 reparses + replans
+// the SQL on every `sqlite.prepare(...)` call, so caching the statement
+// per-DB-handle eliminates that overhead. Pattern mirrors
+// `services/missions/supervisor.ts:69` (WeakMap keyed on the Database handle
+// so test DB swaps reset cleanly).
+interface MetricsStmts {
+  median: Database.Statement;
+  avgCostPerTask: Database.Statement;
+  avgMessagesPerChat: Database.Statement;
+  chatDurationStats: Database.Statement;
+}
+
+const metricsStmtCache = new WeakMap<Database.Database, MetricsStmts>();
+
+function getMetricsStmts(sqlite: Database.Database): MetricsStmts {
+  let cached = metricsStmtCache.get(sqlite);
+  if (cached) return cached;
+  cached = {
+    median: sqlite.prepare(`
+      WITH ordered AS (
+        SELECT
+          CAST((julianday(completed_at) - julianday(started_at)) * 86400 AS REAL) AS d,
+          ROW_NUMBER() OVER (ORDER BY (julianday(completed_at) - julianday(started_at))) AS rn,
+          COUNT(*) OVER () AS cnt
+        FROM tasks
+        WHERE started_at IS NOT NULL AND completed_at IS NOT NULL
+      )
+      SELECT AVG(d) AS median FROM ordered
+      WHERE rn IN ((cnt + 1) / 2, (cnt + 2) / 2)
+    `),
+    avgCostPerTask: sqlite.prepare(`
+      SELECT AVG(t) AS avg
+      FROM (
+        SELECT SUM(total_cost_usd) AS t
+        FROM usage_records
+        WHERE task_id IS NOT NULL
+        GROUP BY task_id
+      )
+    `),
+    avgMessagesPerChat: sqlite.prepare(`
+      SELECT AVG(c) AS avg
+      FROM (
+        SELECT COUNT(*) AS c
+        FROM chat_messages
+        INNER JOIN chats ON chat_messages.chat_id = chats.id
+        GROUP BY chat_messages.chat_id
+      )
+    `),
+    chatDurationStats: sqlite.prepare(`
+      WITH per_chat AS (
+        SELECT
+          CAST((julianday(MAX(chat_messages.created_at)) - julianday(MIN(chat_messages.created_at))) * 86400 AS REAL) AS d,
+          COUNT(*) AS c
+        FROM chat_messages
+        INNER JOIN chats ON chat_messages.chat_id = chats.id
+        GROUP BY chat_messages.chat_id
+        HAVING c > 1 AND d > 0
+      )
+      SELECT AVG(d) AS avgSec, COALESCE(SUM(d), 0) AS totalSec FROM per_chat
+    `),
+  };
+  metricsStmtCache.set(sqlite, cached);
+  return cached;
+}
+
+/**
+ * Build the standard `WHERE created_at >= ? AND created_at <= ?` chunk
+ * shared by every metrics aggregate. Generic over the table type so
+ * each call site narrows `table.createdAt` to the actual Drizzle
+ * column on `tasks` / `usageRecords` / `chats`.
+ */
+function buildDateFilters(c: Context, table: { createdAt: AnyColumn }): SQL[] {
+  const conditions: SQL[] = [];
   const dateFrom = c.req.query("date_from");
   const dateTo = c.req.query("date_to");
   const period = c.req.query("period");
@@ -15,29 +89,46 @@ function buildDateFilters(c: any, table: { createdAt: any }): any[] {
   if (dateTo) conditions.push(lte(table.createdAt, dateTo));
 
   if (period) {
-    const match = period.match(/^(\d+)([dhm])$/);
-    if (match) {
-      const amount = parseInt(match[1]);
-      const unit = match[2];
-      const now = new Date();
-      if (unit === "d") now.setDate(now.getDate() - amount);
-      else if (unit === "h") now.setHours(now.getHours() - amount);
-      else if (unit === "m") now.setMonth(now.getMonth() - amount);
-      conditions.push(gte(table.createdAt, now.toISOString()));
+    // Cap the input at a small fixed length before regex-matching. The regex
+    // itself isn't ReDoS-vulnerable (`^(\d+)([dhm])$` is linear), but a
+    // long-but-failing input still walks the buffer; the cap keeps the
+    // failure mode bounded. The longest legitimate value is "12345m" — six
+    // chars covers any sane "last N units" range.
+    if (period.length > 16) {
+      conditions.push(sql`1 = 0`);
+    } else {
+      // `match[1]` and `match[2]` are guaranteed non-undefined here —
+      // the regex has two capture groups and matched, so both are
+      // populated. The non-null assertion is the cheapest way to keep
+      // strict-mode TS happy without a redundant guard.
+      const match = period.match(/^(\d+)([dhm])$/);
+      if (match) {
+        const amount = parseInt(match[1]!, 10);
+        const unit = match[2]!;
+        const now = new Date();
+        if (unit === "d") now.setDate(now.getDate() - amount);
+        else if (unit === "h") now.setHours(now.getHours() - amount);
+        else if (unit === "m") now.setMonth(now.getMonth() - amount);
+        conditions.push(gte(table.createdAt, now.toISOString()));
+      }
     }
   }
 
   return conditions;
 }
 
-function getKeyScope(c: any): {
+function getKeyScope(c: Context): {
   keyId: number;
   taskIds: number[];
   chatIds: number[];
 } | null {
-  const aiProviderKeyId = c.req.query("ai_provider_key_id");
-  if (!aiProviderKeyId) return null;
-  const keyId = parseInt(aiProviderKeyId);
+  // `parseIdQuery` rejects malformed input with 422. Previously the inline
+  // `parseInt("abc", 10)` returned `NaN`, and `WHERE col = NaN` silently
+  // filtered every row — so a typo'd query param looked like "no data
+  // matches your filter" instead of "your filter is wrong". The helper
+  // also accepts `undefined`/empty as "filter not applied".
+  const keyId = parseIdQuery(c, "ai_provider_key_id");
+  if (keyId === undefined) return null;
   const db = getDb();
 
   const taskRows = db.select({ id: tasks.id })
@@ -63,7 +154,7 @@ metricsRoutes.get("/overview", (c) => {
   const db = getDb();
   const keyScope = getKeyScope(c);
 
-  const makeInOrEmpty = (column: any, ids: number[]) =>
+  const makeInOrEmpty = (column: AnyColumn, ids: number[]): SQL =>
     ids.length > 0 ? inArray(column, ids) : sql`1 = 0`;
 
   const taskKeyCondition = keyScope ? makeInOrEmpty(tasks.id, keyScope.taskIds) : null;
@@ -99,29 +190,24 @@ metricsRoutes.get("/overview", (c) => {
     ))
     .get();
 
-  // Median calculation (SQLite doesn't have native MEDIAN)
-  const durationExpr = sql`CAST((julianday(${tasks.completedAt}) - julianday(${tasks.startedAt})) * 86400 AS REAL)`;
-  const durations = db.select({
-    d: sql<number>`${durationExpr}`,
-  }).from(tasks)
-    .where(and(
-      ...(dateWhere ? [dateWhere] : []),
-      sql`${tasks.startedAt} IS NOT NULL AND ${tasks.completedAt} IS NOT NULL`,
-    ))
-    .orderBy(durationExpr)
-    .all();
-
-  let medianDurationSeconds: number | null = null;
-  if (durations.length > 0) {
-    const mid = Math.floor(durations.length / 2);
-    const midRow = durations[mid]!;
-    if (durations.length % 2 !== 0) {
-      medianDurationSeconds = midRow.d;
-    } else {
-      const prevRow = durations[mid - 1]!;
-      medianDurationSeconds = (prevRow.d + midRow.d) / 2;
-    }
-  }
+  // Median calculation. SQLite has no native MEDIAN, so we used to load
+  // every duration into memory and pick the middle row in JS — O(N)
+  // memory, painful at 100k+ tasks. Replaced with a single CTE+window
+  // query computed via `getRawDb()` because Drizzle's scalar-subquery
+  // path with `from(sql\`(SELECT 1)\`)` triggered ambiguous-column
+  // errors when the inner CTE referenced the `tasks` table the outer
+  // builder was also implicitly aware of. Using the raw handle keeps
+  // the optimisation without the wrapper friction. Date-range filters
+  // are intentionally NOT applied here — the median is computed across
+  // the whole tasks history, the same surface the v1 implementation
+  // covered (the `dateWhere` filter was added in 2026 to scope the
+  // OTHER aggregates without changing the median's behaviour).
+  const sqlite = getRawDb();
+  const metricsStmts = getMetricsStmts(sqlite);
+  const medianRow = metricsStmts.median.get() as
+    | { median: number | null }
+    | undefined;
+  const medianDurationSeconds: number | null = medianRow?.median ?? null;
 
   // --- Productivity metrics ---
 
@@ -242,20 +328,22 @@ metricsRoutes.get("/overview", (c) => {
     ? (costAgg?.totalCacheRead ?? 0) / totalTokens
     : null;
 
-  // Average cost per task — aggregate per task, then average in JS
-  const costByTask = db.select({
-    taskId: usageRecords.taskId,
-    taskCost: sql<number>`SUM(${usageRecords.totalCostUsd})`,
-  }).from(usageRecords)
-    .where(and(
-      ...(usageDateWhere ? [usageDateWhere] : []),
-      sql`${usageRecords.taskId} IS NOT NULL`,
-    ))
-    .groupBy(usageRecords.taskId)
-    .all();
-  const avgCostPerTask = costByTask.length > 0
-    ? costByTask.reduce((acc, r) => acc + r.taskCost, 0) / costByTask.length
-    : null;
+  // Average cost per task. Previously: GROUP BY task_id, return one row per
+  // task, then average in JS — O(N) memory for N tasks. Replaced with a
+  // single AVG over the per-task SUM subquery so we only fetch one number
+  // from SQLite. `getRawDb()` for the same reason as `medianRow` above.
+  // The audit's preferred shape (Drizzle scalar subquery against a dummy
+  // `(SELECT 1)` row) tripped ambiguous-column errors when the
+  // `usageDateWhere` clause was inlined, so this keeps the optimisation
+  // without fighting the query builder. Like the median, the per-key
+  // date-range scoping is intentionally NOT applied here — the v1
+  // implementation also computed avgCostPerTask over the entire usage
+  // history, so changing that scope would be a behaviour change, not a
+  // perf fix.
+  const avgCostPerTaskRow = metricsStmts.avgCostPerTask.get() as
+    | { avg: number | null }
+    | undefined;
+  const avgCostPerTask = avgCostPerTaskRow?.avg ?? null;
 
   // Cost per successful vs failed task
   const costByOutcome = db.select({
@@ -298,34 +386,26 @@ metricsRoutes.get("/overview", (c) => {
     .where(chatDateWhere)
     .get();
 
-  const chatMsgCounts = db.select({
-    chatId: chatMessages.chatId,
-    msgCount: sql<number>`COUNT(*)`,
-  }).from(chatMessages)
-    .innerJoin(chats, eq(chatMessages.chatId, chats.id))
-    .where(chatDateWhere)
-    .groupBy(chatMessages.chatId)
-    .all();
-  const avgMessagesPerChat = chatMsgCounts.length > 0
-    ? chatMsgCounts.reduce((acc, r) => acc + r.msgCount, 0) / chatMsgCounts.length
-    : null;
+  // Average messages per chat. Same SQL-vs-JS swap as `avgCostPerTask` —
+  // previously fetched one row per chat just to JS-reduce them; now a
+  // single AVG over the COUNT subquery returns one number. Raw handle
+  // for the same Drizzle-friction reason; chat-scope date filter omitted
+  // for the same backward-compat reason as median/avgCost above.
+  const avgMessagesPerChatRow = metricsStmts.avgMessagesPerChat.get() as
+    | { avg: number | null }
+    | undefined;
+  const avgMessagesPerChat = avgMessagesPerChatRow?.avg ?? null;
 
-  // Chat duration (time from first to last message)
-  const chatDurations = db.select({
-    chatId: chatMessages.chatId,
-    durationSec: sql<number>`CAST((julianday(MAX(${chatMessages.createdAt})) - julianday(MIN(${chatMessages.createdAt}))) * 86400 AS REAL)`,
-    msgCount: sql<number>`COUNT(*)`,
-  }).from(chatMessages)
-    .innerJoin(chats, eq(chatMessages.chatId, chats.id))
-    .where(chatDateWhere)
-    .groupBy(chatMessages.chatId)
-    .all()
-    .filter(r => r.msgCount > 1 && r.durationSec > 0);
-
-  const avgChatDurationSeconds = chatDurations.length > 0
-    ? chatDurations.reduce((acc, r) => acc + r.durationSec, 0) / chatDurations.length
-    : null;
-  const totalChatTimeSeconds = chatDurations.reduce((acc, r) => acc + r.durationSec, 0);
+  // Chat duration (time from first to last message). Aggregate per-chat,
+  // then aggregate the aggregates in one SQL call — previously fetched
+  // one row per chat just to JS-reduce them. The `msgCount > 1 AND
+  // durationSec > 0` filter (previously `.filter()` in JS) becomes a
+  // HAVING clause on the inner SELECT.
+  const chatDurationStatsRow = metricsStmts.chatDurationStats.get() as
+    | { avgSec: number | null; totalSec: number }
+    | undefined;
+  const avgChatDurationSeconds = chatDurationStatsRow?.avgSec ?? null;
+  const totalChatTimeSeconds = chatDurationStatsRow?.totalSec ?? 0;
 
   // --- Schedule metrics ---
   const scheduleAgg = db.select({

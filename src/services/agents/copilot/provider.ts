@@ -15,6 +15,7 @@ import {
   streamViaCopilotSdk,
 } from "../../ai/copilot-sdk.js";
 import type { AgentUsage } from "../types.js";
+import { BoundedStringAccumulator } from "../../../lib/bounded-string.js";
 
 /**
  * GitHub Copilot provider.
@@ -58,7 +59,8 @@ export class CopilotProvider implements AgentProvider {
     // full turn and emitted a single text block at the end; that erased all
     // tool-boundary context and made Copilot chats render as one post-hoc
     // blob instead of a per-block live transcript.
-    let text = "";
+    // Bounded chunk-buffer accumulator (see lib/bounded-string.ts).
+    const textAcc = new BoundedStringAccumulator();
     const usage: AgentUsage = {
       inputTokens: 0,
       outputTokens: 0,
@@ -80,7 +82,7 @@ export class CopilotProvider implements AgentProvider {
       onEvent: opts.onEvent,
     })) {
       if (ev.type === "text" && ev.text) {
-        text += ev.text;
+        textAcc.append(ev.text);
         opts.onEvent?.({ type: "text", content: ev.text });
       } else if (ev.type === "done" && ev.usage) {
         usage.inputTokens = ev.usage.inputTokens;
@@ -89,6 +91,7 @@ export class CopilotProvider implements AgentProvider {
         errorMsg = ev.error;
       }
     }
+    const text = textAcc.toString();
     if (errorMsg) {
       throw new Error(`Copilot SDK error: ${errorMsg}`);
     }

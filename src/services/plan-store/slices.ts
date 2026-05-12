@@ -11,6 +11,7 @@ import {
   nextOrder,
   dedupeSlug,
   toSlug,
+  assertSafePlanSlug,
 } from "./md-io.js";
 
 // ─── Slice frontmatter mapping ───
@@ -79,6 +80,7 @@ export function sliceToApi(s: SliceData): Record<string, any> {
 // ─── Slices ───
 
 export function listSlices(projectPath: string, milestoneSlug: string): SliceData[] {
+  assertSafePlanSlug(milestoneSlug, "milestone slug");
   const milestoneDir = join(getPlanDir(projectPath), milestoneSlug);
   const dirs = sortedDirs(milestoneDir);
 
@@ -91,6 +93,8 @@ export function listSlices(projectPath: string, milestoneSlug: string): SliceDat
 }
 
 export function getSlice(projectPath: string, milestoneSlug: string, slug: string): SliceData | null {
+  assertSafePlanSlug(milestoneSlug, "milestone slug");
+  assertSafePlanSlug(slug, "slice slug");
   const mdPath = join(getPlanDir(projectPath), milestoneSlug, slug, "slice.md");
   if (!existsSync(mdPath)) return null;
   const { frontmatter, body } = parseMd(mdPath);
@@ -98,6 +102,7 @@ export function getSlice(projectPath: string, milestoneSlug: string, slug: strin
 }
 
 export function createSlice(projectPath: string, milestoneSlug: string, data: Partial<SliceData>): SliceData {
+  assertSafePlanSlug(milestoneSlug, "milestone slug");
   const milestoneDir = join(getPlanDir(projectPath), milestoneSlug);
   if (!existsSync(join(milestoneDir, "milestone.md"))) {
     throw new Error(`Milestone not found: ${milestoneSlug}`);
@@ -134,6 +139,8 @@ export function createSlice(projectPath: string, milestoneSlug: string, data: Pa
 }
 
 export function updateSlice(projectPath: string, milestoneSlug: string, slug: string, data: Partial<SliceData>): SliceData {
+  assertSafePlanSlug(milestoneSlug, "milestone slug");
+  assertSafePlanSlug(slug, "slice slug");
   const existing = getSlice(projectPath, milestoneSlug, slug);
   if (!existing) throw new Error(`Slice not found: ${slug}`);
 
@@ -151,6 +158,8 @@ export function updateSlice(projectPath: string, milestoneSlug: string, slug: st
 }
 
 export function deleteSlice(projectPath: string, milestoneSlug: string, slug: string): void {
+  assertSafePlanSlug(milestoneSlug, "milestone slug");
+  assertSafePlanSlug(slug, "slice slug");
   const dir = join(getPlanDir(projectPath), milestoneSlug, slug);
   if (!existsSync(dir)) throw new Error(`Slice not found: ${slug}`);
   rmSync(dir, { recursive: true, force: true });

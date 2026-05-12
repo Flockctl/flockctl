@@ -1,5 +1,5 @@
 import { memo, useState, type ReactNode } from "react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import "highlight.js/styles/github-dark.css";
@@ -7,6 +7,9 @@ import { Button } from "@/components/ui/button";
 import { Copy, Check, Loader2 } from "lucide-react";
 import { MessageAttachments } from "@/components/MessageAttachments";
 import { InlineDiff } from "@/components/InlineDiff";
+import { formatCostFine } from "@/lib/format";
+import { extractText } from "@/lib/react-children";
+import { parseServerTimestamp } from "@/lib/utils";
 import type { ChatMessageAttachment } from "@/lib/types";
 
 interface ChatMessageProps {
@@ -48,7 +51,7 @@ function CodeBlock({ children, className }: { children?: ReactNode; className?: 
     <div className="group/code relative my-2 overflow-hidden rounded-md border border-border">
       <div className="flex items-center justify-between bg-zinc-800 px-3 py-1 text-xs text-zinc-400">
         <span>{language}</span>
-        <Button variant="ghost" size="icon" className="h-6 w-6 text-zinc-400 hover:text-zinc-200" onClick={handleCopy}>
+        <Button variant="ghost" size="icon" className="h-6 w-6 text-zinc-400 hover:text-zinc-200" aria-label={copied ? "Copied" : "Copy code"} onClick={handleCopy}>
           {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
         </Button>
       </div>
@@ -57,16 +60,73 @@ function CodeBlock({ children, className }: { children?: ReactNode; className?: 
   );
 }
 
-/** Recursively extract text from React children (for the copy button). */
-function extractText(node: ReactNode): string {
-  if (typeof node === "string") return node;
-  if (typeof node === "number") return String(node);
-  if (Array.isArray(node)) return node.map(extractText).join("");
-  if (node && typeof node === "object" && "props" in node) {
-    return extractText((node as { props: { children?: ReactNode } }).props.children);
-  }
-  return "";
-}
+// ─── Hoisted ReactMarkdown configuration ─────────────────────────────────
+//
+// `<ReactMarkdown>` memoises its AST internally keyed on the identity of
+// the `remarkPlugins`, `rehypePlugins`, and `components` props. When these
+// were inline literals inside the render body, every streaming token tick
+// produced fresh references → ReactMarkdown re-parsed and re-highlighted
+// the entire scrollback on every keystroke. Hoisting them to module
+// scope makes them stable references for the lifetime of the module, so
+// React.memo'd ChatMessage bubbles skip the heavy re-parse on every
+// update.
+const MARKDOWN_REMARK_PLUGINS = [remarkGfm];
+const MARKDOWN_REHYPE_PLUGINS = [rehypeHighlight];
+const MARKDOWN_COMPONENTS: Components = {
+  code({ className, children, ...rest }) {
+    const text = extractText(children);
+    const isBlock =
+      text.includes("\n") ||
+      !!className?.startsWith("language-") ||
+      !!className?.startsWith("hljs");
+    if (isBlock) {
+      if (className === "language-diff" || className === "hljs language-diff") {
+        return <InlineDiff diff={text} />;
+      }
+      return <CodeBlock className={className}>{children}</CodeBlock>;
+    }
+    return (
+      <code
+        className="break-all rounded bg-zinc-200 px-1 py-0.5 text-xs dark:bg-zinc-700"
+        {...rest}
+      >
+        {children}
+      </code>
+    );
+  },
+  pre({ children }) {
+    return <>{children}</>;
+  },
+  a({ href, children }) {
+    return (
+      <a
+        href={href}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="break-all text-primary underline"
+      >
+        {children}
+      </a>
+    );
+  },
+  table({ children }) {
+    return (
+      <div className="my-2 max-w-full overflow-x-auto">
+        <table className="w-full border-collapse text-xs">{children}</table>
+      </div>
+    );
+  },
+  th({ children }) {
+    return (
+      <th className="border border-border bg-muted/50 px-2 py-1 text-left font-medium">
+        {children}
+      </th>
+    );
+  },
+  td({ children }) {
+    return <td className="border border-border px-2 py-1">{children}</td>;
+  },
+};
 
 function ChatMessageImpl({ role, content, isStreaming, inputTokens, outputTokens, costUsd, createdAt, chatId, attachments, messageId }: ChatMessageProps) {
   const [copied, setCopied] = useState(false);
@@ -93,10 +153,23 @@ function ChatMessageImpl({ role, content, isStreaming, inputTokens, outputTokens
 
   return (
     <div
-      className={`group flex ${isUser ? "justify-end" : "justify-start"}`}
+      className={`group flex gap-3 ${isUser ? "justify-end" : "justify-start"}`}
       data-message-id={messageId}
     >
-      <div className="relative max-w-[92%] sm:max-w-[85%] lg:max-w-[80%]">
+      {/* Assistant avatar — gradient "F" circle on the left.
+          Lives outside the bubble so the bubble can be background-less but
+          still has a visible identity. User rows skip it. */}
+      {!isUser && (
+        <div
+          aria-hidden="true"
+          data-testid="assistant-avatar"
+          className="mt-0.5 flex h-7 w-7 flex-none items-center justify-center rounded-full bg-gradient-to-br from-indigo-500 to-fuchsia-500 text-[11px] font-semibold text-white shadow-sm"
+        >
+          F
+        </div>
+      )}
+
+      <div className="relative max-w-[680px]">
         {/* Copy entire message button */}
         <Button
           variant="ghost"
@@ -104,16 +177,19 @@ function ChatMessageImpl({ role, content, isStreaming, inputTokens, outputTokens
           className={`absolute top-1 h-6 w-6 opacity-0 transition-opacity group-hover:opacity-100 ${
             isUser ? "-left-8" : "-right-8"
           }`}
+          aria-label={copied ? "Copied message" : "Copy message"}
           onClick={handleCopy}
         >
           {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3 text-muted-foreground" />}
         </Button>
 
         <div
-          className={`rounded-2xl px-4 py-3 text-sm shadow-sm ${
+          data-testid="chat-bubble"
+          data-role={role}
+          className={`text-sm ${
             isUser
-              ? "bg-primary text-primary-foreground"
-              : "bg-muted/60 border border-border/60"
+              ? "bg-indigo-500/10 dark:bg-indigo-500/15 rounded-2xl rounded-tr-sm px-4 py-2 text-foreground"
+              : "px-0 py-1"
           }`}
         >
           {isUser ? (
@@ -135,43 +211,9 @@ function ChatMessageImpl({ role, content, isStreaming, inputTokens, outputTokens
           ) : (
             <div className="chat-markdown prose prose-sm dark:prose-invert min-w-0 max-w-none break-words [overflow-wrap:anywhere]">
               <ReactMarkdown
-                remarkPlugins={[remarkGfm]}
-                rehypePlugins={[rehypeHighlight]}
-                components={{
-                  code({ className, children, ...rest }) {
-                    const isBlock = className?.startsWith("language-") || className?.startsWith("hljs");
-                    if (isBlock) {
-                      // ```diff fenced blocks get the structured inline-diff
-                      // viewer instead of highlight.js token coloring so hunks,
-                      // gutters and per-file stats line up with the task view.
-                      if (className === "language-diff" || className === "hljs language-diff") {
-                        return <InlineDiff diff={extractText(children)} />;
-                      }
-                      return <CodeBlock className={className}>{children}</CodeBlock>;
-                    }
-                    return <code className="break-all rounded bg-zinc-200 px-1 py-0.5 text-xs dark:bg-zinc-700" {...rest}>{children}</code>;
-                  },
-                  pre({ children }) {
-                    // Let CodeBlock handle the wrapper
-                    return <>{children}</>;
-                  },
-                  a({ href, children }) {
-                    return <a href={href} target="_blank" rel="noopener noreferrer" className="break-all text-primary underline">{children}</a>;
-                  },
-                  table({ children }) {
-                    return (
-                      <div className="my-2 max-w-full overflow-x-auto">
-                        <table className="w-full border-collapse text-xs">{children}</table>
-                      </div>
-                    );
-                  },
-                  th({ children }) {
-                    return <th className="border border-border bg-muted/50 px-2 py-1 text-left font-medium">{children}</th>;
-                  },
-                  td({ children }) {
-                    return <td className="border border-border px-2 py-1">{children}</td>;
-                  },
-                }}
+                remarkPlugins={MARKDOWN_REMARK_PLUGINS}
+                rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
+                components={MARKDOWN_COMPONENTS}
               >
                 {content}
               </ReactMarkdown>
@@ -194,12 +236,12 @@ function ChatMessageImpl({ role, content, isStreaming, inputTokens, outputTokens
           {!isUser && inputTokens != null && outputTokens != null && (
             <span>
               {(inputTokens + outputTokens).toLocaleString()} tokens
-              {costUsd != null && ` · $${costUsd.toFixed(4)}`}
+              {costUsd != null && ` · ${formatCostFine(costUsd)}`}
             </span>
           )}
           {createdAt && (
             <span className="opacity-0 transition-opacity group-hover:opacity-100">
-              {new Date(createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+              {parseServerTimestamp(createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
             </span>
           )}
         </div>

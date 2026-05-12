@@ -1,6 +1,8 @@
 import { getDb } from "../../db/index.js";
-import { aiProviderKeys, projects, workspaces } from "../../db/schema.js";
+import { aiProviderKeys, workspaces } from "../../db/schema.js";
 import { eq, and, or, isNull, sql } from "drizzle-orm";
+import { getProjectById } from "../../lib/db-helpers.js";
+import { jsonSafeParseNumberArray } from "../../lib/json-safe-parse.js";
 
 export interface KeySelection {
   id: number;
@@ -10,14 +12,13 @@ export interface KeySelection {
   configDir?: string | null;
 }
 
+/**
+ * Local thin wrapper around the canonical {@link jsonSafeParseNumberArray}
+ * that returns `[]` for missing / malformed inputs (instead of `null`),
+ * matching the prior contract every caller expects.
+ */
 function safeParseJsonArray(value: string | null | undefined): number[] {
-  if (!value) return [];
-  try {
-    const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
+  return jsonSafeParseNumberArray(value) ?? [];
 }
 
 /**
@@ -46,32 +47,61 @@ export function seedDefaultKey(): void {
  * Resolve allowed key IDs with inheritance: task → project → workspace.
  * Project-level overrides workspace-level (no merge).
  *
- * Returns an empty array when no whitelist is configured at any level
- * (callers should treat "empty" as "no restriction").
+ * Accepts either `projectId` (for tasks/chats scoped to a project) or
+ * `workspaceId` (for workspace-only chats with no project context). When both
+ * are absent the function returns an empty array, which callers treat as
+ * "no restriction". Same when no whitelist is configured at any level.
+ *
+ * History: workspace-only chats used to bypass this entirely — passing
+ * `projectId: null` short-circuited at the top of the function and the
+ * workspace's own whitelist was never consulted, so a workspace-restricted
+ * key set didn't apply to chats started directly on the workspace page.
+ * Adding `workspaceId` here closes that gap.
  */
 export function resolveAllowedKeyIds(task: {
   allowedKeyIds?: string | null;
   projectId?: number | null;
+  workspaceId?: number | null;
 }): number[] {
   // 1. Task-level override (highest priority)
   if (task.allowedKeyIds) {
     return safeParseJsonArray(task.allowedKeyIds);
   }
 
-  if (!task.projectId) return [];
-
   const db = getDb();
-  const project = db.select().from(projects).where(eq(projects.id, task.projectId)).get();
-  if (!project) return [];
 
-  // 2. Project-level override
-  if (project.allowedKeyIds) {
-    return safeParseJsonArray(project.allowedKeyIds);
+  if (task.projectId) {
+    const project = getProjectById(task.projectId);
+    if (!project) {
+      // Project lookup failed — fall through to the workspace-only branch
+      // below if a workspaceId was supplied alongside, otherwise no
+      // restriction. Matches the legacy behaviour of returning [] for
+      // missing projects without a workspace fallback.
+      if (!task.workspaceId) return [];
+    } else {
+      // 2. Project-level override
+      if (project.allowedKeyIds) {
+        return safeParseJsonArray(project.allowedKeyIds);
+      }
+
+      // 3. Workspace-level fallback (project's own workspaceId takes
+      //    precedence over an explicit task.workspaceId — the project
+      //    binding is the source of truth for plan-side resolution).
+      if (project.workspaceId) {
+        const ws = db.select().from(workspaces).where(eq(workspaces.id, project.workspaceId)).get();
+        if (ws?.allowedKeyIds) {
+          return safeParseJsonArray(ws.allowedKeyIds);
+        }
+      }
+      return [];
+    }
   }
 
-  // 3. Workspace-level fallback
-  if (project.workspaceId) {
-    const ws = db.select().from(workspaces).where(eq(workspaces.id, project.workspaceId)).get();
+  // 4. Workspace-only fallback — covers chats started on the workspace page
+  //    where there's no project context at all. Without this branch the
+  //    workspace's `allowed_key_ids` whitelist would be silently ignored.
+  if (task.workspaceId) {
+    const ws = db.select().from(workspaces).where(eq(workspaces.id, task.workspaceId)).get();
     if (ws?.allowedKeyIds) {
       return safeParseJsonArray(ws.allowedKeyIds);
     }
@@ -120,14 +150,16 @@ export async function selectKeyForTask(task: {
     .orderBy(aiProviderKeys.priority)
     .all();
 
-  // Filter out failed keys
+  // Filter out failed keys (Set.has = O(1); plain Array.includes was O(n*m)).
   if (failedIds.length > 0) {
-    candidates = candidates.filter(k => !failedIds.includes(k.id));
+    const failedSet = new Set(failedIds);
+    candidates = candidates.filter(k => !failedSet.has(k.id));
   }
 
-  // Filter to allowed keys if specified
+  // Filter to allowed keys if specified.
   if (allowedIds.length > 0) {
-    candidates = candidates.filter(k => allowedIds.includes(k.id));
+    const allowedSet = new Set(allowedIds);
+    candidates = candidates.filter(k => allowedSet.has(k.id));
   }
 
   // Exclude key IDs reserved or unavailable for this scheduling attempt.

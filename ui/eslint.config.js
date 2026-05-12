@@ -68,4 +68,42 @@ export default defineConfig([
       '@typescript-eslint/no-explicit-any': 'off',
     },
   },
+  {
+    // M22 slice 02 — flat-surface design primitives.
+    //
+    // Pages must consume cards via `<FlatCard>` (re-exported from the
+    // `@/components/design` barrel), not via the shadcn `<Card>` family.
+    // shadcn cards remain available *inside* `ui/src/components/**` —
+    // dialogs, forms, and Radix-driven surfaces still use them.
+    //
+    // Severity: 'warn'.
+    //   - Existing pre-M23 pages (~19 files) still legitimately import
+    //     `@/components/ui/card`; they are migrated as part of M23–M25
+    //     and we don't want to gate CI on the in-flight migration.
+    //   - The hard gate against *new* drift is the vitest fallback test
+    //     at `src/__tests__/lint/no-shadcn-card-on-page.test.ts`, which
+    //     carries an explicit allowlist that shrinks as pages migrate.
+    //   - Once the allowlist hits zero (end of M25), bump this to
+    //     'error' so the rule is enforced at the IDE/PR layer too.
+    //
+    // Scope: only `src/pages/**/*.{ts,tsx}`. Do NOT broaden — shadcn
+    // primitives are an explicit allowed dependency outside `pages/`.
+    files: ['src/pages/**/*.{ts,tsx}'],
+    rules: {
+      'no-restricted-imports': [
+        'warn',
+        {
+          paths: [
+            {
+              name: '@/components/ui/card',
+              message:
+                'Use FlatCard from @/components/design instead on pages. ' +
+                'shadcn <Card> is still allowed inside src/components/** ' +
+                '(dialogs, forms). See ui/CONTRIBUTING-DESIGN.md.',
+            },
+          ],
+        },
+      ],
+    },
+  },
 ])

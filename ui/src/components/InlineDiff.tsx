@@ -1,5 +1,15 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { ChevronRight, FileText } from "lucide-react";
+import { useVirtualizer } from "@tanstack/react-virtual";
+
+/**
+ * Row count threshold above which a file's diff body switches to a
+ * virtualised renderer. Smaller diffs stay on the static table path —
+ * it's lighter on mount cost and keeps DOM testing straightforward.
+ * 200 lines is roughly one viewport at the diff's font size, which is
+ * also where rendering all rows starts to feel sluggish during streaming.
+ */
+const HUNK_VIRTUALIZE_THRESHOLD = 200;
 
 /**
  * Shared inline diff viewer for task change-sets and chat tool-use results.
@@ -293,9 +303,18 @@ export function InlineDiff({ diff, truncated, defaultCollapsed = false, classNam
           </span>
         </div>
       )}
-      {files.map((file, idx) => (
-        <DiffFileCard key={idx} file={file} defaultCollapsed={defaultCollapsed} />
-      ))}
+      {files.map((file, idx) => {
+        // Stable key — `newPath ?? oldPath` is the natural identity of
+        // a diff entry. The previous `key={idx}` keyed by position, so
+        // a streaming diff that appended a new file at the end caused
+        // every existing card's `useState(collapsed)` to reset on each
+        // tick (every card got remounted as React saw "new key for
+        // existing slot"). Falling back to `idx` only when neither
+        // path is available preserves uniqueness for synthetic /
+        // unparsable hunks.
+        const key = file.newPath || file.oldPath || `__pos_${idx}`;
+        return <DiffFileCard key={key} file={file} defaultCollapsed={defaultCollapsed} />;
+      })}
       {truncated && (
         <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-300">
           Output truncated. Showing the first portion of the diff.
@@ -333,15 +352,129 @@ function DiffFileCard({ file, defaultCollapsed }: { file: DiffFile; defaultColla
         )}
       </button>
 
-      {!collapsed && !file.isBinary && (
-        <div className="max-h-[32rem] overflow-auto font-mono text-[11px] leading-[1.45]">
-          {file.hunks.length === 0 ? (
-            <div className="px-3 py-2 text-xs text-muted-foreground">No hunks.</div>
-          ) : (
-            file.hunks.map((hunk, hIdx) => <HunkBlock key={hIdx} hunk={hunk} />)
-          )}
-        </div>
-      )}
+      {!collapsed && !file.isBinary && <DiffFileBody file={file} />}
+    </div>
+  );
+}
+
+/**
+ * Body of a diff file card. Counts the total visible rows (header
+ * markers + lines) up front and switches to a virtualised renderer for
+ * large diffs. The static path keeps the existing DOM structure for
+ * tests that interact with `<table>` and `<tr>` elements; the
+ * virtualised path uses absolute positioning inside a scroll container.
+ */
+function DiffFileBody({ file }: { file: DiffFile }) {
+  // Flatten hunks into a single row sequence so the virtualizer can
+  // measure heights uniformly. Each item is either a hunk header or a
+  // line — the renderer dispatches on `kind`.
+  type FlatItem =
+    | { kind: "header"; key: string; header: string }
+    | { kind: "line"; key: string; line: DiffLine };
+  const flat = useMemo<FlatItem[]>(() => {
+    const out: FlatItem[] = [];
+    for (let h = 0; h < file.hunks.length; h++) {
+      const hunk = file.hunks[h]!;
+      out.push({ kind: "header", key: `h:${h}`, header: hunk.header });
+      for (let i = 0; i < hunk.lines.length; i++) {
+        const line = hunk.lines[i]!;
+        const k =
+          line.oldNo !== undefined || line.newNo !== undefined
+            ? `l:${h}:${line.kind}:${line.oldNo ?? "_"}:${line.newNo ?? "_"}`
+            : `l:${h}:pos:${i}`;
+        out.push({ kind: "line", key: k, line });
+      }
+    }
+    return out;
+  }, [file.hunks]);
+
+  if (file.hunks.length === 0) {
+    return (
+      <div className="px-3 py-2 text-xs text-muted-foreground">No hunks.</div>
+    );
+  }
+
+  if (flat.length > HUNK_VIRTUALIZE_THRESHOLD) {
+    return <VirtualisedDiffBody flat={flat} />;
+  }
+
+  // Static path — preserves the existing `<table>` structure for small
+  // diffs (the common case). Tests / snapshot assertions that walk the
+  // DOM continue to work unchanged for these.
+  return (
+    <div className="max-h-[32rem] overflow-auto font-mono text-[11px] leading-[1.45]">
+      {file.hunks.map((hunk, hIdx) => (
+        <HunkBlock key={hIdx} hunk={hunk} />
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Virtualised renderer for large diffs. Renders only the rows currently
+ * in view (plus a small overscan) and absolutely-positions them inside a
+ * phantom-height scroll container. Headers and lines share the same
+ * row API so the virtualizer doesn't need a heterogeneous-height
+ * special-case beyond the `measureElement` callback.
+ */
+function VirtualisedDiffBody({
+  flat,
+}: {
+  flat: Array<
+    | { kind: "header"; key: string; header: string }
+    | { kind: "line"; key: string; line: DiffLine }
+  >;
+}) {
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const virtualizer = useVirtualizer({
+    count: flat.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => 20, // px per row — refined via measureElement
+    overscan: 30,
+  });
+  return (
+    <div
+      ref={scrollRef}
+      className="max-h-[32rem] overflow-auto font-mono text-[11px] leading-[1.45]"
+    >
+      <div
+        style={{
+          height: virtualizer.getTotalSize(),
+          width: "100%",
+          position: "relative",
+        }}
+      >
+        {virtualizer.getVirtualItems().map((vItem) => {
+          const item = flat[vItem.index];
+          if (!item) return null;
+          return (
+            <div
+              key={item.key}
+              data-index={vItem.index}
+              ref={virtualizer.measureElement}
+              style={{
+                position: "absolute",
+                top: 0,
+                left: 0,
+                width: "100%",
+                transform: `translateY(${vItem.start}px)`,
+              }}
+            >
+              {item.kind === "header" ? (
+                <div className="border-y border-border bg-blue-500/10 px-3 py-1 text-[10px] text-blue-600 dark:text-blue-300">
+                  {item.header}
+                </div>
+              ) : (
+                <table className="w-full border-collapse">
+                  <tbody>
+                    <DiffLineRow line={item.line} />
+                  </tbody>
+                </table>
+              )}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -354,9 +487,17 @@ function HunkBlock({ hunk }: { hunk: DiffHunk }) {
       </div>
       <table className="w-full border-collapse">
         <tbody>
-          {hunk.lines.map((line, i) => (
-            <DiffLineRow key={i} line={line} />
-          ))}
+          {hunk.lines.map((line, i) => {
+            // Compose a stable key from the line's natural identity
+            // (kind + side-line-numbers). Falls back to index when the
+            // line carries no positional metadata (e.g. "\ No newline at
+            // end of file" markers).
+            const k =
+              line.oldNo !== undefined || line.newNo !== undefined
+                ? `${line.kind}:${line.oldNo ?? "_"}:${line.newNo ?? "_"}`
+                : `pos:${i}`;
+            return <DiffLineRow key={k} line={line} />;
+          })}
         </tbody>
       </table>
     </div>

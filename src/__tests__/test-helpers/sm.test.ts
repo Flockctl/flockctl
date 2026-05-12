@@ -3,7 +3,7 @@ import {
   notImplemented,
   toTransitionFrom,
   TransitionSpec,
-} from "../../test-helpers";
+} from "../_helpers";
 import type { StateMachine } from "../../services/state-machines/sm-parser";
 
 const sm: StateMachine = {

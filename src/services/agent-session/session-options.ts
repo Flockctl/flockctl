@@ -94,11 +94,12 @@ export interface AgentSessionOptions {
    */
   thinkingEnabled?: boolean;
   /**
-   * Reasoning effort level (`low` | `medium` | `high` | `max`). Forwarded
-   * verbatim to `provider.chat`. When omitted, the provider falls back to
-   * `"high"` — byte-identical to the pre-toggle behavior.
+   * Reasoning effort level (`low` | `medium` | `high` | `xhigh` | `max`).
+   * Forwarded verbatim to `provider.chat`. When omitted, the provider falls
+   * back to `"xhigh"` (the SDK silently degrades to `"high"` on models that
+   * don't support xhigh — Opus 4.7 is the only model that does today).
    */
-  effort?: "low" | "medium" | "high" | "max";
+  effort?: "low" | "medium" | "high" | "xhigh" | "max";
   /**
    * Workspace scope for this session — name, absolute path, and the list of
    * projects that belong to it. Used to inject a "Workspace projects" block

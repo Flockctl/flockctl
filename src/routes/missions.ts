@@ -42,8 +42,11 @@ import { randomUUID } from "node:crypto";
 import { eq, and, sql, desc } from "drizzle-orm";
 import { getDb, getRawDb } from "../db/index.js";
 import { missions, missionEvents } from "../db/schema.js";
-import { ValidationError } from "../lib/errors.js";
+import { AppError, ValidationError } from "../lib/errors.js";
+import { computeEtag, etagMatches } from "../lib/etag.js";
 import { flattenZodError } from "../lib/zod-utils.js";
+import { jsonSafeParseOrParseError } from "../lib/json-safe-parse.js";
+import { paginationParams } from "../lib/pagination.js";
 import { requireRow, getProjectOrThrow } from "../lib/db-helpers.js";
 import { SUPERVISOR_PROMPT_VERSION } from "../services/missions/supervisor-prompt.js";
 import {
@@ -207,51 +210,19 @@ function parseProposalStatus(c: Context): ProposalStatus {
   );
 }
 
-/**
- * Variant of `paginationParams` with a 1000/page cap instead of the global
- * 100/page. Same query-param shape (`page` / `per_page` OR `offset` /
- * `limit`) so clients don't have to special-case this endpoint.
- */
-function eventsPaginationParams(c: Context): {
-  page: number;
-  perPage: number;
-  offset: number;
-} {
-  const offsetRaw = c.req.query("offset");
-  const limitRaw = c.req.query("limit");
-
-  if (offsetRaw !== undefined || limitRaw !== undefined) {
-    const perPage = Math.min(
-      EVENTS_MAX_PER_PAGE,
-      Math.max(1, Number(limitRaw ?? 50)),
-    );
-    const offset = Math.max(0, Number(offsetRaw ?? 0));
-    const page = Math.floor(offset / perPage) + 1;
-    return { page, perPage, offset };
-  }
-
-  const page = Math.max(1, Number(c.req.query("page") ?? 1));
-  const perPage = Math.min(
-    EVENTS_MAX_PER_PAGE,
-    Math.max(1, Number(c.req.query("per_page") ?? 50)),
-  );
-  return { page, perPage, offset: (page - 1) * perPage };
-}
+// `/missions/:id/events` uses the canonical `paginationParams` helper from
+// `lib/pagination.ts` with a raised `maxPerPage` — see `EVENTS_PAGINATION_OPTS`
+// below for the supervisor-timeline-specific clamps.
+const EVENTS_PAGINATION_OPTS = { defaultPerPage: 50, maxPerPage: EVENTS_MAX_PER_PAGE } as const;
 
 /**
- * Decode a `mission_events.payload` JSON blob defensively. Hand-decoded
- * (rather than `JSON.parse` inline) so a single malformed row does not poison
- * the whole list response — the supervisor writes payloads via guardedEvaluate
- * which always emits valid JSON, but the column is just TEXT and we keep this
- * boundary forgiving for forensics on partially-corrupted DBs.
+ * Decode a `mission_events.payload` JSON blob defensively. The supervisor
+ * writes payloads via guardedEvaluate which always emits valid JSON, but the
+ * column is just TEXT and we keep this boundary forgiving for forensics on
+ * partially-corrupted DBs. Delegates to the canonical
+ * {@link jsonSafeParseOrParseError} for the parse-or-envelope logic.
  */
-function safeParsePayload(raw: string): unknown {
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return { _parse_error: true, raw };
-  }
-}
+const safeParsePayload = jsonSafeParseOrParseError;
 
 /** Shape returned to clients — `payload` is decoded JSON, not a raw string. */
 interface MissionEventResponse {
@@ -291,7 +262,7 @@ missionRoutes.post("/", async (c) => {
   const data = parsed.data;
 
   if (data.autonomy === AUTONOMY_NOT_IMPLEMENTED) {
-    return c.json({ error: "autonomy.auto not implemented in v1" }, 501);
+    throw new AppError(501, "autonomy.auto not implemented in v1");
   }
 
   // 422 if the project doesn't exist — a 500 from the FK constraint would
@@ -340,7 +311,7 @@ missionRoutes.patch("/:id", async (c) => {
   const data = parsed.data;
 
   if (data.autonomy === AUTONOMY_NOT_IMPLEMENTED) {
-    return c.json({ error: "autonomy.auto not implemented in v1" }, 501);
+    throw new AppError(501, "autonomy.auto not implemented in v1");
   }
 
   const patch: Partial<typeof missions.$inferInsert> = {
@@ -368,9 +339,32 @@ missionRoutes.get("/:id/events", (c) => {
   if (!id) throw new ValidationError("missing :id");
   getMissionOrThrow(id);
 
-  const { page, perPage, offset } = eventsPaginationParams(c);
+  const { page, perPage, offset } = paginationParams(c, EVENTS_PAGINATION_OPTS);
   const db = getDb();
   const where = eq(missionEvents.missionId, id);
+
+  // ─── Fast ETag pre-check ───
+  //
+  // The `mission_events` table is append-only: the (max id, count) pair
+  // changes monotonically as events arrive. We compute that tuple in
+  // ONE query and gate the rest of the handler on it — if the client's
+  // `If-None-Match` matches the resulting tag, we 304 without ever
+  // touching the timeline rows again. The UI polls this endpoint on a
+  // tight cadence (mission-detail page); 304 reduces both rows-shipped
+  // and React re-renders on idle pages.
+  const stats = db
+    .select({
+      maxId: sql<string | null>`MAX(${missionEvents.id})`.as("max_id"),
+      cnt: sql<number>`count(*)`.as("cnt"),
+    })
+    .from(missionEvents)
+    .where(where)
+    .get();
+  const tagSeed = `${stats?.maxId ?? "_"}:${stats?.cnt ?? 0}:${page}:${perPage}`;
+  const tag = computeEtag(tagSeed);
+  if (etagMatches(c, tag)) {
+    return new Response(null, { status: 304, headers: { ETag: tag } });
+  }
 
   const rows = db
     .select()
@@ -381,17 +375,11 @@ missionRoutes.get("/:id/events", (c) => {
     .offset(offset)
     .all();
 
-  /* v8 ignore next — SQL count(*) always returns one row, so `?? 0` is unreachable */
-  const total =
-    db
-      .select({ count: sql<number>`count(*)` })
-      .from(missionEvents)
-      .where(where)
-      .get()?.count ?? 0;
-
+  c.header("ETag", tag);
   return c.json({
     items: rows.map(serializeEvent),
-    total,
+    /* v8 ignore next — SQL count(*) always returns one row, so `?? 0` is unreachable */
+    total: stats?.cnt ?? 0,
     page,
     perPage,
   });
@@ -773,27 +761,77 @@ missionRoutes.post("/:id/proposals/:pid/approve", async (c) => {
   const proposal = reparseStoredProposal(proposalRow.payload);
 
   const projectPath = getProjectPathForMission(mission);
-  const created = createEntityFromProposal(projectPath, proposal);
+
+  // ─── Durability ordering (audit-round-3 finding #3) ───
+  //
+  // Previously this handler called `createEntityFromProposal` (FS
+  // write) BEFORE `writeDecisionEvent` (DB write). A daemon crash
+  // between the two left the plan entity on disk with no
+  // corresponding `remediation_approved` event — the idempotency
+  // check above won't fire on retry, so re-approve creates a
+  // DUPLICATE entity (different slug suffix).
+  //
+  // We now write the event FIRST. The new failure mode (event
+  // recorded but entity missing) is loud and operator-visible — a
+  // boot-time reconciler can scan `remediation_approved` events
+  // whose `target_id` doesn't resolve to a plan-store path and
+  // either re-materialize or surface a remediation task. The
+  // alternative (duplicate entities, silent corruption) is harder
+  // to detect post-hoc.
+  //
+  // To do this safely we generate the decisionId UPFRONT and write
+  // the event with a deterministic placeholder for `target_id` and
+  // `entity_kind`; we then materialise the entity and UPDATE the
+  // event payload with the real values. The placeholder is enough
+  // to make the idempotency check fire (same proposal_event_id +
+  // kind) without losing the actual target ids the UI needs.
 
   const decisionId = randomUUID();
+  const pendingPayload: Record<string, unknown> = {
+    proposal_event_id: pid,
+    target_type: proposal.target_type,
+    pending: true,
+  };
   writeDecisionEvent(
     decisionId,
     id,
     "remediation_approved",
-    {
-      proposal_event_id: pid,
-      target_type: proposal.target_type,
-      entity_kind: created.entityKind,
-      target_id: created.targetId,
-      ...(created.parentMilestoneSlug
-        ? { parent_milestone_slug: created.parentMilestoneSlug }
-        : {}),
-      ...(created.parentSliceSlug
-        ? { parent_slice_slug: created.parentSliceSlug }
-        : {}),
-    },
+    pendingPayload,
     proposalRow.depth,
   );
+
+  // Materialisation failure is INTENTIONALLY uncaught here. If
+  // `createEntityFromProposal` throws AFTER we recorded the approval
+  // event, we deliberately do NOT delete the event — keeping it lets
+  // the operator/boot reconciler see "approval attempted, materialise
+  // failed" instead of silently rolling back the user-visible
+  // approval. The error propagates to Hono's error handler which
+  // returns a 4xx/5xx the UI can render as a retryable failure.
+  const created: CreatedEntity = createEntityFromProposal(projectPath, proposal);
+
+  // Finalise the event payload with the real targetId so the UI's
+  // `mission_events` feed reads the same fields it did before this
+  // refactor. The event row keeps its decisionId, so the
+  // idempotency check above still short-circuits on retries.
+  getRawDb()
+    .prepare(
+      `UPDATE mission_events SET payload = ? WHERE id = ?`,
+    )
+    .run(
+      JSON.stringify({
+        proposal_event_id: pid,
+        target_type: proposal.target_type,
+        entity_kind: created.entityKind,
+        target_id: created.targetId,
+        ...(created.parentMilestoneSlug
+          ? { parent_milestone_slug: created.parentMilestoneSlug }
+          : {}),
+        ...(created.parentSliceSlug
+          ? { parent_slice_slug: created.parentSliceSlug }
+          : {}),
+      }),
+      decisionId,
+    );
 
   return c.json(
     {

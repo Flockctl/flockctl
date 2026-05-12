@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 import { createWorkspace, uniq } from "./_helpers";
 
 test("chats page renders and lists a chat created via API", async ({ page, request }) => {
@@ -15,7 +15,7 @@ test("chats page renders and lists a chat created via API", async ({ page, reque
 
 test("chats page shows new chat button", async ({ page }) => {
   await page.goto("/chats");
-  await expect(page.getByRole("button", { name: /New Chat/i }).first()).toBeVisible();
+  await expect(page.getByRole("button", { name: /New[\s-]?chat/i }).first()).toBeVisible();
 });
 
 /**
@@ -308,4 +308,334 @@ test("composer rejects oversized non-image files client-side", async ({ page, re
 
   await expect(page.getByTestId("chat-composer-error")).toBeVisible({ timeout: 2_000 });
   await expect(page.getByTestId("attachment-chip")).toHaveCount(0);
+});
+
+// ---------------------------------------------------------------------------
+// Visual baselines (slice 24-02 T04).
+//
+// Page assembly: SectionHeader → ChatsToolbar → ChatsList. Baselines cover
+// list/grouped × light/dark + initial empty + filtered empty.
+//
+// Each variant intercepts /chats at the daemon origin so the baseline does
+// not drift as the e2e backend accumulates seeded rows. Theme is pinned via
+// localStorage before navigation so the dark baseline doesn't fight the OS
+// preference of the testing host. `?group=project` toggles the grouped
+// section view; `?q=__no_match__` exercises the filtered-empty branch.
+// ---------------------------------------------------------------------------
+
+async function freezeChatsAnimations(page: Page) {
+  await page.addStyleTag({
+    content: `
+      *, *::before, *::after {
+        animation-duration: 0s !important;
+        animation-delay: 0s !important;
+        transition-duration: 0s !important;
+        transition-delay: 0s !important;
+        caret-color: transparent !important;
+      }
+    `,
+  });
+}
+
+async function pinChatsTheme(page: Page, theme: "light" | "dark") {
+  await page.addInitScript((t) => {
+    try {
+      window.localStorage.setItem("flockctl-theme", t);
+    } catch {
+      /* private mode etc. */
+    }
+  }, theme);
+}
+
+const CHATS_FIXTURE_NOW = "2025-01-01T00:00:00.000Z";
+
+interface ChatsFixtureChat {
+  id: string;
+  user_id: string;
+  project_id: string | null;
+  workspace_id: string | null;
+  project_name: string | null;
+  workspace_name: string | null;
+  title: string;
+  entity_type: string | null;
+  entity_id: string | null;
+  permission_mode: null;
+  ai_provider_key_id: null;
+  model: null;
+  thinking_enabled: boolean;
+  effort: null;
+  pinned: boolean;
+  created_at: string;
+  updated_at: string;
+  is_streaming: boolean;
+  metrics: {
+    message_count: number;
+    user_message_count: number;
+    assistant_message_count: number;
+    total_input_tokens: number;
+    total_output_tokens: number;
+    total_cost_usd: number;
+    total_copilot_quota: number;
+    last_message_at: string | null;
+    last_message_excerpt: string | null;
+    todos_counts: null;
+  };
+}
+
+function makeFixtureChat(
+  overrides: Partial<ChatsFixtureChat> & { id: string; title: string },
+): ChatsFixtureChat {
+  return {
+    user_id: "u-1",
+    project_id: null,
+    workspace_id: null,
+    project_name: null,
+    workspace_name: null,
+    entity_type: null,
+    entity_id: null,
+    permission_mode: null,
+    ai_provider_key_id: null,
+    model: null,
+    thinking_enabled: true,
+    effort: null,
+    pinned: false,
+    created_at: CHATS_FIXTURE_NOW,
+    updated_at: CHATS_FIXTURE_NOW,
+    is_streaming: false,
+    metrics: {
+      message_count: 4,
+      user_message_count: 2,
+      assistant_message_count: 2,
+      total_input_tokens: 1200,
+      total_output_tokens: 800,
+      total_cost_usd: 0.04,
+      total_copilot_quota: 0,
+      last_message_at: CHATS_FIXTURE_NOW,
+      last_message_excerpt: "Sounds good — let's split the milestone view first.",
+      todos_counts: null,
+    },
+    ...overrides,
+  };
+}
+
+const FIXTURE_CHATS: ChatsFixtureChat[] = [
+  makeFixtureChat({
+    id: "fc-alpha",
+    title: "Refactor the planner",
+    project_name: "flockctl",
+    project_id: "1",
+    is_streaming: true,
+    metrics: {
+      message_count: 8,
+      user_message_count: 4,
+      assistant_message_count: 4,
+      total_input_tokens: 4800,
+      total_output_tokens: 2200,
+      total_cost_usd: 0.12,
+      total_copilot_quota: 0,
+      last_message_at: "2025-01-01T03:00:00.000Z",
+      last_message_excerpt: "Editing src/services/plan-store/milestones.ts to thread the new flag.",
+      todos_counts: null,
+    },
+    updated_at: "2025-01-01T03:00:00.000Z",
+  }),
+  makeFixtureChat({
+    id: "fc-beta",
+    title: "Marketing site copy review",
+    project_name: "marketing-site",
+    project_id: "2",
+    metrics: {
+      message_count: 5,
+      user_message_count: 3,
+      assistant_message_count: 2,
+      total_input_tokens: 1800,
+      total_output_tokens: 1000,
+      total_cost_usd: 0.05,
+      total_copilot_quota: 0,
+      last_message_at: "2025-01-01T02:00:00.000Z",
+      last_message_excerpt: "Tighten the headline — three options below, ranked by punch.",
+      todos_counts: null,
+    },
+    updated_at: "2025-01-01T02:00:00.000Z",
+  }),
+  makeFixtureChat({
+    id: "fc-gamma",
+    title: "Docs revamp",
+    workspace_name: "personal",
+    workspace_id: "9",
+    metrics: {
+      message_count: 3,
+      user_message_count: 2,
+      assistant_message_count: 1,
+      total_input_tokens: 900,
+      total_output_tokens: 600,
+      total_cost_usd: 0.02,
+      total_copilot_quota: 0,
+      last_message_at: "2025-01-01T01:00:00.000Z",
+      last_message_excerpt: "Move the conceptual docs above the API reference.",
+      todos_counts: null,
+    },
+    updated_at: "2025-01-01T01:00:00.000Z",
+  }),
+  makeFixtureChat({
+    id: "fc-delta",
+    title: "Standalone scratch",
+    metrics: {
+      message_count: 1,
+      user_message_count: 1,
+      assistant_message_count: 0,
+      total_input_tokens: 120,
+      total_output_tokens: 0,
+      total_cost_usd: 0.001,
+      total_copilot_quota: 0,
+      last_message_at: "2025-01-01T00:30:00.000Z",
+      last_message_excerpt: "Quick experiment with the new chat list grouping.",
+      todos_counts: null,
+    },
+    updated_at: "2025-01-01T00:30:00.000Z",
+  }),
+];
+
+async function stubChatsList(page: Page, chats: ChatsFixtureChat[] = FIXTURE_CHATS) {
+  // The SPA's apiFetch always targets the daemon at 127.0.0.1:<E2E_BACKEND_PORT>.
+  // Pinning route handlers to that origin avoids shadowing the dev server's
+  // SPA HTML responses on /chats (a bare `**/chats` glob would also catch
+  // `http://localhost:5174/chats`, the page navigation itself).
+  const backendPort = Number(process.env.E2E_BACKEND_PORT ?? 52078);
+  const apiOrigin = `http://127.0.0.1:${backendPort}`;
+
+  const respond = async (route: import("@playwright/test").Route, payload: unknown) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(payload),
+    });
+  };
+
+  const handleChats = async (route: import("@playwright/test").Route) => {
+    if (route.request().method() === "GET") {
+      await respond(route, { items: chats, total: chats.length, page: 1, perPage: 50 });
+      return;
+    }
+    await route.fallback();
+  };
+
+  await page.route(`${apiOrigin}/chats`, handleChats);
+  await page.route(`${apiOrigin}/chats?**`, handleChats);
+
+  // Quiet the live-pending seed and the projects/workspaces dialog
+  // dropdowns so the screenshot doesn't flicker on whatever the seeded
+  // backend currently holds.
+  await page.route(`${apiOrigin}/chats/pending-permissions`, async (route) => {
+    await respond(route, { pending: {}, running: [] });
+  });
+  await page.route(`${apiOrigin}/projects`, async (route) => {
+    if (route.request().method() === "GET") {
+      await respond(route, { items: [], total: 0 });
+      return;
+    }
+    await route.fallback();
+  });
+  await page.route(`${apiOrigin}/projects?**`, async (route) => {
+    if (route.request().method() === "GET") {
+      await respond(route, { items: [], total: 0 });
+      return;
+    }
+    await route.fallback();
+  });
+  await page.route(`${apiOrigin}/workspaces`, async (route) => {
+    if (route.request().method() === "GET") {
+      await respond(route, { items: [], total: 0 });
+      return;
+    }
+    await route.fallback();
+  });
+  await page.route(`${apiOrigin}/workspaces?**`, async (route) => {
+    if (route.request().method() === "GET") {
+      await respond(route, { items: [], total: 0 });
+      return;
+    }
+    await route.fallback();
+  });
+  await page.route(`${apiOrigin}/attention*`, async (route) => {
+    await respond(route, { items: [] });
+  });
+}
+
+test.describe("chats page — visual baselines", () => {
+  for (const theme of ["light", "dark"] as const) {
+    test(`list layout — ${theme}`, async ({ page }) => {
+      await pinChatsTheme(page, theme);
+      await stubChatsList(page);
+      await page.goto("/chats");
+      await expect(
+        page.getByTestId("chats-page").getByRole("heading", { name: "Chats", level: 1 }),
+      ).toBeVisible();
+      await expect(page.getByTestId("chats-list")).toBeVisible({ timeout: 10_000 });
+      // At least one row from the fixture must render before we snap.
+      await expect(page.getByTestId("chat-row").first()).toBeVisible();
+      await freezeChatsAnimations(page);
+      await expect(page).toHaveScreenshot(`chats-list-${theme}.png`, {
+        fullPage: true,
+        threshold: 0.1,
+        maxDiffPixelRatio: 0.02,
+      });
+    });
+
+    test(`grouped layout — ${theme}`, async ({ page }) => {
+      await pinChatsTheme(page, theme);
+      await stubChatsList(page);
+      await page.goto("/chats?group=project");
+      await expect(
+        page.getByTestId("chats-page").getByRole("heading", { name: "Chats", level: 1 }),
+      ).toBeVisible();
+      await expect(page.getByTestId("chats-list")).toHaveAttribute(
+        "data-group",
+        "project",
+        { timeout: 10_000 },
+      );
+      await expect(page.getByTestId("chats-list-section").first()).toBeVisible();
+      await freezeChatsAnimations(page);
+      await expect(page).toHaveScreenshot(`chats-grouped-${theme}.png`, {
+        fullPage: true,
+        threshold: 0.1,
+        maxDiffPixelRatio: 0.02,
+      });
+    });
+  }
+
+  test("empty baseline — no chats yet", async ({ page }) => {
+    await pinChatsTheme(page, "light");
+    await stubChatsList(page, []);
+    await page.goto("/chats");
+    await expect(
+      page.getByTestId("chats-page").getByRole("heading", { name: "Chats", level: 1 }),
+    ).toBeVisible();
+    await expect(page.getByTestId("chats-empty-state")).toBeVisible({
+      timeout: 10_000,
+    });
+    await freezeChatsAnimations(page);
+    await expect(page).toHaveScreenshot("chats-empty.png", {
+      fullPage: true,
+      threshold: 0.1,
+      maxDiffPixelRatio: 0.02,
+    });
+  });
+
+  test("filtered empty baseline — ?q=__no_match__", async ({ page }) => {
+    await pinChatsTheme(page, "light");
+    await stubChatsList(page);
+    await page.goto(`/chats?q=${encodeURIComponent("__zzz_no_match_zzz__")}`);
+    await expect(
+      page.getByTestId("chats-page").getByRole("heading", { name: "Chats", level: 1 }),
+    ).toBeVisible();
+    await expect(page.getByTestId("chats-filtered-empty-state")).toBeVisible({
+      timeout: 10_000,
+    });
+    await freezeChatsAnimations(page);
+    await expect(page).toHaveScreenshot("chats-filtered-empty.png", {
+      fullPage: true,
+      threshold: 0.1,
+      maxDiffPixelRatio: 0.02,
+    });
+  });
 });

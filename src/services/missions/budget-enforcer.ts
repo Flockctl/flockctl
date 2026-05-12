@@ -36,6 +36,55 @@
 
 import { getRawDb } from "../../db/index.js";
 import { randomUUID } from "node:crypto";
+import type Database from "better-sqlite3";
+
+// ─── Prepared-statement cache ──────────────────────────────────────────────
+//
+// better-sqlite3's `prepare()` is meant to be reused — re-preparing on every
+// call burns cycles parsing identical SQL. Audit-round-2 finding #5 flagged
+// every method here as rebuilding statements per call inside the transaction
+// closure. We lift them into a per-DB-handle cache so each statement is
+// parsed once per process lifetime.
+//
+// Cache is keyed on the better-sqlite3 Database instance because tests
+// swap the handle via `setDb(...)` and the cached statements bind to the
+// originating handle. Re-keying on each `getRawDb()` call lets the cache
+// transparently reset itself when the test harness rotates the DB.
+
+interface PreparedStatements {
+  readMission: Database.Statement<[string]>;
+  updateMission: Database.Statement<[number, number, string, string]>;
+  insertEvent: Database.Statement<[string, string, string, number, number]>;
+}
+
+const stmtCache = new WeakMap<Database.Database, PreparedStatements>();
+
+function getStatements(sqlite: Database.Database): PreparedStatements {
+  let cached = stmtCache.get(sqlite);
+  if (cached) return cached;
+  cached = {
+    readMission: sqlite.prepare(
+      `SELECT status, budget_tokens, budget_usd_cents, spent_tokens, spent_usd_cents
+         FROM missions
+        WHERE id = ?`,
+    ),
+    updateMission: sqlite.prepare(
+      `UPDATE missions
+         SET spent_tokens = ?,
+             spent_usd_cents = ?,
+             status = ?,
+             updated_at = unixepoch()
+       WHERE id = ?`,
+    ),
+    insertEvent: sqlite.prepare(
+      `INSERT INTO mission_events
+         (id, mission_id, kind, payload, cost_tokens, cost_usd_cents)
+       VALUES (?, ?, 'budget_exceeded', ?, ?, ?)`,
+    ),
+  };
+  stmtCache.set(sqlite, cached);
+  return cached;
+}
 
 /**
  * Result returned from `BudgetEnforcer.check()` and `BudgetEnforcer.increment()`.
@@ -100,12 +149,16 @@ export class BudgetEnforcer {
    * deleted target.
    */
   static check(missionId: string): BudgetEnforcerResult {
+    // Plain consistent read — under WAL, readers see a snapshot regardless
+    // of concurrent writers, so wrapping a pure SELECT in BEGIN IMMEDIATE
+    // would only serialize global readers without adding correctness. The
+    // worst-case staleness is one in-flight increment landing between this
+    // read and the supervisor's next call, which surfaces as one extra
+    // permitted call before the gate flips — `increment()` is the
+    // authoritative kill switch and it is still serialized via tx.immediate.
     const sqlite = getRawDb();
-    const tx = sqlite.transaction((mid: string) => {
-      const row = readMission(sqlite, mid);
-      return computeResult(row);
-    });
-    return tx.immediate(missionId);
+    const row = readMission(sqlite, missionId);
+    return computeResult(row);
   }
 
   /**
@@ -133,6 +186,7 @@ export class BudgetEnforcer {
     validateDelta(delta);
 
     const sqlite = getRawDb();
+    const stmts = getStatements(sqlite);
     const tx = sqlite.transaction((mid: string, d: BudgetDelta): BudgetEnforcerResult => {
       const row = readMission(sqlite, mid);
 
@@ -143,16 +197,7 @@ export class BudgetEnforcer {
       const transitionsToPaused = willHalt && !wasPaused;
       const newStatus = transitionsToPaused ? "paused" : row.status;
 
-      sqlite
-        .prepare(
-          `UPDATE missions
-             SET spent_tokens = ?,
-                 spent_usd_cents = ?,
-                 status = ?,
-                 updated_at = unixepoch()
-           WHERE id = ?`,
-        )
-        .run(newTokens, newCents, newStatus, mid);
+      stmts.updateMission.run(newTokens, newCents, newStatus, mid);
 
       if (transitionsToPaused) {
         const payload = JSON.stringify({
@@ -163,13 +208,7 @@ export class BudgetEnforcer {
           delta_tokens: d.tokens,
           delta_cents: d.cents,
         });
-        sqlite
-          .prepare(
-            `INSERT INTO mission_events
-               (id, mission_id, kind, payload, cost_tokens, cost_usd_cents)
-             VALUES (?, ?, 'budget_exceeded', ?, ?, ?)`,
-          )
-          .run(randomUUID(), mid, payload, d.tokens, d.cents);
+        stmts.insertEvent.run(randomUUID(), mid, payload, d.tokens, d.cents);
       }
 
       return computeResult({
@@ -187,13 +226,8 @@ export class BudgetEnforcer {
 
 /** Fetch the mission row needed for budget evaluation; throw if missing. */
 function readMission(sqlite: ReturnType<typeof getRawDb>, missionId: string): MissionRow {
-  const row = sqlite
-    .prepare(
-      `SELECT status, budget_tokens, budget_usd_cents, spent_tokens, spent_usd_cents
-         FROM missions
-        WHERE id = ?`,
-    )
-    .get(missionId) as MissionRow | undefined;
+  const stmts = getStatements(sqlite);
+  const row = stmts.readMission.get(missionId) as MissionRow | undefined;
   if (!row) {
     throw new Error(`BudgetEnforcer: mission not found: ${missionId}`);
   }

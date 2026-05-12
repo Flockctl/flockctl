@@ -241,16 +241,26 @@ export async function sshExec(
       return;
     }
 
+    // One-shot exec — cap output at 1 MiB so a runaway remote command
+    // streaming megabytes cannot OOM the daemon. Excess is truncated
+    // from the head (we keep the tail, where errors usually surface).
+    const MAX_EXEC_BYTES = 1024 * 1024;
+    const appendBounded = (prev: string, chunk: string): string => {
+      const combined = prev + chunk;
+      return combined.length <= MAX_EXEC_BYTES
+        ? combined
+        : combined.slice(-MAX_EXEC_BYTES);
+    };
     let stdout = "";
     let stderr = "";
 
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (chunk: string) => {
-      stdout += chunk;
+      stdout = appendBounded(stdout, chunk);
     });
     child.stderr?.setEncoding("utf8");
     child.stderr?.on("data", (chunk: string) => {
-      stderr += chunk;
+      stderr = appendBounded(stderr, chunk);
     });
 
     let timedOut = false;

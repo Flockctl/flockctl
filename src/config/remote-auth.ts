@@ -84,12 +84,6 @@ export function findMatchingToken(provided: string): { label: string } | null {
   return match;
 }
 
-/** @deprecated prefer `hasRemoteAuth()` / `findMatchingToken()` */
-export function getRemoteAccessToken(): string | null {
-  const tokens = getConfiguredTokens();
-  return tokens[0]?.token ?? null;
-}
-
 export function addRemoteAccessToken(label: string, token: string): void {
   if (!label || typeof label !== "string") {
     throw new Error("Token label is required");

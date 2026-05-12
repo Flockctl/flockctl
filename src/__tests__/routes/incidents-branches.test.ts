@@ -3,6 +3,7 @@ import { app } from "../../server.js";
 import { createTestDb } from "../helpers.js";
 import { setDb, closeDb } from "../../db/index.js";
 import { incidents, projects } from "../../db/schema.js";
+import { _resetIncidentsTagsCache } from "../../routes/incidents.js";
 
 describe("Incidents — branch coverage", () => {
   let testDb: ReturnType<typeof createTestDb>;
@@ -10,6 +11,10 @@ describe("Incidents — branch coverage", () => {
   beforeEach(() => {
     testDb = createTestDb();
     setDb(testDb.db, testDb.sqlite);
+    // Tests insert rows via Drizzle directly, bypassing the POST
+    // handler's tags-cache invalidation. Reset the cache here so each
+    // case sees a fresh view.
+    _resetIncidentsTagsCache();
   });
 
   afterEach(() => {

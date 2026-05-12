@@ -48,18 +48,54 @@ clean:
 # `claude --resume <dead-id>` and starts from scratch — which is exactly the
 # "context lost on make reinstall" bug.
 #
-# `flockctl stop` now blocks until the child process actually exits (up to
-# 15 s, matches the shutdown budget). If it times out we bail loudly instead
-# of papering over it — that should prompt the operator to investigate, not
-# auto-force-kill.
+# Step-by-step:
+#   1. Stop the daemon if `flockctl` exists in PATH; tolerate first-install
+#      where the binary isn't there yet.
+#   2. Poll `lsof :52077` for up to 15 s for the port to be released —
+#      `flockctl stop` returns when the child exits, but the kernel may
+#      hold the listening socket in TIME_WAIT for a tick.
+#   3. `npm run build` (TS + UI bundle copied into dist/ui).
+#   4. `npm install -g .` — if this fails (EACCES, nvm prefix, etc.)
+#      the whole target aborts; we never try to start a half-installed
+#      daemon.
+#   5. `flockctl start` and poll `/health` for up to 10 s before
+#      reporting success. A green ✅ means the daemon actually answers
+#      HTTP, not just that the launcher returned.
 reinstall:
-	@flockctl stop 2>/dev/null || true
-	@if lsof -ti :52077 >/dev/null 2>&1; then \
-		echo "❌ port 52077 still busy after flockctl stop — refusing to reinstall."; \
-		echo "   Investigate the stuck process manually before retrying."; \
+	@if command -v flockctl >/dev/null 2>&1; then \
+		echo "→ Stopping running daemon (graceful, no SIGKILL)…"; \
+		flockctl stop 2>/dev/null || true; \
+	else \
+		echo "→ flockctl not in PATH yet — skipping stop (first install)."; \
+	fi
+	@printf "→ Waiting for port 52077 to be released"
+	@released=0; for i in $$(seq 1 30); do \
+		if ! lsof -ti :52077 >/dev/null 2>&1; then released=1; break; fi; \
+		printf "."; sleep 0.5; \
+	done; \
+	echo ""; \
+	if [ $$released -ne 1 ]; then \
+		echo "❌ port 52077 still busy after 15 s — refusing to reinstall."; \
+		echo "   Stuck PID(s): $$(lsof -ti :52077 | tr '\n' ' ')"; \
+		echo "   Investigate manually (e.g. \`kill <pid>\`) before retrying."; \
 		exit 1; \
 	fi
+	@echo "→ Building (tsc + ui bundle)…"
 	npm run build
+	@echo "→ Installing globally (npm install -g .)…"
 	npm install -g .
+	@echo "→ Starting daemon…"
 	flockctl start
-	@echo "\n✅ flockctl reinstalled and started successfully."
+	@printf "→ Waiting for /health to respond"
+	@healthy=0; for i in $$(seq 1 20); do \
+		if curl -sf http://localhost:52077/health >/dev/null 2>&1; then healthy=1; break; fi; \
+		printf "."; sleep 0.5; \
+	done; \
+	echo ""; \
+	if [ $$healthy -ne 1 ]; then \
+		echo "⚠️  daemon started but /health did not answer within 10 s."; \
+		echo "   Check logs: \`flockctl status\` and ~/.flockctl/daemon.log"; \
+		exit 1; \
+	fi
+	@echo ""
+	@echo "✅ flockctl reinstalled and healthy on http://localhost:52077"

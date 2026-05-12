@@ -17,6 +17,7 @@
  */
 
 import { execSync } from "child_process";
+import { BoundedStringAccumulator } from "../../lib/bounded-string.js";
 import type {
   StreamChatEvent,
   PermissionHandler,
@@ -149,8 +150,33 @@ type CopilotSession = {
  * falls back to `GH_TOKEN` / `GITHUB_TOKEN` / `gh auth status`; that entry
  * lives under the sentinel key `"__env__"`.
  */
+// Bounded growth (audit-round-5). In practice the daemon sees 1-2
+// distinct github tokens at a time, but rotation over a long uptime
+// could grow these maps unbounded. 32 is more than any realistic
+// rotation pattern; oldest-eviction on overflow disconnects the
+// least-recently-created client (NOT least-recently-used — we don't
+// track usage timestamps; LRU would require bookkeeping each call).
+const MAX_COPILOT_POOL_ENTRIES = 32;
 const _clients = new Map<string, CopilotClient>();
 const _clientStartPromises = new Map<string, Promise<CopilotClient>>();
+
+function evictOldestCopilotClient(): void {
+  if (_clients.size < MAX_COPILOT_POOL_ENTRIES) return;
+  const oldest = _clients.keys().next().value;
+  if (oldest === undefined) return;
+  const client = _clients.get(oldest);
+  _clients.delete(oldest);
+  _clientStartPromises.delete(oldest);
+  // Best-effort disconnect — `client.disconnect?.()` is async but we
+  // don't await it; the LRU slot is reclaimed immediately and the
+  // SDK's own cleanup runs in the background.
+  try {
+    (client as unknown as { disconnect?: () => Promise<void> } | undefined)?.disconnect?.();
+  } catch {
+    // Disconnect failures must not propagate — we're already in
+    // memory-pressure relief territory.
+  }
+}
 
 function poolKeyFor(token: string | undefined): string {
   return token && token.length > 0 ? token : "__env__";
@@ -178,6 +204,9 @@ async function getOrCreateClient(
       // SDK 0.2.2 vocab: none | error | warning | info | debug | all | default
       logLevel: process.env.COPILOT_LOG_LEVEL ?? "warning",
     });
+    // Evict before insert when at capacity so the new client doesn't
+    // bypass the cap on a fresh key.
+    if (!_clients.has(key)) evictOldestCopilotClient();
     _clients.set(key, client);
     return client;
   })();
@@ -598,7 +627,9 @@ export async function* streamViaCopilotSdk(
 export async function chatViaCopilotSdk(
   opts: StreamViaCopilotOptions,
 ): Promise<{ text: string; usage: AgentUsage; error?: string }> {
-  let text = "";
+  // Bounded accumulator instead of `let s = ""; s += chunk` — see
+  // lib/bounded-string.ts for the O(n²) → amortised O(1) rationale.
+  const textAcc = new BoundedStringAccumulator();
   const usage: AgentUsage = {
     inputTokens: 0,
     outputTokens: 0,
@@ -608,7 +639,7 @@ export async function chatViaCopilotSdk(
   let error: string | undefined;
 
   for await (const ev of streamViaCopilotSdk(opts)) {
-    if (ev.type === "text" && ev.text) text += ev.text;
+    if (ev.type === "text" && ev.text) textAcc.append(ev.text);
     else if (ev.type === "done" && ev.usage) {
       usage.inputTokens = ev.usage.inputTokens;
       usage.outputTokens = ev.usage.outputTokens;
@@ -620,5 +651,5 @@ export async function chatViaCopilotSdk(
     }
   }
 
-  return { text, usage, error };
+  return { text: textAcc.toString(), usage, error };
 }

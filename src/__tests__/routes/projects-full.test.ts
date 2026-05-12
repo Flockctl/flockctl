@@ -8,19 +8,54 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { createMilestone, createSlice } from "../../services/plan-store/index.js";
 
+// Existing tests drove the project-create git path through an
+// `execSync` mock. The routes now invoke `execa` instead (async, non
+// event-loop-blocking — see routes/projects.ts and audit-round-3
+// finding). Forward the execa call to the existing `execSync` mock so
+// test stubs that throw / return Buffer still drive the same behaviour.
 vi.mock("child_process", async () => {
   const actual = await vi.importActual<any>("child_process");
   return {
     ...actual,
     execSync: vi.fn(actual.execSync),
-    // `git clone` now uses execFileSync (no shell); tests still drive it
-    // through the execSync mock by forwarding stubbed impls — matches the
-    // prior behavior of asserting on the "clone" argv.
-    execFileSync: vi.fn((file: string, args: readonly string[], opts: unknown) => {
+  };
+});
+
+vi.mock("execa", async () => {
+  return {
+    execa: vi.fn(async (file: string, args: readonly string[]) => {
       const fake = (execSync as unknown as { getMockImplementation?: () => (cmd: string) => unknown })
         .getMockImplementation?.();
       const rebuiltCmd = `${file} ${args.join(" ")}`;
-      return fake ? fake(rebuiltCmd) : actual.execFileSync(file, args, opts);
+      if (!fake) return { stdout: "", stderr: "", exitCode: 0 };
+      try {
+        const result = fake(rebuiltCmd);
+        const stdout =
+          typeof result === "string"
+            ? result
+            : result && typeof (result as Buffer).toString === "function"
+              ? (result as Buffer).toString()
+              : "";
+        return { stdout, stderr: "", exitCode: 0 };
+      } catch (err) {
+        // Preserve the raw thrown shape so the route catch-block
+        // fallback (stderr → message → "unknown error") drives the
+        // expected error path. Tests deliberately throw `{}` to
+        // exercise the "unknown error" branch.
+        const e = err as { stderr?: Buffer | string; message?: string };
+        const stderrText =
+          typeof e.stderr === "string"
+            ? e.stderr
+            : e.stderr
+              ? e.stderr.toString()
+              : undefined;
+        const wrapped: { stderr?: string; message?: string; exitCode: number } = {
+          exitCode: 1,
+        };
+        if (stderrText !== undefined) wrapped.stderr = stderrText;
+        if (typeof e.message === "string") wrapped.message = e.message;
+        throw wrapped;
+      }
     }),
   };
 });
@@ -74,7 +109,7 @@ describe("projects — POST derives path from workspace", () => {
     expect(res.status).toBe(201);
     const body = await res.json();
     expect(body.path.startsWith(wsPath)).toBe(true);
-    expect(body.path.endsWith("Derived_Name")).toBe(true);
+    expect(body.path.endsWith("derived-name")).toBe(true);
   });
 
   it("falls back to homedir/flockctl/projects/<slug> when workspace has no path", async () => {
@@ -85,7 +120,7 @@ describe("projects — POST derives path from workspace", () => {
     });
     expect(res.status).toBe(201);
     const body = await res.json();
-    expect(body.path).toContain("Solo_Project");
+    expect(body.path).toContain("solo-project");
   });
 });
 

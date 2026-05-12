@@ -1,5 +1,6 @@
 import { Link } from "react-router-dom";
 import { useScheduleTasks } from "@/lib/hooks";
+import { useWsAwarePolling } from "@/lib/global-ws";
 import { statusBadge } from "@/components/status-badge";
 import { formatTimestamp as formatTime } from "@/lib/format";
 import {
@@ -24,8 +25,9 @@ export function ScheduleTasksRow({
   scheduleId: string;
   colSpan: number;
 }) {
+  const refetchInterval = useWsAwarePolling(10_000);
   const { data, isLoading, error } = useScheduleTasks(scheduleId, 0, 20, {
-    refetchInterval: 10_000,
+    refetchInterval,
   });
 
   return (

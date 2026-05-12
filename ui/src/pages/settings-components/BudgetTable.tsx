@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/table";
 import { Trash2 } from "lucide-react";
 import { ConfirmDialog, useConfirmDialog } from "@/components/confirm-dialog";
+import { formatCost } from "@/lib/format";
 
 // --- Budget Table ---
 
@@ -61,8 +62,8 @@ export function BudgetTable() {
                 {b.scope_id && <span className="ml-1 text-xs text-muted-foreground">#{b.scope_id}</span>}
               </TableCell>
               <TableCell className="hidden text-sm sm:table-cell">{b.period}</TableCell>
-              <TableCell className="text-sm font-mono">${b.limit_usd.toFixed(2)}</TableCell>
-              <TableCell className="hidden text-sm font-mono md:table-cell">${b.spent_usd.toFixed(2)}</TableCell>
+              <TableCell className="text-sm font-mono">{formatCost(b.limit_usd)}</TableCell>
+              <TableCell className="hidden text-sm font-mono md:table-cell">{formatCost(b.spent_usd)}</TableCell>
               <TableCell className="hidden md:table-cell">
                 <div className="flex items-center gap-2">
                   <div className="h-2 w-20 rounded-full bg-muted overflow-hidden">
@@ -92,6 +93,7 @@ export function BudgetTable() {
                     size="sm"
                     className="h-7 px-2 text-xs text-destructive hover:text-destructive"
                     disabled={deleteBudget.isPending}
+                    aria-label={`Delete budget for ${b.scope}`}
                     onClick={() => deleteConfirm.requestConfirm(String(b.id))}
                   >
                     <Trash2 className="h-3 w-3" />

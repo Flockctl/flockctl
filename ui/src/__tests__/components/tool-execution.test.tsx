@@ -44,4 +44,35 @@ describe("StoredToolMessageItem", () => {
     );
     expect(container.firstChild).toBeNull();
   });
+
+  // Operators rely on the per-row timestamp to spot a hung agent: a tool
+  // call stamped 10:16 with no follow-up means the run has been stuck ever
+  // since. Render `HH:mm` from the `createdAt` ISO string when provided.
+  it("renders the createdAt timestamp on the tool row", () => {
+    const { getByTestId } = render(
+      <StoredToolMessageItem
+        id={1}
+        content={payload}
+        createdAt="2026-05-09T10:16:00.000Z"
+      />,
+    );
+    const stamp = getByTestId("stored-tool-timestamp");
+    // Locale-dependent formatting (12h vs 24h) — assert that *some* HH:mm
+    // string ending in "16" is present rather than pinning a specific zone.
+    expect(stamp.textContent).toMatch(/\d{1,2}:\d{2}/);
+  });
+
+  it("omits the timestamp slot when createdAt is missing", () => {
+    const { queryByTestId } = render(
+      <StoredToolMessageItem id={1} content={payload} />,
+    );
+    expect(queryByTestId("stored-tool-timestamp")).toBeNull();
+  });
+
+  it("omits the timestamp slot when createdAt is unparseable", () => {
+    const { queryByTestId } = render(
+      <StoredToolMessageItem id={1} content={payload} createdAt="not-a-date" />,
+    );
+    expect(queryByTestId("stored-tool-timestamp")).toBeNull();
+  });
 });

@@ -6,9 +6,14 @@ export {
   getGlobalSkillsDir,
   getGlobalMcpDir,
   getGlobalTemplatesDir,
+  getFlockctlDir,
+  getMcpDir,
+  getSkillsDir,
+  getTemplatesDir,
 } from "./paths.js";
 
 export {
+  DEFAULT_DAEMON_PORT,
   getDefaultModel,
   getPlanningModel,
   getDefaultAgent,
@@ -31,7 +36,6 @@ export {
   getConfiguredTokens,
   hasRemoteAuth,
   findMatchingToken,
-  getRemoteAccessToken,
   addRemoteAccessToken,
   removeRemoteAccessToken,
   getCorsAllowedOrigins,

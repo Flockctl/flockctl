@@ -34,6 +34,7 @@ import { Command, CommanderError } from "commander";
 import { setTimeout as sleep } from "node:timers/promises";
 import { getRunningPid, startDaemon as realStartDaemon } from "../daemon.js";
 import { loadRc, saveRc } from "../config/paths.js";
+import { DEFAULT_DAEMON_PORT } from "../config/index.js";
 import { generateRemoteAccessToken } from "../lib/token.js";
 
 /** Inclusive ASCII control character ranges that we refuse to store in a
@@ -77,7 +78,7 @@ export function registerRemoteBootstrapCommand(program: Command): void {
     )
     .option("--print-token", "Print the minted token to stdout", false)
     .option("-l, --label <name>", "Label to attach to the token", "unnamed")
-    .option("-p, --port <number>", "Port the daemon should listen on", "52077")
+    .option("-p, --port <number>", "Port the daemon should listen on", String(DEFAULT_DAEMON_PORT))
     .action(
       async (opts: { printToken?: boolean; label: string; port: string }) => {
         // Forward as argv so there is a single source of truth for parsing
@@ -153,7 +154,11 @@ export async function runRemoteBootstrap(
     .allowExcessArguments(false)
     .option("--print-token", "Print the minted token to stdout", false)
     .option("-l, --label <name>", "Label to attach to the token", "unnamed")
-    .option("-p, --port <number>", "Port the daemon should listen on", "52077");
+    .option(
+      "-p, --port <number>",
+      "Port the daemon should listen on",
+      String(DEFAULT_DAEMON_PORT),
+    );
 
   let parsed: { printToken?: boolean; label: string; port: string };
   try {

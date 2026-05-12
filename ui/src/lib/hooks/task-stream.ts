@@ -11,6 +11,27 @@ import { useTaskLogs } from "./tasks";
 
 // --- Live log stream hook ---
 
+/**
+ * Bound on the in-memory dedup Set that tracks which log lines have already
+ * been folded into `logs`. A long-running task can stream tens of thousands
+ * of log lines while the user keeps the page open; without this cap each
+ * line's id stays in the Set forever, holding memory and slowing
+ * `seenIds.has()` lookups proportionally.
+ *
+ * The cap is intentionally generous (10k) so even a chatty 30-minute task
+ * streams without losing dedup for the visible page. Past the cap we evict
+ * the oldest insert (FIFO) — JS `Set.add` preserves insertion order.
+ */
+const SEEN_IDS_MAX = 10_000;
+
+function rememberSeen(seen: Set<string>, id: string): void {
+  if (seen.size >= SEEN_IDS_MAX) {
+    const oldest = seen.values().next();
+    if (!oldest.done) seen.delete(oldest.value);
+  }
+  seen.add(id);
+}
+
 export function useTaskLogStream(taskId: string) {
   const [logs, setLogs] = useState<TaskLog[]>([]);
   const [metrics, setMetrics] = useState<TaskMetrics | null>(null);
@@ -66,7 +87,7 @@ export function useTaskLogStream(taskId: string) {
         const logId =
           String(data.id ?? `ws-${data.timestamp ?? Date.now()}`);
         if (!seenIds.current.has(logId)) {
-          seenIds.current.add(logId);
+          rememberSeen(seenIds.current, logId);
           const newLog: TaskLog = {
             id: logId,
             task_id: String(data.task_id ?? taskId),
@@ -142,6 +163,20 @@ export function useTaskLogStream(taskId: string) {
             return { items: [...items, item] };
           },
         );
+      } else if (msg.type === "permission_resolved") {
+        // Backend auto-resolved (or manually resolved) a pending permission
+        // entry — drop the card from the UI. Mirrors the chat-events handler:
+        // a permission-mode swap to `bypassPermissions` / `acceptEdits` /
+        // `auto` resolves matching pending entries server-side and emits
+        // `permission_resolved` per entry, so the operator's "Bash permission"
+        // card disappears without a manual click.
+        const requestId = String(data.request_id);
+        setPermissionRequests((prev) => prev.filter((r) => r.request_id !== requestId));
+      } else if (msg.type === "task_permission_mode_changed") {
+        // Variant-B cross-tab parity: another tab (or the live-swap from a
+        // PATCH /tasks/:id) changed the permission mode — invalidate the
+        // task query so the dropdown re-renders with the new value.
+        queryClient.invalidateQueries({ queryKey: queryKeys.task(taskId) });
       } else if (msg.type === "agent_question_resolved") {
         const requestId = String(data.request_id);
         queryClient.setQueryData<{ items: AgentQuestionItem[] }>(

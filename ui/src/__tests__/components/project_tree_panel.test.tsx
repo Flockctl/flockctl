@@ -219,12 +219,15 @@ describe("ProjectTreePanel — selection highlighting", () => {
       ),
     );
 
-    await user.click(screen.getByTestId("tree-slice-s1"));
+    // Click the row inside the slice treeitem. The click handler lives on
+    // the inner row div (not the <li>) so that clicks on nested task rows
+    // don't bubble up and re-fire the parent slice's select.
+    await user.click(
+      within(screen.getByTestId("tree-slice-s1")).getByText("Slice one"),
+    );
     expect(onSelectSlice).toHaveBeenCalledWith("m1", "s1");
 
-    // Click the row inside the milestone treeitem — the click handler is on
-    // the inner row div, not on the <li>, so events fired on a child are
-    // what users actually trigger when clicking the title.
+    // Same pattern on the milestone row.
     await user.click(within(screen.getByTestId("tree-milestone-m1")).getByText("First"));
     expect(onSelectMilestone).toHaveBeenCalledWith("m1");
   });

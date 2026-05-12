@@ -211,12 +211,35 @@ export function registerChatsCommand(program: Command): void {
   cmd
     .command("rm <id>")
     .alias("remove")
-    .description("Soft-delete a chat (and its attachments).")
-    .action(async (id: string) => {
+    .description(
+      "Soft-delete a chat (and its attachments). Refuses if the chat owns a " +
+        "dirty worktree — pass --force to discard.",
+    )
+    .option("--force", "Discard the chat's worktree even if it has uncommitted changes")
+    .action(async (id: string, opts: { force?: boolean }) => {
       try {
         const client = createDaemonClient();
-        await client.del(`/chats/${id}`);
+        const path = `/chats/${id}${opts.force ? "?force=true" : ""}`;
+        await client.del(path);
         console.log(`Deleted chat #${id}`);
+      } catch (err) {
+        exitWithDaemonError(err);
+      }
+    });
+
+  cmd
+    .command("end <id>")
+    .description(
+      "End an isolated chat session — clean up the per-chat git worktree. " +
+        "Refuses on a dirty worktree without --force; the chat row itself stays alive.",
+    )
+    .option("--force", "Discard the worktree even when it has uncommitted changes")
+    .action(async (id: string, opts: { force?: boolean }) => {
+      try {
+        const client = createDaemonClient();
+        const path = `/chats/${id}/end-session${opts.force ? "?force=true" : ""}`;
+        const result = await client.post<{ removed: boolean; reason: string }>(path);
+        console.log(`Chat #${id} session ended: ${result.removed ? "worktree removed" : "kept"} (${result.reason})`);
       } catch (err) {
         exitWithDaemonError(err);
       }

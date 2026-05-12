@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { tasks } from "../../db/schema.js";
 import { AppError } from "../../lib/errors.js";
+import { flattenZodError } from "../../lib/zod-utils.js";
 
 // ─── Spec field caps ───
 // Caps are enforced at the API boundary so invalid payloads never reach the
@@ -49,12 +50,7 @@ export function parseSpecFieldsOrThrow(body: unknown): z.infer<typeof taskSpecSc
   if (!parsed.success) {
     // Collapse zod issues into a ValidationError-compatible `details` map so
     // the client can highlight the offending field.
-    const details: Record<string, string[]> = {};
-    for (const issue of parsed.error.issues) {
-      const key = issue.path.length > 0 ? String(issue.path[0]) : "_";
-      (details[key] ||= []).push(issue.message);
-    }
-    throw new AppError(400, "Invalid task spec fields", details);
+    throw new AppError(400, "Invalid task spec fields", flattenZodError(parsed.error));
   }
   return parsed.data;
 }

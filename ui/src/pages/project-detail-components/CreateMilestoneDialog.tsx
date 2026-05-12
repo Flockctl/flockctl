@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Plus } from "lucide-react";
 import { useCreateMilestone } from "@/lib/hooks";
 import type { MilestoneCreate } from "@/lib/types";
 import { Button } from "@/components/ui/button";
@@ -72,16 +73,19 @@ export function CreateMilestoneDialog({ projectId }: { projectId: string }) {
       }}
     >
       <DialogTrigger asChild>
-        <Button size="sm" variant="outline">Create Milestone</Button>
+        <Button size="sm" variant="outline">
+          <Plus aria-hidden="true" />
+          New milestone
+        </Button>
       </DialogTrigger>
-      <DialogContent className="max-w-lg">
+      <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>Create Milestone</DialogTitle>
           <DialogDescription>
             Manually add a new milestone to this project.
           </DialogDescription>
         </DialogHeader>
-        <form onSubmit={handleSubmit} className="space-y-4">
+        <form onSubmit={handleSubmit} className="space-y-3">
           <div className="space-y-2">
             <Label htmlFor="cm-title">Title *</Label>
             <Input

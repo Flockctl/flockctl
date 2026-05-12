@@ -144,7 +144,7 @@ export function McpPanel({
           MCP server configs at the {level} level. Servers provide tools and context to AI agents.
         </p>
       </CardHeader>
-      <CardContent className="space-y-4">
+      <CardContent className="space-y-3">
         {inherited.length > 0 && (
           <div className="space-y-1">
             <p className="text-xs font-medium text-muted-foreground">
@@ -262,6 +262,7 @@ export function McpPanel({
                       variant="ghost"
                       size="icon"
                       className="h-7 w-7"
+                      aria-label={`Edit MCP server ${server.name}`}
                       onClick={(e) => {
                         e.stopPropagation();
                         handleEdit(server);
@@ -273,6 +274,7 @@ export function McpPanel({
                       variant="ghost"
                       size="icon"
                       className="h-7 w-7"
+                      aria-label={`Delete MCP server ${server.name}`}
                       onClick={(e) => {
                         e.stopPropagation();
                         handleDelete(server);
